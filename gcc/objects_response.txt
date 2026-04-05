@@ -4,8 +4,10 @@
 ../../../../project/demo/LVGL_withSDandNetwork/chsc6540.o
 ../../../../project/demo/LVGL_withSDandNetwork/epd.o
 ../../../../project/demo/LVGL_withSDandNetwork/lv_port_disp.o
+../../../../project/demo/LVGL_withSDandNetwork/heap_debug.o
 ../../../../project/demo/LVGL_withSDandNetwork/http_server.o
 ../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.o
+../../../../project/demo/LVGL_withSDandNetwork/mem_guard.o
 ../../../../project/demo/LVGL_withSDandNetwork/wlan_manager.o
 ../../../../project/demo/LVGL_withSDandNetwork/file_manager.o
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/demos/benchmark/lv_demo_benchmark.o
@@ -468,6 +470,7 @@
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/tests/src/test_fonts/font_1.o
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/tests/unity/unity.o
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/tests/unity/unity_support.o
+../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.o
 ../../../../project/common/apps/recorder_app.o
 ../../../../project/common/apps/player_app.o
 ../../../../project/common/apps/buttons/buttons.o

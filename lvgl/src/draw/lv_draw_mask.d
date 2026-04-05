@@ -50,17 +50,7 @@
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/lv_draw_mask.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_math.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/lv_draw_transform.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/lv_draw_layer.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_log.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_assert.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_gc.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_ll.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_timer.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../hal/lv_hal_tick.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../hal/../lv_conf_internal.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../draw/lv_img_cache.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../draw/lv_draw_mask.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../core/lv_obj_pos.h
+ ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/lv_draw_layer.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -163,23 +153,3 @@
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/lv_draw_transform.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/lv_draw_layer.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_log.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_assert.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_gc.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_ll.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/lv_timer.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../hal/lv_hal_tick.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../hal/../lv_conf_internal.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../draw/lv_img_cache.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../draw/lv_draw_mask.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/draw/../misc/../core/lv_obj_pos.h:

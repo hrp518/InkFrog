@@ -218,7 +218,9 @@
  ../../../../include/kernel/os/os_queue.h \
  ../../../../include/kernel/os/os_semaphore.h \
  ../../../../include/kernel/os/os_mutex.h \
- ../../../../include/kernel/os/os_timer.h
+ ../../../../include/kernel/os/os_timer.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -659,3 +661,7 @@
 ../../../../include/kernel/os/os_mutex.h:
 
 ../../../../include/kernel/os/os_timer.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h:

@@ -227,8 +227,11 @@ SECTIONS
         __psram_start__ = .;
         __psram_text_start__ = .;
         *project/common/cmd/cmd_psram.o (.text* .rodata*)
-        *project/demo/LVGL_withSDandNetwork/http_server.o (.text* .rodata*)
-        *project/demo/LVGL_withSDandNetwork/file_manager.o (.text* .rodata*)
+        *project/demo/fixing_LVGL_withSDandNetworkKeyboard/http_server.o (.text* .rodata*)
+        *project/demo/fixing_LVGL_withSDandNetworkKeyboard/file_manager.o (.text* .rodata*)
+        *project/demo/fixing_LVGL_withSDandNetworkKeyboard/epd.o (.text* .rodata*)
+        *project/demo/fixing_LVGL_withSDandNetworkKeyboard/epub_reader.o (.text* .rodata*)
+        *project/demo/fixing_LVGL_withSDandNetworkKeyboard/epub_viewer.o (.text* .rodata*)
         *(.psram_text* .psram_rodata*)
         . = ALIGN(4);
         __psram_text_end__ = .;
