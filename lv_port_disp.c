@@ -19,6 +19,10 @@
 #include "lv_port_indev.h"
 #include "driver/chip/hal_gpio.h"
 #include "kernel/os/os.h"
+#include "task.h"
+
+/* LVGL线程句柄 - 用于刷新时挂起LVGL任务防止SPI冲突 */
+extern OS_Thread_t lvgl_thread;
 
 /*====================
  * EPD_3IN52 配置
@@ -367,7 +371,12 @@ void epd_do_refresh(void) {
     uint32_t t = epd_get_tick();
 
     printf("[EPD] Starting display (T=%ums)\n", t);
+    
+    /* 终极护航：挂起LVGL任务，防止SPI传输被中断导致busy死等 */
+    vTaskSuspend(lvgl_thread.handle);
     EPD_3IN52_Display_DU();
+    vTaskResume(lvgl_thread.handle);
+    
     printf("[EPD] Display done (T=%ums, epd_cost=%ums)\n", epd_get_tick(), epd_get_tick() - t);
 
     /* After EPD refresh completes, clear LVGL's invalidation queue.

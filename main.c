@@ -44,8 +44,8 @@ extern struct mmc_card *mmc_scan_init(uint16_t sd_id, uint16_t sdc_id, void *car
 /* 显示刷新任务周期 (ms) - 优化二：提高响应速度 */
 #define DISP_TASK_PERIOD     20
 
-/* LVGL线程句柄 */
-static OS_Thread_t lvgl_thread;
+/* LVGL线程句柄 - 非static以便在刷新时挂起 */
+OS_Thread_t lvgl_thread;
 static OS_Thread_t disp_task_thread;
 
 /* platform_init声明 */

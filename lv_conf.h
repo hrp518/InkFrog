@@ -77,7 +77,8 @@
  *-----------*/
 
 /*Enable complex draw engine. 关闭复杂绘制以节省资源*/
-#define LV_DRAW_COMPLEX         1
+/* 1-bit单色屏必须关闭复杂绘制，否则圆角遮罩会导致像素丢失 */
+#define LV_DRAW_COMPLEX         0
 #if LV_DRAW_COMPLEX != 0
     #define LV_SHADOW_CACHE_SIZE 0
     #define LV_CIRCLE_CACHE_SIZE 0
