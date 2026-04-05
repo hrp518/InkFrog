@@ -367,9 +367,7 @@ void epd_do_refresh(void) {
     uint32_t t = epd_get_tick();
 
     printf("[EPD] Starting display (T=%ums)\n", t);
-    // TODO: 临时用全刷替代局刷排查问题
-    // EPD_3IN52_Display_DU();
-    EPD_3IN52_Display();
+    EPD_3IN52_Display_DU();
     printf("[EPD] Display done (T=%ums, epd_cost=%ums)\n", epd_get_tick(), epd_get_tick() - t);
 
     /* After EPD refresh completes, clear LVGL's invalidation queue.

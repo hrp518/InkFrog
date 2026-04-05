@@ -265,8 +265,8 @@ static void EPD_3IN52_ReadBusy(void)
     uint8_t busy;
     int timeout = 0;
     
-    // 添加超时保护，最多等待1.5秒
-    while (timeout < 1500) {
+    // 全刷可能需要更长时间，最多等待5秒
+    while (timeout < 5000) {
         busy = HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8);  // PA8 = BUSY
         if (busy) {
             // BUSY为高时退出
@@ -276,8 +276,8 @@ static void EPD_3IN52_ReadBusy(void)
         timeout++;
     }
     
-    if (timeout >= 1500) {
-        printf("e-Paper busy timeout!\r\n");
+    if (timeout >= 5000) {
+        printf("[EPD FATAL] e-Paper busy timeout!\r\n");
     } else {
         OS_MSleep(200);
         printf("e-Paper busy release\r\n");
@@ -446,7 +446,7 @@ int EPD_3IN52_Init(void)
     return 0;
 }
 
-/* Show display and enter deep sleep */
+/* Show display (Deep sleep removed for LVGL compatibility) */
 void EPD_3IN52_Show(void)
 {
     EPD_3IN52_lut_GC();
@@ -454,8 +454,8 @@ void EPD_3IN52_Show(void)
     OS_MSleep(2);
     printf("EPD_3IN52_Show END\r\n");
     
-    EPD_SendCommand(0X07);  // deep sleep
-    EPD_SendData(0xA5);
+    // Deep sleep removed - do not sleep after display!
+    // If sleep is needed, call EPD_3IN52_Sleep() explicitly
 }
 
 /* Display frame buffer */
