@@ -36,15 +36,11 @@
  *=========================*/
 
 /*1: use custom malloc/free, 0: use the built-in `lv_mem_alloc()` and `lv_mem_free()`*/
-/* 注意：必须为1让LVGL使用PSRAM的256KB内存池，系统堆只有~16KB会导致heap exhausted */
-#define LV_MEM_CUSTOM            1
-#if LV_MEM_CUSTOM == 1
-    /* 使用PSRAM通过dma_heap分配内存 */
-    #define LV_MEM_CUSTOM_INCLUDE <sys/dma_heap.h>
-    #define LV_MEM_CUSTOM_ALLOC(size)   _dma_malloc(size, DMAHEAP_PSRAM)
-    #define LV_MEM_CUSTOM_FREE(ptr)     _dma_free(ptr, 0)
-    /* 注意：XR872没有dma_realloc，LVGL如果需要realloc会fallback到malloc */
-#endif
+/* 使用LVGL内置TLSF分配器，配合PSRAM大数组实现无碎片内存管理 */
+#define LV_MEM_CUSTOM            0
+
+/* 内置内存池大小 - 256KB，全部放在PSRAM */
+#define LV_MEM_SIZE              (256 * 1024)
 
 /*Number of the intermediate memory buffer used during rendering*/
 #define LV_MEM_BUF_MAX_NUM       8
@@ -169,7 +165,8 @@
 #define LV_ATTRIBUTE_MEM_ALIGN_SIZE 4
 #define LV_ATTRIBUTE_MEM_ALIGN
 #define LV_ATTRIBUTE_LARGE_CONST
-#define LV_ATTRIBUTE_LARGE_RAM_ARRAY
+/* 将LVGL大数组（内存池）放到PSRAM */
+#define LV_ATTRIBUTE_LARGE_RAM_ARRAY __attribute__((section(".psram_bss")))
 #define LV_ATTRIBUTE_FAST_MEM
 #define LV_ATTRIBUTE_DMA
 #define LV_EXPORT_CONST_INT(int_value) struct _silence_gcc_warning

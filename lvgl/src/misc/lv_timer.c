@@ -113,10 +113,26 @@ uint32_t LV_ATTRIBUTE_TIMER_HANDLER lv_timer_handler(void)
         timer_deleted             = false;
         timer_created             = false;
         LV_GC_ROOT(_lv_timer_act) = _lv_ll_get_head(&LV_GC_ROOT(_lv_timer_ll));
+        
+        if (LV_GC_ROOT(_lv_timer_act) != NULL) {
+            uint32_t head_addr = (uint32_t)LV_GC_ROOT(_lv_timer_act);
+            if (head_addr < 0x01400000 || head_addr > 0x01800000) {
+                printf("[TIMER_CORRUPT] HEAD corrupted! addr=0x%08X\r\n", head_addr);
+            }
+        }
+        
         while(LV_GC_ROOT(_lv_timer_act)) {
             /*The timer might be deleted if it runs only once ('repeat_count = 1')
              *So get next element until the current is surely valid*/
             next = _lv_ll_get_next(&LV_GC_ROOT(_lv_timer_ll), LV_GC_ROOT(_lv_timer_act));
+            
+            if (next != NULL) {
+                uint32_t next_addr = (uint32_t)next;
+                if (next_addr < 0x01400000 || next_addr > 0x01800000) {
+                    printf("[TIMER_CORRUPT] NEXT corrupted! addr=0x%08X, curr=0x%08X\r\n", 
+                           next_addr, (uint32_t)LV_GC_ROOT(_lv_timer_act));
+                }
+            }
 
             if(lv_timer_exec(LV_GC_ROOT(_lv_timer_act))) {
                 /*If a timer was created or deleted then this or the next item might be corrupted*/
@@ -192,6 +208,9 @@ lv_timer_t * lv_timer_create(lv_timer_cb_t timer_xcb, uint32_t period, void * us
     new_timer->user_data = user_data;
 
     timer_created = true;
+    
+    printf("[TIMER_CREATE] new_timer=0x%08X, period=%u, cb=%p\r\n", 
+           (uint32_t)new_timer, period, timer_xcb);
 
     return new_timer;
 }
@@ -212,6 +231,7 @@ void lv_timer_set_cb(lv_timer_t * timer, lv_timer_cb_t timer_cb)
  */
 void lv_timer_del(lv_timer_t * timer)
 {
+    printf("[TIMER_DEL] deleting timer=0x%08X\r\n", (uint32_t)timer);
     _lv_ll_remove(&LV_GC_ROOT(_lv_timer_ll), timer);
     timer_deleted = true;
 

@@ -98,6 +98,7 @@ static FlushInfo flushes[MAX_FLUSHES_PER_RENDER];
 static int flush_count_this_render = 0;
 static int flush_num = 0;  // 全局render序号
 static uint32_t total_pix_this_render = 0; // 本轮总像素数（用于微渲染检测）
+static uint32_t black_pix_this_render = 0;  // 本轮黑像素数量
 
 /*====================
  * 像素格式转换
@@ -131,6 +132,7 @@ static void epd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *
     if (flush_count_this_render == 0) {
         flush_num++;
         total_pix_this_render = 0;
+        black_pix_this_render = 0;  // 重置黑像素计数
         epd_micro_render_drained = 0;  // 重置微渲染标志
     }
     
@@ -150,6 +152,10 @@ static void epd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *
     // 像素写入帧缓冲
     for (y = area->y1; y <= area->y2; y++) {
         for (x = area->x1; x <= area->x2; x++) {
+            // 统计黑像素
+            if (color_p->full == 0) {
+                black_pix_this_render++;
+            }
             set_pixel(framebuffer, x, y, *color_p);
             color_p++;
         }
@@ -166,8 +172,9 @@ static void epd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *
         // 整轮渲染结束，汇总打印所有flush的耗时
         uint32_t start_tick = flushes[0].enter_tick;
         uint32_t total_render_ms = t_exit - start_tick;
-        printf("\n[EPD_RENDER #%d] === LVGL render DONE (T=%ums, duration=%ums, %d flushes, total_pix=%lu) ===\n",
-               flush_num, t_exit, total_render_ms, flush_count_this_render, (unsigned long)total_pix_this_render);
+        printf("\n[EPD_RENDER #%d] === LVGL render DONE (T=%ums, duration=%ums, %d flushes, total_pix=%lu, BLACK_pix=%lu) ===\n",
+               flush_num, t_exit, total_render_ms, flush_count_this_render, 
+               (unsigned long)total_pix_this_render, (unsigned long)black_pix_this_render);
         for (int i = 0; i < flush_count_this_render; i++) {
             FlushInfo *fi = &flushes[i];
             uint32_t enter_gap = (i == 0) ? 0 : fi->enter_tick - flushes[i-1].enter_tick;
@@ -240,10 +247,8 @@ void lv_port_disp_init(void) {
     EPD_3IN52_Display();
     
     printf("[TEST] SPI hardware test complete. Screen should be BLACK now.\r\n");
-    printf("[TEST] Hanging forever to observe result...\r\n");
-    while(1) {
-        OS_MSleep(1000);
-    }
+    // 删除阻塞循环，添加调试信息
+    printf("[TEST] Continuing to LVGL init...\r\n");
     // =======================================================
     
     printf("[LVGL] Initial full screen refresh...\r\n");
@@ -362,7 +367,9 @@ void epd_do_refresh(void) {
     uint32_t t = epd_get_tick();
 
     printf("[EPD] Starting display (T=%ums)\n", t);
-    EPD_3IN52_Display_DU();
+    // TODO: 临时用全刷替代局刷排查问题
+    // EPD_3IN52_Display_DU();
+    EPD_3IN52_Display();
     printf("[EPD] Display done (T=%ums, epd_cost=%ums)\n", epd_get_tick(), epd_get_tick() - t);
 
     /* After EPD refresh completes, clear LVGL's invalidation queue.

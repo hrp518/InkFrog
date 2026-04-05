@@ -31,6 +31,7 @@
 #include "file_manager.h"
 #include "wlan_manager.h"
 #include "http_server.h"
+#include "mem_guard.h"
 
 /* SD卡测试函数声明 - 来自cmd_sd.c */
 extern int32_t mmc_test_init(uint32_t host_id, void *sdc_param, uint32_t scan);
@@ -413,13 +414,19 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
 
 static void lvgl_task(void *arg) {
     printf("[LVGL] Task started\r\n");
+    mem_guard_check_timer_list("lvgl_task_start");
     
     while (1) {
+        printf("[LVGL] loop tick\r\n");
         /* 【关键修复】：告诉 LVGL 时间过去了 LVGL_TIMER_PERIOD 毫秒 */
         lv_tick_inc(LVGL_TIMER_PERIOD);
         
+        mem_guard_check_timer_list("before_handler");
+        printf("[LVGL] calling lv_timer_handler\r\n");
         /* LVGL定时器处理（内部会检查是否该触发 read_cb 了） */
         lv_timer_handler();
+        printf("[LVGL] lv_timer_handler done\r\n");
+        mem_guard_check_timer_list("after_handler");
         
         /* 休眠一小段时间 */
         OS_MSleep(LVGL_TIMER_PERIOD);
@@ -434,13 +441,18 @@ static void disp_task(void *arg) {
     printf("[Display] Task started\r\n");
     
     while (1) {
+        printf("[Display] loop tick\r\n");
         /* 处理待刷新的显示 - 检查状态 */
         lv_port_disp_task();
+        printf("[Display] lv_port_disp_task done\r\n");
         
         /* 执行EPD刷新 - 可能阻塞本线程，但不影响lvgl */
+        printf("[Display] calling epd_do_refresh\r\n");
         epd_do_refresh();
+        printf("[Display] epd_do_refresh done\r\n");
         
         /* 休眠 */
+        printf("[Display] sleeping %d ms\r\n", DISP_TASK_PERIOD);
         OS_MSleep(DISP_TASK_PERIOD);
     }
 }
@@ -558,6 +570,9 @@ int main(void)
     lv_init();
     printf("[MAIN] Step 1: lv_init() completed\r\n");
     
+    /* 初始化内存监控 */
+    mem_guard_init();
+    
     /* 初始化显示端口 */
     printf("[MAIN] Step 2: Calling lv_port_disp_init()...\r\n");
     lv_port_disp_init();
@@ -568,19 +583,7 @@ int main(void)
     lv_port_indev_init();
     printf("[MAIN] Step 3: lv_port_indev_init() completed\r\n");
     
-    /* 创建显示刷新任务 */
-    if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
-                        OS_PRIORITY_NORMAL, 2048) != 0) {
-        printf("[ERROR] Failed to create disp_task\r\n");
-    }
-    
-    /* 创建LVGL任务 */
-    if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
-        printf("[ERROR] Failed to create lvgl_task\r\n");
-    }
-    
-    /* 创建演示UI - 控件测试 */
+    /* 创建演示UI - 控件测试（先创建UI，再启动后台任务，避免竞态条件） */
     
     /* 优化三：全局关闭LVGL动画 - 消除墨水屏"狂闪" */
     /*
@@ -728,7 +731,20 @@ int main(void)
     epd_resume_refresh();
     printf("[EPD] Refresh resumed after init\n");
 
-    /* 主线程完成，LVGL任务在后台运行 */
+    /* UI创建完毕，现在启动后台任务（避免LVGL链表竞态条件） */
+    printf("[MAIN] Creating background tasks...\n");
+    if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
+                        OS_PRIORITY_NORMAL, 2048) != 0) {
+        printf("[ERROR] Failed to create disp_task\r\n");
+    }
+    
+    if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
+                        OS_PRIORITY_NORMAL, 4096) != 0) {
+        printf("[ERROR] Failed to create lvgl_task\r\n");
+    }
+    printf("[MAIN] Background tasks created\n");
+
+    /* 主线程进入休眠 */
     while (1) {
         OS_MSleep(1000);
     }

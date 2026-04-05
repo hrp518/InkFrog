@@ -71,6 +71,11 @@ void * _lv_ll_ins_head(lv_ll_t * ll_p)
     n_new = lv_mem_alloc(ll_p->n_size + LL_NODE_META_SIZE);
 
     if(n_new != NULL) {
+        uint32_t addr = (uint32_t)n_new;
+        if (addr < 0x01400000 || addr > 0x01800000) {
+            printf("[LL_CORRUPT] _lv_ll_ins_head allocated node=0x%08X out of PSRAM!\r\n", addr);
+        }
+        
         node_set_prev(ll_p, n_new, NULL);       /*No prev. before the new head*/
         node_set_next(ll_p, n_new, ll_p->head); /*After new comes the old head*/
 
@@ -154,6 +159,11 @@ void * _lv_ll_ins_tail(lv_ll_t * ll_p)
 void _lv_ll_remove(lv_ll_t * ll_p, void * node_p)
 {
     if(ll_p == NULL) return;
+    
+    uint32_t node_addr = (uint32_t)node_p;
+    if (node_addr < 0x01400000 || node_addr > 0x01800000) {
+        printf("[LL_CORRUPT] _lv_ll_remove node=0x%08X is out of PSRAM!\r\n", node_addr);
+    }
 
     if(_lv_ll_get_head(ll_p) == node_p) {
         /*The new head will be the node after 'n_act'*/
@@ -256,7 +266,16 @@ void _lv_ll_chg_list(lv_ll_t * ll_ori_p, lv_ll_t * ll_new_p, void * node, bool h
 void * _lv_ll_get_head(const lv_ll_t * ll_p)
 {
     if(ll_p == NULL) return NULL;
-    return ll_p->head;
+    
+    void *head = ll_p->head;
+    if (head != NULL) {
+        uint32_t addr = (uint32_t)head;
+        if (addr < 0x01400000 || addr > 0x01800000) {
+            printf("[LL_CORRUPT] head=0x%08X is out of PSRAM range!\r\n", addr);
+        }
+    }
+    
+    return head;
 }
 
 /**
@@ -282,7 +301,17 @@ void * _lv_ll_get_next(const lv_ll_t * ll_p, const void * n_act)
      *Go there and return the address found there*/
     const lv_ll_node_t * n_act_d = n_act;
     n_act_d += LL_NEXT_P_OFFSET(ll_p);
-    return *((lv_ll_node_t **)n_act_d);
+    void *next = *((lv_ll_node_t **)n_act_d);
+    
+    if (next != NULL) {
+        uint32_t addr = (uint32_t)next;
+        if (addr < 0x01400000 || addr > 0x01800000) {
+            printf("[LL_CORRUPT] next=0x%08X from n_act=0x%08X is out of PSRAM!\r\n", 
+                   addr, (uint32_t)n_act);
+        }
+    }
+    
+    return next;
 }
 
 /**
@@ -297,7 +326,17 @@ void * _lv_ll_get_prev(const lv_ll_t * ll_p, const void * n_act)
      *Go there and return the address found there*/
     const lv_ll_node_t * n_act_d = n_act;
     n_act_d += LL_PREV_P_OFFSET(ll_p);
-    return *((lv_ll_node_t **)n_act_d);
+    void *prev = *((lv_ll_node_t **)n_act_d);
+    
+    if (prev != NULL) {
+        uint32_t addr = (uint32_t)prev;
+        if (addr < 0x01400000 || addr > 0x01800000) {
+            printf("[LL_CORRUPT] prev=0x%08X from n_act=0x%08X is out of PSRAM!\r\n", 
+                   addr, (uint32_t)n_act);
+        }
+    }
+    
+    return prev;
 }
 
 /**
