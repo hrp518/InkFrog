@@ -764,17 +764,49 @@ void EPD_3IN52_Display_DU(void)
 {
     /* Wait for EPD to be ready (BUSY high) before sending new data */
     int timeout = 0;
-    while (timeout < 1500) {
+    while (timeout < 3000) {
         if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) {
             break;
         }
         OS_MSleep(1);
         timeout++;
     }
-    if (timeout >= 1500) {
+    if (timeout >= 3000) {
         printf("[EPD] EPD_3IN52_Display_DU: busy wait timeout\r\n");
         return;
     }
+    
+    /* Re-initialize panel for DU mode - EPD needs this after GC refresh */
+    EPD_SendCommand(0x00);  // panel setting PSR
+    EPD_SendData(0xFF);
+    EPD_SendData(0x01);
+    
+    EPD_SendCommand(0x01);  // POWER SETTING PWR
+    EPD_SendData(0x03);
+    EPD_SendData(0x10);
+    EPD_SendData(0x3F);
+    EPD_SendData(0x3F);
+    EPD_SendData(0x03);
+    
+    EPD_SendCommand(0x06);  // booster soft start BTST
+    EPD_SendData(0x37);
+    EPD_SendData(0x3D);
+    EPD_SendData(0x3D);
+    
+    EPD_SendCommand(0x60);  // TCON setting
+    EPD_SendData(0x22);
+    
+    EPD_SendCommand(0x82);  // VCOM_DC setting VDCS
+    EPD_SendData(0x07);
+    
+    EPD_SendCommand(0x30);  // PLL setting
+    EPD_SendData(0x09);
+    
+    EPD_SendCommand(0xe3);  // power saving PWS
+    EPD_SendData(0x88);
+    
+    EPD_SendCommand(0x50);  // VCOM setting
+    EPD_SendData(0xB7);
     
     /* Send framebuffer data to EPD */
     EPD_SendCommand(0x13);
