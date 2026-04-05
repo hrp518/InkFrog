@@ -643,7 +643,13 @@ int main(void)
     
     lv_obj_t *sw2 = lv_switch_create(scr);
     lv_obj_align(sw2, LV_ALIGN_LEFT_MID, 120, -30);
-    // sw2 默认关闭状态，不需要特殊设置
+    // sw2 也需要边框才能在单色屏上可见
+    static lv_style_t style_sw2;
+    lv_style_init(&style_sw2);
+    lv_style_set_border_width(&style_sw2, 2);
+    lv_style_set_border_color(&style_sw2, lv_color_make(0, 0, 0));
+    lv_style_set_radius(&style_sw2, LV_RADIUS_CIRCLE);
+    lv_obj_add_style(sw2, &style_sw2, LV_PART_MAIN);
     
     // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
     // 对开关的所有 Part 彻底禁用过渡动画
@@ -665,6 +671,12 @@ int main(void)
     lv_obj_align(slider, LV_ALIGN_LEFT_MID, 120, 20);
     lv_slider_set_range(slider, 0, 100);
     lv_slider_set_value(slider, 50, LV_ANIM_OFF);
+    // Slider也需要边框才能在单色屏上可见
+    static lv_style_t style_slider;
+    lv_style_init(&style_slider);
+    lv_style_set_border_width(&style_slider, 2);
+    lv_style_set_border_color(&style_slider, lv_color_make(0, 0, 0));
+    lv_obj_add_style(slider, &style_slider, LV_PART_MAIN);
     
     // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
     lv_obj_set_style_transition(slider, NULL, LV_PART_INDICATOR);
@@ -677,10 +689,15 @@ int main(void)
     lv_obj_set_style_text_color(slider_value, lv_color_make(0, 0, 0), 0);
     lv_obj_align(slider_value, LV_ALIGN_LEFT_MID, 280, 20);
     
-    // 按钮1
+    // 按钮1 - 需要边框才能在单色屏上可见
     lv_obj_t *btn1 = lv_btn_create(scr);
     lv_obj_set_size(btn1, 80, 40);
     lv_obj_align(btn1, LV_ALIGN_LEFT_MID, 20, 80);
+    static lv_style_t style_btn1;
+    lv_style_init(&style_btn1);
+    lv_style_set_border_width(&style_btn1, 2);
+    lv_style_set_border_color(&style_btn1, lv_color_make(0, 0, 0));
+    lv_obj_add_style(btn1, &style_btn1, LV_PART_MAIN);
     lv_obj_t *btn1_label = lv_label_create(btn1);
     lv_label_set_text(btn1_label, "Button 1");
     lv_obj_set_style_text_color(btn1_label, lv_color_make(0, 0, 0), 0);
@@ -689,10 +706,15 @@ int main(void)
     lv_obj_set_style_transition(btn1, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(btn1, NULL, LV_PART_SCROLLBAR);
     
-    // 按钮2
+    // 按钮2 - 需要边框才能在单色屏上可见
     lv_obj_t *btn2 = lv_btn_create(scr);
     lv_obj_set_size(btn2, 80, 40);
     lv_obj_align(btn2, LV_ALIGN_LEFT_MID, 120, 80);
+    static lv_style_t style_btn2;
+    lv_style_init(&style_btn2);
+    lv_style_set_border_width(&style_btn2, 2);
+    lv_style_set_border_color(&style_btn2, lv_color_make(0, 0, 0));
+    lv_obj_add_style(btn2, &style_btn2, LV_PART_MAIN);
     lv_obj_t *btn2_label = lv_label_create(btn2);
     lv_label_set_text(btn2_label, "Button 2");
     lv_obj_set_style_text_color(btn2_label, lv_color_make(0, 0, 0), 0);
@@ -701,10 +723,15 @@ int main(void)
     lv_obj_set_style_transition(btn2, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(btn2, NULL, LV_PART_SCROLLBAR);
     
-    // 文件管理器按钮
+    // 文件管理器按钮 - 需要边框才能在单色屏上可见
     lv_obj_t *btn_fm = lv_btn_create(scr);
     lv_obj_set_size(btn_fm, 120, 40);
     lv_obj_align(btn_fm, LV_ALIGN_LEFT_MID, 20, 130);
+    static lv_style_t style_btn_fm;
+    lv_style_init(&style_btn_fm);
+    lv_style_set_border_width(&style_btn_fm, 2);
+    lv_style_set_border_color(&style_btn_fm, lv_color_make(0, 0, 0));
+    lv_obj_add_style(btn_fm, &style_btn_fm, LV_PART_MAIN);
     lv_obj_set_style_transition(btn_fm, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(btn_fm, NULL, LV_PART_SCROLLBAR);
     lv_obj_t *btn_fm_label = lv_label_create(btn_fm);
