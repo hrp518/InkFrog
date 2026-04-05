@@ -1,0 +1,7 @@
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\chsc6540.o
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\command.o
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\ctp.o
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\epd.o
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\lv_port_disp.o
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\lv_port_indev.o
+C:\home\Administrator\xradio-skylark-sdk-xradio-skylark-sdk-1.0.2\project\demo\lvgl_intergration\main.o
