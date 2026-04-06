@@ -662,9 +662,11 @@ int main(void)
     lv_obj_t *sw2_label = lv_label_create(scr);
     lv_label_set_text(sw2_label, "Switch 2:");
     lv_obj_set_style_text_color(sw2_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(sw2_label, 80, 20);
     lv_obj_align(sw2_label, LV_ALIGN_LEFT_MID, 20, -30);
     
     lv_obj_t *sw2 = lv_switch_create(scr);
+    lv_obj_set_size(sw2, 50, 25);
     lv_obj_align(sw2, LV_ALIGN_LEFT_MID, 120, -30);
     // sw2 默认关闭状态，不需要特殊设置
     
@@ -681,10 +683,11 @@ int main(void)
     lv_obj_t *slider_label = lv_label_create(scr);
     lv_label_set_text(slider_label, "Slider:");
     lv_obj_set_style_text_color(slider_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(slider_label, 80, 20);
     lv_obj_align(slider_label, LV_ALIGN_LEFT_MID, 20, 20);
     
     lv_obj_t *slider = lv_slider_create(scr);
-    lv_obj_set_width(slider, 150);
+    lv_obj_set_size(slider, 150, 30);
     lv_obj_align(slider, LV_ALIGN_LEFT_MID, 120, 20);
     lv_slider_set_range(slider, 0, 100);
     lv_slider_set_value(slider, 50, LV_ANIM_OFF);
@@ -698,6 +701,9 @@ int main(void)
     lv_obj_t *slider_value = lv_label_create(scr);
     lv_label_set_text_fmt(slider_value, "%d%%", 50);
     lv_obj_set_style_text_color(slider_value, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(slider_value, 50, 20);
+    lv_obj_align(slider_value, LV_ALIGN_LEFT_MID, 280, 20);
+    lv_obj_set_style_text_color(slider_value, lv_color_make(0, 0, 0), 0);
     lv_obj_align(slider_value, LV_ALIGN_LEFT_MID, 280, 20);
     
     // 按钮1
@@ -707,6 +713,7 @@ int main(void)
     lv_obj_t *btn1_label = lv_label_create(btn1);
     lv_label_set_text(btn1_label, "Button 1");
     lv_obj_set_style_text_color(btn1_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(btn1_label, 70, 30);
     
     // 【真正的精准打击】：按钮也有过渡，关闭它
     lv_obj_set_style_transition(btn1, NULL, LV_PART_MAIN);
@@ -719,6 +726,7 @@ int main(void)
     lv_obj_t *btn2_label = lv_label_create(btn2);
     lv_label_set_text(btn2_label, "Button 2");
     lv_obj_set_style_text_color(btn2_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(btn2_label, 70, 30);
     
     // 【真正的精准打击】：按钮也有过渡，关闭它
     lv_obj_set_style_transition(btn2, NULL, LV_PART_MAIN);
@@ -733,6 +741,7 @@ int main(void)
     lv_obj_t *btn_fm_label = lv_label_create(btn_fm);
     lv_label_set_text(btn_fm_label, "File Manager");
     lv_obj_set_style_text_color(btn_fm_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(btn_fm_label, 110, 30);
     lv_obj_add_event_cb(btn_fm, file_manager_btn_event_handler, LV_EVENT_CLICKED, NULL);
     
     // 网络状态标签
@@ -743,6 +752,7 @@ int main(void)
         lv_label_set_text(net_label, "WiFi: OFF");
     }
     lv_obj_set_style_text_color(net_label, lv_color_make(0, 128, 0), 0);
+    lv_obj_set_size(net_label, 100, 20);
     lv_obj_align(net_label, LV_ALIGN_TOP_RIGHT, -10, 10);
     
     printf("\r\n[OK] LVGL system initialized!\r\n");
