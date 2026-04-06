@@ -229,8 +229,7 @@
  ../../../../project/common/framework/sys_ctrl/looper.h \
  ../../../../project/demo/LVGL_withSDandNetwork/file_manager.h \
  ../../../../project/demo/LVGL_withSDandNetwork/wlan_manager.h \
- ../../../../project/demo/LVGL_withSDandNetwork/http_server.h \
- ../../../../project/demo/LVGL_withSDandNetwork/mem_guard.h
+ ../../../../project/demo/LVGL_withSDandNetwork/http_server.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -699,5 +698,3 @@
 ../../../../project/demo/LVGL_withSDandNetwork/wlan_manager.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/http_server.h:
-
-../../../../project/demo/LVGL_withSDandNetwork/mem_guard.h:

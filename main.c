@@ -31,7 +31,6 @@
 #include "file_manager.h"
 #include "wlan_manager.h"
 #include "http_server.h"
-#include "mem_guard.h"
 
 /* SD卡测试函数声明 - 来自cmd_sd.c */
 extern int32_t mmc_test_init(uint32_t host_id, void *sdc_param, uint32_t scan);
@@ -44,7 +43,7 @@ extern struct mmc_card *mmc_scan_init(uint16_t sd_id, uint16_t sdc_id, void *car
 /* 显示刷新任务周期 (ms) - 优化二：提高响应速度 */
 #define DISP_TASK_PERIOD     20
 
-/* LVGL线程句柄 - 非static以便在刷新时挂起 */
+/* LVGL线程句柄 - 用于刷新时挂起LVGL任务防止SPI冲突 */
 OS_Thread_t lvgl_thread;
 static OS_Thread_t disp_task_thread;
 
@@ -414,19 +413,13 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
 
 static void lvgl_task(void *arg) {
     printf("[LVGL] Task started\r\n");
-    mem_guard_check_timer_list("lvgl_task_start");
     
     while (1) {
-        printf("[LVGL] loop tick\r\n");
         /* 【关键修复】：告诉 LVGL 时间过去了 LVGL_TIMER_PERIOD 毫秒 */
         lv_tick_inc(LVGL_TIMER_PERIOD);
         
-        mem_guard_check_timer_list("before_handler");
-        printf("[LVGL] calling lv_timer_handler\r\n");
         /* LVGL定时器处理（内部会检查是否该触发 read_cb 了） */
         lv_timer_handler();
-        printf("[LVGL] lv_timer_handler done\r\n");
-        mem_guard_check_timer_list("after_handler");
         
         /* 休眠一小段时间 */
         OS_MSleep(LVGL_TIMER_PERIOD);
@@ -441,18 +434,13 @@ static void disp_task(void *arg) {
     printf("[Display] Task started\r\n");
     
     while (1) {
-        printf("[Display] loop tick\r\n");
         /* 处理待刷新的显示 - 检查状态 */
         lv_port_disp_task();
-        printf("[Display] lv_port_disp_task done\r\n");
         
         /* 执行EPD刷新 - 可能阻塞本线程，但不影响lvgl */
-        printf("[Display] calling epd_do_refresh\r\n");
         epd_do_refresh();
-        printf("[Display] epd_do_refresh done\r\n");
         
         /* 休眠 */
-        printf("[Display] sleeping %d ms\r\n", DISP_TASK_PERIOD);
         OS_MSleep(DISP_TASK_PERIOD);
     }
 }
@@ -570,9 +558,6 @@ int main(void)
     lv_init();
     printf("[MAIN] Step 1: lv_init() completed\r\n");
     
-    /* 初始化内存监控 */
-    mem_guard_init();
-    
     /* 初始化显示端口 */
     printf("[MAIN] Step 2: Calling lv_port_disp_init()...\r\n");
     lv_port_disp_init();
@@ -583,7 +568,19 @@ int main(void)
     lv_port_indev_init();
     printf("[MAIN] Step 3: lv_port_indev_init() completed\r\n");
     
-    /* 创建演示UI - 控件测试（先创建UI，再启动后台任务，避免竞态条件） */
+    /* 创建显示刷新任务 */
+    if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
+                        OS_PRIORITY_NORMAL, 2048) != 0) {
+        printf("[ERROR] Failed to create disp_task\r\n");
+    }
+    
+    /* 创建LVGL任务 */
+    if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
+                        OS_PRIORITY_NORMAL, 4096) != 0) {
+        printf("[ERROR] Failed to create lvgl_task\r\n");
+    }
+    
+    /* 创建演示UI - 控件测试 */
     
     /* 优化三：全局关闭LVGL动画 - 消除墨水屏"狂闪" */
     /*
@@ -599,25 +596,51 @@ int main(void)
     lv_style_set_border_width(&style_no_anim, 0);
     
     lv_obj_t *scr = lv_scr_act();
+    printf("[MAIN] scr=%p\n");
     
     /* 针对所有对象（Part Main）在所有状态下应用此样式 */
     lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
     lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);  // 白色背景
+    printf("[MAIN] scr styled\n");
     
     // 标题
+    printf("[MAIN] Creating title label...\n");
     lv_obj_t *title = lv_label_create(scr);
+    printf("[MAIN] title=%p created\n", (void*)title);
     lv_label_set_text(title, "LVGL EPD Controls");
     lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(title, 200, 30);
+    printf("[MAIN] title set_size(200,30) called\n");
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
     
+    // 检查title coords
+    lv_area_t title_coords;
+    lv_obj_get_coords(title, &title_coords);
+    printf("[MAIN] title coords: (%d,%d)-(%d,%d), w=%d, h=%d\n",
+           title_coords.x1, title_coords.y1, title_coords.x2, title_coords.y2,
+           title_coords.x2 - title_coords.x1 + 1, title_coords.y2 - title_coords.y1 + 1);
+    
     // 开关1 - 带标签
+    printf("[MAIN] Creating sw1_label...\n");
     lv_obj_t *sw1_label = lv_label_create(scr);
     lv_label_set_text(sw1_label, "Switch 1:");
     lv_obj_set_style_text_color(sw1_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(sw1_label, 80, 20);
     lv_obj_align(sw1_label, LV_ALIGN_LEFT_MID, 20, -80);
     
+    printf("[MAIN] Creating sw1...\n");
     lv_obj_t *sw1 = lv_switch_create(scr);
+    printf("[MAIN] sw1=%p created\n", (void*)sw1);
+    lv_obj_set_size(sw1, 50, 25);
+    printf("[MAIN] sw1 set_size(50,25) called\n");
     lv_obj_align(sw1, LV_ALIGN_LEFT_MID, 120, -80);
+    
+    // 检查sw1 coords
+    lv_area_t sw1_coords;
+    lv_obj_get_coords(sw1, &sw1_coords);
+    printf("[MAIN] sw1 coords: (%d,%d)-(%d,%d), w=%d, h=%d\n",
+           sw1_coords.x1, sw1_coords.y1, sw1_coords.x2, sw1_coords.y2,
+           sw1_coords.x2 - sw1_coords.x1 + 1, sw1_coords.y2 - sw1_coords.y1 + 1);
     lv_obj_add_state(sw1, LV_STATE_CHECKED);  // 默认开启
     // 开关: 设置边框使开关可见
     static lv_style_t style_sw;
@@ -643,13 +666,7 @@ int main(void)
     
     lv_obj_t *sw2 = lv_switch_create(scr);
     lv_obj_align(sw2, LV_ALIGN_LEFT_MID, 120, -30);
-    // sw2 也需要边框才能在单色屏上可见
-    static lv_style_t style_sw2;
-    lv_style_init(&style_sw2);
-    lv_style_set_border_width(&style_sw2, 2);
-    lv_style_set_border_color(&style_sw2, lv_color_make(0, 0, 0));
-    lv_style_set_radius(&style_sw2, LV_RADIUS_CIRCLE);
-    lv_obj_add_style(sw2, &style_sw2, LV_PART_MAIN);
+    // sw2 默认关闭状态，不需要特殊设置
     
     // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
     // 对开关的所有 Part 彻底禁用过渡动画
@@ -671,12 +688,6 @@ int main(void)
     lv_obj_align(slider, LV_ALIGN_LEFT_MID, 120, 20);
     lv_slider_set_range(slider, 0, 100);
     lv_slider_set_value(slider, 50, LV_ANIM_OFF);
-    // Slider也需要边框才能在单色屏上可见
-    static lv_style_t style_slider;
-    lv_style_init(&style_slider);
-    lv_style_set_border_width(&style_slider, 2);
-    lv_style_set_border_color(&style_slider, lv_color_make(0, 0, 0));
-    lv_obj_add_style(slider, &style_slider, LV_PART_MAIN);
     
     // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
     lv_obj_set_style_transition(slider, NULL, LV_PART_INDICATOR);
@@ -689,15 +700,10 @@ int main(void)
     lv_obj_set_style_text_color(slider_value, lv_color_make(0, 0, 0), 0);
     lv_obj_align(slider_value, LV_ALIGN_LEFT_MID, 280, 20);
     
-    // 按钮1 - 需要边框才能在单色屏上可见
+    // 按钮1
     lv_obj_t *btn1 = lv_btn_create(scr);
     lv_obj_set_size(btn1, 80, 40);
     lv_obj_align(btn1, LV_ALIGN_LEFT_MID, 20, 80);
-    static lv_style_t style_btn1;
-    lv_style_init(&style_btn1);
-    lv_style_set_border_width(&style_btn1, 2);
-    lv_style_set_border_color(&style_btn1, lv_color_make(0, 0, 0));
-    lv_obj_add_style(btn1, &style_btn1, LV_PART_MAIN);
     lv_obj_t *btn1_label = lv_label_create(btn1);
     lv_label_set_text(btn1_label, "Button 1");
     lv_obj_set_style_text_color(btn1_label, lv_color_make(0, 0, 0), 0);
@@ -706,15 +712,10 @@ int main(void)
     lv_obj_set_style_transition(btn1, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(btn1, NULL, LV_PART_SCROLLBAR);
     
-    // 按钮2 - 需要边框才能在单色屏上可见
+    // 按钮2
     lv_obj_t *btn2 = lv_btn_create(scr);
     lv_obj_set_size(btn2, 80, 40);
     lv_obj_align(btn2, LV_ALIGN_LEFT_MID, 120, 80);
-    static lv_style_t style_btn2;
-    lv_style_init(&style_btn2);
-    lv_style_set_border_width(&style_btn2, 2);
-    lv_style_set_border_color(&style_btn2, lv_color_make(0, 0, 0));
-    lv_obj_add_style(btn2, &style_btn2, LV_PART_MAIN);
     lv_obj_t *btn2_label = lv_label_create(btn2);
     lv_label_set_text(btn2_label, "Button 2");
     lv_obj_set_style_text_color(btn2_label, lv_color_make(0, 0, 0), 0);
@@ -723,15 +724,10 @@ int main(void)
     lv_obj_set_style_transition(btn2, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(btn2, NULL, LV_PART_SCROLLBAR);
     
-    // 文件管理器按钮 - 需要边框才能在单色屏上可见
+    // 文件管理器按钮
     lv_obj_t *btn_fm = lv_btn_create(scr);
     lv_obj_set_size(btn_fm, 120, 40);
     lv_obj_align(btn_fm, LV_ALIGN_LEFT_MID, 20, 130);
-    static lv_style_t style_btn_fm;
-    lv_style_init(&style_btn_fm);
-    lv_style_set_border_width(&style_btn_fm, 2);
-    lv_style_set_border_color(&style_btn_fm, lv_color_make(0, 0, 0));
-    lv_obj_add_style(btn_fm, &style_btn_fm, LV_PART_MAIN);
     lv_obj_set_style_transition(btn_fm, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(btn_fm, NULL, LV_PART_SCROLLBAR);
     lv_obj_t *btn_fm_label = lv_label_create(btn_fm);
@@ -758,20 +754,7 @@ int main(void)
     epd_resume_refresh();
     printf("[EPD] Refresh resumed after init\n");
 
-    /* UI创建完毕，现在启动后台任务（避免LVGL链表竞态条件） */
-    printf("[MAIN] Creating background tasks...\n");
-    if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
-                        OS_PRIORITY_NORMAL, 2048) != 0) {
-        printf("[ERROR] Failed to create disp_task\r\n");
-    }
-    
-    if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
-        printf("[ERROR] Failed to create lvgl_task\r\n");
-    }
-    printf("[MAIN] Background tasks created\n");
-
-    /* 主线程进入休眠 */
+    /* 主线程完成，LVGL任务在后台运行 */
     while (1) {
         OS_MSleep(1000);
     }
