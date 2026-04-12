@@ -568,18 +568,6 @@ int main(void)
     lv_port_indev_init();
     printf("[MAIN] Step 3: lv_port_indev_init() completed\r\n");
     
-    /* 创建显示刷新任务 */
-    if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
-                        OS_PRIORITY_NORMAL, 2048) != 0) {
-        printf("[ERROR] Failed to create disp_task\r\n");
-    }
-    
-    /* 创建LVGL任务 */
-    if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
-        printf("[ERROR] Failed to create lvgl_task\r\n");
-    }
-    
     /* 创建演示UI - 控件测试 */
     
     /* 优化三：全局关闭LVGL动画 - 消除墨水屏"狂闪" */
@@ -759,6 +747,16 @@ int main(void)
     printf("[INFO] Controls: 2 switches, 1 slider, 3 buttons\r\n");
     printf("[INFO] Network: %s\r\n\r\n",
            http_server_is_running() ? "enabled" : "disabled");
+
+    /* UI创建完毕，启动后台任务 */
+    if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
+                        OS_PRIORITY_NORMAL, 2048) != 0) {
+        printf("[ERROR] Failed to create disp_task\r\n");
+    }
+    if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
+                        OS_PRIORITY_NORMAL, 4096) != 0) {
+        printf("[ERROR] Failed to create lvgl_task\r\n");
+    }
 
     // 初始化完成，恢复EPD刷新
     epd_resume_refresh();

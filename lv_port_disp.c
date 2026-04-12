@@ -78,9 +78,9 @@ extern uint8_t framebuffer[EPD_BUFFER_SIZE];
 
 // LVGL绘制缓冲
 #ifdef __CONFIG_PSRAM
-static lv_color_t lv_draw_buf[EPD_HORZ * EPD_VERT / 8] __attribute__((section(".psram_bss")));
+static lv_color_t lv_draw_buf[EPD_HORZ * EPD_VERT] __attribute__((section(".psram_bss")));
 #else
-static lv_color_t lv_draw_buf[EPD_HORZ * EPD_VERT / 8];
+static lv_color_t lv_draw_buf[EPD_HORZ * EPD_VERT];
 #endif
 static lv_disp_draw_buf_t disp_buf;
 static lv_disp_drv_t disp_drv;
