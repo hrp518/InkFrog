@@ -1201,6 +1201,9 @@ int http_server_init(int port)
 {
     g_http_port = port > 0 ? port : HTTP_SERVER_PORT;
     g_http_running = 0;
+    printf("[HTTP] init: BEFORE SetInvalid, handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
+    OS_ThreadSetInvalid(&g_http_thread);
+    printf("[HTTP] init: AFTER SetInvalid, handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
     
     /* SD卡已在main.c中挂载，保持挂载状态 */
     
@@ -1213,6 +1216,8 @@ int http_server_init(int port)
  */
 int http_server_start(void)
 {
+    printf("[HTTP] start: ENTER, g_http_running=%d, handle=0x%08x\r\n", g_http_running, (unsigned int)g_http_thread.handle);
+    
     if (g_http_running) {
         HTTP_LOG("Server already running");
         return 0;
@@ -1225,12 +1230,13 @@ int http_server_start(void)
     printf("[HTTP] HTTP_RESPONSE_SIZE = %d bytes\r\n", HTTP_RESPONSE_SIZE);
     printf("[HTTP] HTTP_BUF_SIZE = %d bytes\r\n", HTTP_BUF_SIZE);
     printf("[HTTP] HTTP_MAX_PATH = %d bytes\r\n", HTTP_MAX_PATH);
-    printf("[HTTP] Thread stack size = 4096 bytes\r\n");
+    printf("[HTTP] Thread stack size = 2048 bytes\r\n");
+    printf("[HTTP] g_http_thread.handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
     
-    /* 将线程栈从 8192 降为 4096 */
+    /* 将线程栈从 4096 降为 2048 */
     if (OS_ThreadCreate(&g_http_thread, "http_server",
                         http_server_thread, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
+                        OS_PRIORITY_NORMAL, 2048) != 0) {
         HTTP_LOG("Failed to create thread");
         g_http_running = 0;
         return -1;
