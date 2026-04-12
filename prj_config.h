@@ -45,7 +45,7 @@ extern "C" {
 #define PRJCONF_MAIN_THREAD_PRIO        OS_THREAD_PRIO_APP
 
 /* main thread stack size */
-#define PRJCONF_MAIN_THREAD_STACK_SIZE  (2 * 1024)
+#define PRJCONF_MAIN_THREAD_STACK_SIZE  (8 * 1024)
 
 /* sys ctrl enable/disable */
 #define PRJCONF_SYS_CTRL_EN             1

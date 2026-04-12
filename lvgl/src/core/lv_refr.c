@@ -233,9 +233,14 @@ void _lv_inv_area(lv_disp_t * disp, const lv_area_t * area_p)
 
     /*If there were at least 1 invalid area in full refresh mode, redraw the whole screen*/
     if(disp->driver->full_refresh) {
+        extern volatile uint8_t epd_refresh_in_progress;
+        extern volatile uint8_t epd_refresh_requested;
         disp->inv_areas[0] = scr_area;
         disp->inv_p = 1;
         if(disp->refr_timer) lv_timer_resume(disp->refr_timer);
+        printf("[INV_AREA] full_refresh: area(%d,%d)-(%d,%d) -> inv_p=1, epd_in_progress=%d, epd_requested=%d\n",
+               com_area.x1, com_area.y1, com_area.x2, com_area.y2,
+               epd_refresh_in_progress, epd_refresh_requested);
         return;
     }
 
@@ -292,10 +297,15 @@ void _lv_disp_refr_timer(lv_timer_t * tmr)
 
     extern volatile uint8_t epd_refresh_in_progress;
     extern volatile uint8_t epd_refresh_requested;
-    if(epd_refresh_in_progress || epd_refresh_requested) return;
+    if(epd_refresh_in_progress || epd_refresh_requested) {
+        printf("[REFR_TIMER] BLOCKED: epd_in_progress=%d, epd_requested=%d\n",
+               epd_refresh_in_progress, epd_refresh_requested);
+        return;
+    }
 
     if(tmr) {
         disp_refr = tmr->user_data;
+        printf("[REFR_TIMER] RUNNING: inv_p=%d\n", disp_refr ? disp_refr->inv_p : -1);
 #if LV_USE_PERF_MONITOR == 0 && LV_USE_MEM_MONITOR == 0
         lv_timer_pause(tmr);
 #endif

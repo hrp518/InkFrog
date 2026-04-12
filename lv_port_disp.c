@@ -370,31 +370,28 @@ void epd_do_refresh(void) {
     epd_refresh_in_progress = 1;
     uint32_t t = epd_get_tick();
 
-    printf("[EPD] Starting display (T=%ums)\n", t);
+    lv_disp_t * disp_before = lv_disp_get_default();
+    printf("[EPD] Starting display (T=%ums) inv_p_before=%d\n", t, disp_before ? disp_before->inv_p : -1);
     
-    /* 终极护航：挂起LVGL任务，防止SPI传输被中断导致busy死等 */
     vTaskSuspend(lvgl_thread.handle);
     EPD_3IN52_Display_DU();
-    vTaskResume(lvgl_thread.handle);
     
-    printf("[EPD] Display done (T=%ums, epd_cost=%ums)\n", epd_get_tick(), epd_get_tick() - t);
-
-    /* After EPD refresh completes, clear LVGL's invalidation queue.
-     * Without this, a small pending invalidation (e.g. 6x6 from lv_list style
-     * recalc) survives from the previous frame and triggers another REFR_TIMER
-     * render + another EPD refresh → infinite loop at ~922ms period.
-     * Clearing inv_p here breaks the loop: next REFR_TIMER sees inv_p=0 and
-     * does nothing, leaving the EPD idle until a real user interaction. */
     lv_disp_t * disp = lv_disp_get_default();
+    int inv_p_during = disp ? disp->inv_p : -1;
+    printf("[EPD] Display done (T=%ums, epd_cost=%ums) inv_p_during=%d\n", epd_get_tick(), epd_get_tick() - t, inv_p_during);
+
     if (disp) {
+        printf("[EPD] Clearing inv_p: %d -> 0\n", disp->inv_p);
         disp->inv_p = 0;
     }
 
     epd_refresh_in_progress = 0;
     epd_sync.refresh_busy = 0;
-    // 不能强制清零 pending！如果EPD刷新时LVGL渲染好新帧，会被这行代码干掉
     epd_sync.last_refresh_time = epd_get_tick();
     epd_sync.state = EPD_STATE_IDLE;
+
+    vTaskResume(lvgl_thread.handle);
+    printf("[EPD] LVGL resumed, waiting to see if INV_AREA fires...\n");
 }
 
 /*====================

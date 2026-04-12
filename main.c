@@ -204,9 +204,8 @@ static FRESULT fatfs_scan_files(char *path)
     DIR dir;
     static FILINFO fno;
     
-    /* 路径栈 - 使用静态数组存储待扫描的目录 */
-    char path_stack[MAX_PATH_STACK][256];
-    int stack_top = 0;
+    static char path_stack[MAX_PATH_STACK][256];
+    static int stack_top = 0;
     
     /* 初始化 - 将根目录压入栈 */
     strcpy(path_stack[0], path);
