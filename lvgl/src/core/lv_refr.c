@@ -322,6 +322,8 @@ void _lv_disp_refr_timer(lv_timer_t * tmr)
         return;
     }
 
+    lv_obj_update_layout(disp_refr->act_scr);
+
     lv_refr_join_area();
     refr_sync_areas();
     refr_invalid_areas();

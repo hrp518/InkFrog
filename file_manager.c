@@ -625,27 +625,29 @@ static void display_current_page(void)
     /* 清空列表 */
     lv_obj_clean(fm_list);
     
-    /* 显示当前页的文件 */
-    for (int i = start_idx; i < end_idx; i++) {
-        FileEntry *entry = &file_entries[i];
-        
-        /* 处理返回按钮 */
-        if (entry->is_dir == 0xFF) {
-            lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, entry->name);
-            epd_disable_all_animations_recursive(btn);
-            lv_obj_set_style_text_font(btn, get_reader_font(), 0);
-            lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
-            continue;
-        }
-        
-        /* 普通文件/目录 */
-        const char *icon = get_file_icon(entry->name, entry->is_dir);
-        char item_text[280];
-        snprintf(item_text, sizeof(item_text), "%s %s", icon, entry->name);
-        
-        lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, item_text);
+     /* 显示当前页的文件 */
+     for (int i = start_idx; i < end_idx; i++) {
+         FileEntry *entry = &file_entries[i];
+         
+         /* 处理返回按钮 */
+         if (entry->is_dir == 0xFF) {
+        lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, entry->name);
         epd_disable_all_animations_recursive(btn);
-        lv_obj_set_style_text_font(btn, get_reader_font(), 0);
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
+        lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
+        continue;
+         }
+         
+         /* 普通文件/目录 */
+         const char *icon = get_file_icon(entry->name, entry->is_dir);
+         static char item_text[280];
+         snprintf(item_text, sizeof(item_text), "%s %s", icon, entry->name);
+         
+         lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, item_text);
+        epd_disable_all_animations_recursive(btn);
+        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+        if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
         
         char *path_copy = malloc(strlen(entry->full_path) + 1);
         if (path_copy) {

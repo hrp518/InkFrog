@@ -97,16 +97,12 @@ bool lv_obj_refr_size(lv_obj_t * obj)
     }
     else {
         w = lv_obj_get_style_width(obj, LV_PART_MAIN);
-        printf("[DBG] lv_obj_refr_size: obj=%p, style_w=%d, LV_SIZE_CONTENT=%d\n", 
-               (void*)obj, (int)w, (int)LV_SIZE_CONTENT);
         w_is_content = w == LV_SIZE_CONTENT ? true : false;
         w_is_pct = LV_COORD_IS_PCT(w) ? true : false;
         lv_coord_t parent_w = lv_obj_get_content_width(parent);
-        printf("[DBG]   w_is_content=%d, w_is_pct=%d, parent_w=%d\n", w_is_content, w_is_pct, (int)parent_w);
 
         if(w_is_content) {
             w = calc_content_width(obj);
-            printf("[DBG]   calc_content_width=%d\n", (int)w);
         }
         else if(w_is_pct) {
             /*If parent has content size and the child has pct size
@@ -194,8 +190,6 @@ bool lv_obj_refr_size(lv_obj_t * obj)
     else {
         obj->coords.x2 = obj->coords.x1 + w - 1;
     }
-    printf("[DBG] lv_obj_refr_size set coords: obj=%p, x1=%d, y1=%d, x2=%d, y2=%d, w=%d, h=%d\n",
-           (void*)obj, obj->coords.x1, obj->coords.y1, obj->coords.x2, obj->coords.y2, (int)w, (int)h);
 
     /*Call the ancestor's event handler to the object with its new coordinates*/
     lv_event_send(obj, LV_EVENT_SIZE_CHANGED, &ori);
@@ -224,37 +218,18 @@ void lv_obj_set_size(lv_obj_t * obj, lv_coord_t w, lv_coord_t h)
 
     lv_obj_set_width(obj, w);
     lv_obj_set_height(obj, h);
-    
-    /* Force immediate coords update */
-    lv_obj_refr_size(obj);
 }
 
 void lv_obj_set_width(lv_obj_t * obj, lv_coord_t w)
 {
     LV_ASSERT_OBJ(obj, MY_CLASS);
-    lv_res_t res_w;
-    lv_style_value_t v_w;
-    printf("[DBG] lv_obj_set_width: obj=%p, w=%d\n", (void*)obj, (int)w);
-    res_w = lv_obj_get_local_style_prop(obj, LV_STYLE_WIDTH, &v_w, 0);
-    printf("[DBG]   existing style_w=%d, res=%d\n", (int)v_w.num, res_w);
-
-    if((res_w == LV_RES_OK && v_w.num != w) || res_w == LV_RES_INV) {
-        lv_obj_set_style_width(obj, w, 0);
-        printf("[DBG]   lv_obj_set_style_width called\n");
-    }
+    lv_obj_set_style_width(obj, w, 0);
 }
 
 void lv_obj_set_height(lv_obj_t * obj, lv_coord_t h)
 {
     LV_ASSERT_OBJ(obj, MY_CLASS);
-    lv_res_t res_h;
-    lv_style_value_t v_h;
-
-    res_h = lv_obj_get_local_style_prop(obj, LV_STYLE_HEIGHT, &v_h, 0);
-
-    if((res_h == LV_RES_OK && v_h.num != h) || res_h == LV_RES_INV) {
-        lv_obj_set_style_height(obj, h, 0);
-    }
+    lv_obj_set_style_height(obj, h, 0);
 }
 
 void lv_obj_set_content_width(lv_obj_t * obj, lv_coord_t w)
@@ -351,8 +326,6 @@ void lv_obj_align(lv_obj_t * obj, lv_align_t align, lv_coord_t x_ofs, lv_coord_t
 {
     lv_obj_set_style_align(obj, align, 0);
     lv_obj_set_pos(obj, x_ofs, y_ofs);
-    /* Force immediate position update */
-    lv_obj_refr_pos(obj);
 }
 
 void lv_obj_align_to(lv_obj_t * obj, const lv_obj_t * base, lv_align_t align, lv_coord_t x_ofs, lv_coord_t y_ofs)
