@@ -383,6 +383,7 @@ void epd_do_refresh(void) {
     if (disp) {
         printf("[EPD] Clearing inv_p: %d -> 0\n", disp->inv_p);
         disp->inv_p = 0;
+        lv_disp_enable_invalidation(disp, false);
     }
 
     epd_refresh_in_progress = 0;
@@ -391,7 +392,7 @@ void epd_do_refresh(void) {
     epd_sync.state = EPD_STATE_IDLE;
 
     vTaskResume(lvgl_thread.handle);
-    printf("[EPD] LVGL resumed, waiting to see if INV_AREA fires...\n");
+    printf("[EPD] LVGL resumed, invalidation DISABLED\n");
 }
 
 /*====================
@@ -399,6 +400,11 @@ void epd_do_refresh(void) {
  *===================*/
 
 void epd_notify_touch_down(void) {
+    lv_disp_t * disp = lv_disp_get_default();
+    if (disp && !lv_disp_is_invalidation_enabled(disp)) {
+        lv_disp_enable_invalidation(disp, true);
+        printf("[EPD] Invalidation RE-ENABLED by touch\n");
+    }
     if (epd_sync.state == EPD_STATE_WAIT_RELEASE) {
         epd_sync.refresh_pending = 0;
     }
@@ -412,6 +418,10 @@ void epd_notify_touch_up(void) {
 
 void epd_mark_refresh_pending(void) {
     if (epd_sync.state != EPD_STATE_REFRESHING && !epd_sync.refresh_busy && !epd_sync.refresh_paused) {
+        lv_disp_t * disp = lv_disp_get_default();
+        if (disp && !lv_disp_is_invalidation_enabled(disp)) {
+            lv_disp_enable_invalidation(disp, true);
+        }
         epd_sync.refresh_pending = 1;
     }
 }
