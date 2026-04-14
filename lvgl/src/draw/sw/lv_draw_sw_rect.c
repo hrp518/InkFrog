@@ -66,9 +66,7 @@ static void draw_border_simple(lv_draw_ctx_t * draw_ctx, const lv_area_t * outer
 
 void lv_draw_sw_rect(lv_draw_ctx_t * draw_ctx, const lv_draw_rect_dsc_t * dsc, const lv_area_t * coords)
 {
-    printf("[DRAW_RECT] area(%d,%d)->(%d,%d) | bg_color=%d, border_w=%d, border_color=%d, radius=%d\r\n",
-           coords->x1, coords->y1, coords->x2, coords->y2,
-           dsc->bg_color.full, dsc->border_width, dsc->border_color.full, dsc->radius);
+    (void)0;
 
 #if LV_DRAW_COMPLEX
     draw_shadow(draw_ctx, dsc, coords);

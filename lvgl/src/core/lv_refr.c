@@ -238,9 +238,7 @@ void _lv_inv_area(lv_disp_t * disp, const lv_area_t * area_p)
         disp->inv_areas[0] = scr_area;
         disp->inv_p = 1;
         if(disp->refr_timer) lv_timer_resume(disp->refr_timer);
-        printf("[INV_AREA] full_refresh: area(%d,%d)-(%d,%d) -> inv_p=1, epd_in_progress=%d, epd_requested=%d\n",
-               com_area.x1, com_area.y1, com_area.x2, com_area.y2,
-               epd_refresh_in_progress, epd_refresh_requested);
+        (void)com_area.x1;
         return;
     }
 

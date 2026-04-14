@@ -94,12 +94,7 @@ static inline lv_color_t color_blend_true_color_multiply(lv_color_t fg, lv_color
 
 void lv_draw_sw_blend(lv_draw_ctx_t * draw_ctx, const lv_draw_sw_blend_dsc_t * dsc)
 {
-    if (dsc->color.full == 0) {
-        printf("[BLEND_BLACK] area(%d,%d)->(%d,%d) | opa=%d, has_mask=%s\r\n",
-               dsc->blend_area->x1, dsc->blend_area->y1,
-               dsc->blend_area->x2, dsc->blend_area->y2,
-               dsc->opa, (dsc->mask_buf != NULL) ? "YES" : "NO");
-    }
+    (void)0;
 
     /*Do not draw transparent things*/
     if(dsc->opa <= LV_OPA_MIN) return;
