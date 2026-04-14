@@ -235,7 +235,15 @@ static void epd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *
 
 void lv_port_disp_init(void) {
     printf("[LVGL] Full EPD init...\r\n");
-    EPD_3IN52_Init();
+    int init_retry = 0;
+    while (EPD_3IN52_Init() != 0) {
+        init_retry++;
+        printf("[EPD] Init failed, retry #%d in 3s...\n", init_retry);
+        OS_MSleep(3000);
+    }
+    if (init_retry > 0) {
+        printf("[EPD] Init succeeded after %d retries\n", init_retry);
+    }
     
     printf("[LVGL] Entering DU mode...\r\n");
     EPD_3IN52_Init_DU();
@@ -381,9 +389,15 @@ void epd_do_refresh(void) {
     printf("[EPD] Display done (T=%ums, epd_cost=%ums) inv_p_during=%d\n", epd_get_tick(), epd_get_tick() - t, inv_p_during);
 
     if (disp) {
-        printf("[EPD] Clearing inv_p: %d -> 0\n", disp->inv_p);
-        disp->inv_p = 0;
-        lv_disp_enable_invalidation(disp, false);
+        if (disp->inv_p > 0) {
+            printf("[EPD] inv_p=%d during display, re-invalidating active screen\n", disp->inv_p);
+            disp->inv_p = 0;
+            lv_disp_enable_invalidation(disp, true);
+            lv_obj_invalidate(disp->act_scr);
+        } else {
+            disp->inv_p = 0;
+            lv_disp_enable_invalidation(disp, false);
+        }
     }
 
     epd_refresh_in_progress = 0;

@@ -253,6 +253,7 @@ static void file_btn_cb(lv_event_t *e)
 static void viewer_back_cb(lv_event_t *e)
 {
     (void)e;
+    lv_disp_load_scr(fm_screen);
     if (viewer_textarea) {
         lv_obj_del(viewer_textarea);
         viewer_textarea = NULL;
@@ -261,7 +262,6 @@ static void viewer_back_cb(lv_event_t *e)
         lv_obj_del(viewer_screen);
         viewer_screen = NULL;
     }
-    lv_disp_load_scr(fm_screen);
     epd_mark_refresh_pending();
 }
 
@@ -387,8 +387,11 @@ static void show_rename_keyboard(void *user_data)
     // 确认按钮
     lv_obj_t *confirm_btn = lv_btn_create(rename_screen);
     lv_obj_set_size(confirm_btn, 60, 30);
-    lv_obj_align(confirm_btn, LV_ALIGN_TOP_RIGHT, -10, 50);
+    lv_obj_align(confirm_btn, LV_ALIGN_TOP_RIGHT, -10, 95);
     epd_disable_all_animations_recursive(confirm_btn);
+    lv_obj_set_style_border_width(confirm_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(confirm_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(confirm_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(confirm_btn, (void*)1);
     lv_obj_add_event_cb(confirm_btn, rename_confirm_cb, LV_EVENT_CLICKED, NULL);
     
@@ -397,11 +400,13 @@ static void show_rename_keyboard(void *user_data)
     lv_obj_set_style_text_font(confirm_label, get_reader_font(), 0);
     lv_obj_center(confirm_label);
     
-    // 取消按钮
     lv_obj_t *cancel_btn = lv_btn_create(rename_screen);
     lv_obj_set_size(cancel_btn, 60, 30);
-    lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 10, 50);
+    lv_obj_align(cancel_btn, LV_ALIGN_TOP_LEFT, 10, 95);
     epd_disable_all_animations_recursive(cancel_btn);
+    lv_obj_set_style_border_width(cancel_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(cancel_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(cancel_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(cancel_btn, (void*)0);
     lv_obj_add_event_cb(cancel_btn, rename_cancel_cb, LV_EVENT_CLICKED, NULL);
     
@@ -835,7 +840,7 @@ static void show_file_action_menu(const char *filename)
     int is_epub = (ext && strcasecmp(ext, ".epub") == 0);
     
     action_dialog = lv_obj_create(fm_screen);
-    lv_obj_set_size(action_dialog, 200, is_epub ? 240 : 200);
+    lv_obj_set_size(action_dialog, 200, is_epub ? 240 : 165);
     lv_obj_align(action_dialog, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(action_dialog, lv_color_white(), 0);
     epd_disable_all_animations_recursive(action_dialog);
@@ -943,24 +948,9 @@ static void show_file_action_menu(const char *filename)
         lv_obj_set_style_text_font(btn2_label, get_reader_font(), 0);
         lv_obj_center(btn2_label);
         
-        lv_obj_t *btn3 = lv_btn_create(action_dialog);
-        lv_obj_set_size(btn3, 80, 30);
-        lv_obj_align(btn3, LV_ALIGN_BOTTOM_MID, 0, -10);
-        epd_disable_all_animations_recursive(btn3);
-        lv_obj_set_style_border_width(btn3, 1, LV_STATE_PRESSED);
-        lv_obj_set_style_border_width(btn3, 1, LV_STATE_FOCUSED);
-        lv_obj_set_style_outline_width(btn3, 0, LV_STATE_FOCUSED);
-        lv_obj_set_user_data(btn3, (void*)3);
-        lv_obj_add_event_cb(btn3, action_btn_cb, LV_EVENT_CLICKED, NULL);
-        
-        lv_obj_t *btn3_label = lv_label_create(btn3);
-        lv_label_set_text(btn3_label, "取消");
-        lv_obj_set_style_text_font(btn3_label, get_reader_font(), 0);
-        lv_obj_center(btn3_label);
-        
         lv_obj_t *btn4 = lv_btn_create(action_dialog);
         lv_obj_set_size(btn4, 80, 30);
-        lv_obj_align(btn4, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+        lv_obj_align(btn4, LV_ALIGN_TOP_LEFT, 10, 95);
         epd_disable_all_animations_recursive(btn4);
         lv_obj_set_style_border_width(btn4, 1, LV_STATE_PRESSED);
         lv_obj_set_style_border_width(btn4, 1, LV_STATE_FOCUSED);
@@ -972,6 +962,21 @@ static void show_file_action_menu(const char *filename)
         lv_label_set_text(btn4_label, "重命名");
         lv_obj_set_style_text_font(btn4_label, get_reader_font(), 0);
         lv_obj_center(btn4_label);
+        
+        lv_obj_t *btn3 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn3, 80, 30);
+        lv_obj_align(btn3, LV_ALIGN_TOP_RIGHT, -10, 95);
+        epd_disable_all_animations_recursive(btn3);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn3, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn3, (void*)3);
+        lv_obj_add_event_cb(btn3, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn3_label = lv_label_create(btn3);
+        lv_label_set_text(btn3_label, "取消");
+        lv_obj_set_style_text_font(btn3_label, get_reader_font(), 0);
+        lv_obj_center(btn3_label);
     }
     
     epd_mark_refresh_pending();

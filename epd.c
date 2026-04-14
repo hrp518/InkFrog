@@ -718,6 +718,26 @@ void EPD_3IN52_Init_DU(void)
     EPD_3IN52_Flag = 0;
     EPD_Reset();
     
+    int timeout = 0;
+    while (timeout < 3000) {
+        if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) break;
+        OS_MSleep(1);
+        timeout++;
+    }
+    if (timeout >= 3000) {
+        printf("[EPD] Init_DU: busy timeout after reset, retrying reset\n");
+        EPD_Reset();
+        timeout = 0;
+        while (timeout < 3000) {
+            if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) break;
+            OS_MSleep(1);
+            timeout++;
+        }
+        if (timeout >= 3000) {
+            printf("[EPD] Init_DU: still busy, proceeding anyway\n");
+        }
+    }
+    
     EPD_SendCommand(0x00);  // panel setting PSR
     EPD_SendData(0xFF);
     EPD_SendData(0x01);
