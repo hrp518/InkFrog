@@ -753,7 +753,7 @@ int main(void)
         printf("[ERROR] Failed to create disp_task\r\n");
     }
     if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
+                        OS_PRIORITY_NORMAL, 16384) != 0) {
         printf("[ERROR] Failed to create lvgl_task\r\n");
     }
 
