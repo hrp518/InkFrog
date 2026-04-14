@@ -787,8 +787,9 @@ static void next_page_handler(EpubViewer *viewer) {
 /* 触摸事件处理 */
 static void content_area_event_cb(lv_event_t *e) {
     lv_event_code_t code = lv_event_get_code(e);
-    EpubViewer *viewer = (EpubViewer*)lv_event_get_user_data(e);
-    
+    lv_obj_t *screen = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(screen);
+
     if (!viewer) return;
     
     /* 获取触摸点 */
@@ -865,29 +866,26 @@ static void toc_btn_close_cb(lv_event_t *e) {
  *====================*/
 
 static void close_viewer_cb(lv_event_t *e) {
-    EpubViewer *viewer = (EpubViewer*)lv_event_get_user_data(e);
+    lv_obj_t *btn = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
     if (viewer) {
         epub_viewer_close(viewer);
     }
 }
 
 static void prev_chapter_cb(lv_event_t *e) {
-    EpubViewer *viewer = (EpubViewer*)lv_event_get_user_data(e);
+    lv_obj_t *btn = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
     if (viewer && viewer->current_chapter > 0) {
-        viewer->current_chapter--;
-        if (viewer->chapter_cb) {
-            viewer->chapter_cb(viewer->current_chapter, viewer->reader ? viewer->reader->spine_count : 0);
-        }
+        epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1);
     }
 }
 
 static void next_chapter_cb(lv_event_t *e) {
-    EpubViewer *viewer = (EpubViewer*)lv_event_get_user_data(e);
+    lv_obj_t *btn = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
     if (viewer && viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
-        viewer->current_chapter++;
-        if (viewer->chapter_cb) {
-            viewer->chapter_cb(viewer->current_chapter, viewer->reader->spine_count);
-        }
+        epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1);
     }
 }
 
@@ -969,7 +967,7 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_border_width(back_btn, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(back_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(back_btn, viewer);
-    lv_obj_add_event_cb(back_btn, close_viewer_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(back_btn, close_viewer_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(back_btn);
     
     lv_obj_t *back_label = lv_label_create(back_btn);
@@ -995,7 +993,7 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_label_set_long_mode(viewer->content_label, LV_LABEL_LONG_CLIP);
     
     lv_obj_set_user_data(viewer->screen, viewer);
-    lv_obj_add_event_cb(viewer->screen, content_area_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(viewer->screen, content_area_event_cb, LV_EVENT_CLICKED, viewer);
     
     lv_obj_t *nav_bar = lv_obj_create(viewer->screen);
     lv_obj_set_size(nav_bar, SCREEN_WIDTH, 50);
@@ -1010,7 +1008,7 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_border_width(prev_btn, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(prev_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(prev_btn, viewer);
-    lv_obj_add_event_cb(prev_btn, prev_chapter_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(prev_btn, prev_chapter_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(prev_btn);
     
     lv_obj_t *prev_label = lv_label_create(prev_btn);
@@ -1025,7 +1023,7 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_border_width(toc_btn_obj, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(toc_btn_obj, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(toc_btn_obj, viewer);
-    lv_obj_add_event_cb(toc_btn_obj, toc_btn_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(toc_btn_obj, toc_btn_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(toc_btn_obj);
     
     lv_obj_t *toc_label = lv_label_create(toc_btn_obj);
@@ -1040,7 +1038,7 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_border_width(next_btn, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(next_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(next_btn, viewer);
-    lv_obj_add_event_cb(next_btn, next_chapter_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(next_btn, next_chapter_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(next_btn);
     
     lv_obj_t *next_label = lv_label_create(next_btn);
@@ -1187,7 +1185,7 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
     lv_obj_set_size(close_btn, 50, 30);
     lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -10, 5);
     lv_obj_set_user_data(close_btn, viewer);
-    lv_obj_add_event_cb(close_btn, toc_btn_close_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(close_btn, toc_btn_close_cb, LV_EVENT_CLICKED, viewer);
     
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "关闭");
