@@ -295,7 +295,6 @@ void lv_obj_update_layout(const lv_obj_t * obj)
 
     lv_obj_t * scr = lv_obj_get_screen(obj);
 
-    /*Repeat until there where layout invalidations*/
     while(scr->scr_layout_inv) {
         LV_LOG_INFO("Layout update begin");
         scr->scr_layout_inv = 0;

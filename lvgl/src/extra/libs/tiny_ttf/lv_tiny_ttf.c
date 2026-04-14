@@ -3,6 +3,7 @@
 #if LV_USE_TINY_TTF
 #include <stdio.h>
 #include "../../../misc/lv_lru.h"
+#include "sys/sys_heap.h"
 
 #define STB_RECT_PACK_IMPLEMENTATION
 #define STBRP_STATIC
@@ -15,6 +16,20 @@
 #define STBTT_free(x, u) ((void)(u), lv_mem_free(x))
 #define TTF_MALLOC(x) (lv_mem_alloc(x))
 #define TTF_FREE(x) (lv_mem_free(x))
+
+#define CJK_METRICS_START 0x4E00u
+#define CJK_METRICS_END   0x9FFFu
+#define CJK_METRICS_COUNT (CJK_METRICS_END - CJK_METRICS_START + 1u)
+
+typedef struct {
+    uint8_t adv_w;
+    uint8_t box_w;
+    uint8_t box_h;
+    int8_t  ofs_x;
+    int8_t  ofs_y;
+    uint8_t valid;
+    uint8_t pad;
+} ttf_metrics_entry_t;
 
 #if LV_TINY_TTF_FILE_SUPPORT
 /* a hydra stream that can be in memory or from a file*/
@@ -91,6 +106,7 @@ typedef struct ttf_font_desc {
     int ascent;
     int descent;
     lv_lru_t * bitmap_cache;
+    ttf_metrics_entry_t * metrics_cache;
 } ttf_font_desc_t;
 
 typedef struct ttf_bitmap_cache_key {
@@ -98,25 +114,64 @@ typedef struct ttf_bitmap_cache_key {
     lv_coord_t line_height;
 } ttf_bitmap_cache_key_t;
 
+int g_glyph_dsc_calls = 0;
+int g_glyph_dsc_cache_hits = 0;
+int g_glyph_dsc_stbtt_calls = 0;
+
 static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * dsc_out, uint32_t unicode_letter,
                                  uint32_t unicode_letter_next)
 {
+    g_glyph_dsc_calls++;
+
     if(unicode_letter < 0x20 ||
-       unicode_letter == 0xf8ff || /*LV_SYMBOL_DUMMY*/
-       unicode_letter == 0x200c) { /*ZERO WIDTH NON-JOINER*/
+       unicode_letter == 0xf8ff ||
+       unicode_letter == 0x200c) {
         dsc_out->box_w = 0;
         dsc_out->adv_w = 0;
-        dsc_out->box_h = 0; /*height of the bitmap in [px]*/
-        dsc_out->ofs_x = 0; /*X offset of the bitmap in [pf]*/
-        dsc_out->ofs_y = 0; /*Y offset of the bitmap in [pf]*/
+        dsc_out->box_h = 0;
+        dsc_out->ofs_x = 0;
+        dsc_out->ofs_y = 0;
         dsc_out->bpp = 0;
         dsc_out->is_placeholder = false;
         return true;
     }
+
+    if(unicode_letter < 0x4E00) {
+        return false;
+    }
+
     ttf_font_desc_t * dsc = (ttf_font_desc_t *)font->dsc;
+
+    if(unicode_letter >= CJK_METRICS_START && unicode_letter <= CJK_METRICS_END && dsc->metrics_cache) {
+        uint32_t idx = unicode_letter - CJK_METRICS_START;
+        ttf_metrics_entry_t *entry = &dsc->metrics_cache[idx];
+        if(entry->valid == 1) {
+            g_glyph_dsc_cache_hits++;
+            dsc_out->adv_w = entry->adv_w;
+            dsc_out->box_w = entry->box_w;
+            dsc_out->box_h = entry->box_h;
+            dsc_out->ofs_x = entry->ofs_x;
+            dsc_out->ofs_y = entry->ofs_y;
+            dsc_out->bpp = 8;
+            dsc_out->is_placeholder = false;
+            return true;
+        }
+        else if(entry->valid == 2) {
+            g_glyph_dsc_cache_hits++;
+            return false;
+        }
+    }
+
+    g_glyph_dsc_stbtt_calls++;
+    if(g_glyph_dsc_stbtt_calls <= 30) {
+        printf("[GLYPH_DSC] stbtt #%d: U+0x%04X\n", g_glyph_dsc_stbtt_calls, unicode_letter);
+    }
+
     int g1 = stbtt_FindGlyphIndex(&dsc->info, (int)unicode_letter);
     if(g1 == 0) {
-        /* Glyph not found */
+        if(unicode_letter >= CJK_METRICS_START && unicode_letter <= CJK_METRICS_END && dsc->metrics_cache) {
+            dsc->metrics_cache[unicode_letter - CJK_METRICS_START].valid = 2;
+        }
         return false;
     }
     int x1, y1, x2, y2;
@@ -130,17 +185,29 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
     stbtt_GetGlyphHMetrics(&dsc->info, g1, &advw, &lsb);
     int k = stbtt_GetGlyphKernAdvance(&dsc->info, g1, g2);
     dsc_out->adv_w = (uint16_t)floor((((float)advw + (float)k) * dsc->scale) +
-                                     0.5f); /*Horizontal space required by the glyph in [px]*/
+                                     0.5f);
 
     dsc_out->adv_w = (uint16_t)floor((((float)advw + (float)k) * dsc->scale) +
-                                     0.5f); /*Horizontal space required by the glyph in [px]*/
-    dsc_out->box_w = (x2 - x1 + 1);         /*width of the bitmap in [px]*/
-    dsc_out->box_h = (y2 - y1 + 1);         /*height of the bitmap in [px]*/
-    dsc_out->ofs_x = x1;                    /*X offset of the bitmap in [pf]*/
-    dsc_out->ofs_y = -y2;                   /*Y offset of the bitmap measured from the as line*/
-    dsc_out->bpp = 8;                       /*Bits per pixel: 1/2/4/8*/
+                                     0.5f);
+    dsc_out->box_w = (x2 - x1 + 1);
+    dsc_out->box_h = (y2 - y1 + 1);
+    dsc_out->ofs_x = x1;
+    dsc_out->ofs_y = -y2;
+    dsc_out->bpp = 8;
     dsc_out->is_placeholder = false;
-    return true; /*true: glyph found; false: glyph was not found*/
+
+    if(unicode_letter >= CJK_METRICS_START && unicode_letter <= CJK_METRICS_END && dsc->metrics_cache) {
+        uint32_t idx = unicode_letter - CJK_METRICS_START;
+        ttf_metrics_entry_t *entry = &dsc->metrics_cache[idx];
+        entry->adv_w = (uint8_t)dsc_out->adv_w;
+        entry->box_w = (uint8_t)dsc_out->box_w;
+        entry->box_h = (uint8_t)dsc_out->box_h;
+        entry->ofs_x = (int8_t)dsc_out->ofs_x;
+        entry->ofs_y = (int8_t)dsc_out->ofs_y;
+        entry->valid = 1;
+    }
+
+    return true;
 }
 
 static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t unicode_letter)
@@ -233,6 +300,15 @@ static lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size
         goto err_after_dsc;
     }
 
+    dsc->metrics_cache = (ttf_metrics_entry_t *)psram_malloc(CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t));
+    if(dsc->metrics_cache) {
+        memset(dsc->metrics_cache, 0, CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t));
+        printf("[TTF] CJK metrics cache allocated: %lu bytes in PSRAM\n",
+               (unsigned long)(CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t)));
+    } else {
+        printf("[TTF] CJK metrics cache alloc failed, running uncached\n");
+    }
+
     lv_font_t * out_font = (lv_font_t *)TTF_MALLOC(sizeof(lv_font_t));
     if(out_font == NULL) {
         LV_LOG_ERROR("tiny_ttf: out of memory\n");
@@ -293,6 +369,10 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
             }
 #endif
             lv_lru_del(ttf->bitmap_cache);
+            if(ttf->metrics_cache) {
+                psram_free(ttf->metrics_cache);
+                ttf->metrics_cache = NULL;
+            }
             TTF_FREE(ttf);
         }
         TTF_FREE(font);

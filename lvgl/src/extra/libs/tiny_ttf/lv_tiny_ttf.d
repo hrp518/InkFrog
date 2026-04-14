@@ -197,6 +197,7 @@
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/../../../misc/lv_lru.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/../../../misc/../lv_conf_internal.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/../../../misc/lv_types.h \
+ ../../../../include/sys/sys_heap.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/stb_rect_pack.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/stb_truetype_htcw.h
 
@@ -593,6 +594,8 @@ c:\xr872\home\administrator\xradio-skylark-sdk-master\project\demo\lvgl_withsdan
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/../../../misc/../lv_conf_internal.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/../../../misc/lv_types.h:
+
+../../../../include/sys/sys_heap.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/stb_rect_pack.h:
 

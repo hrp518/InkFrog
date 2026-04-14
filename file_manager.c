@@ -622,10 +622,10 @@ static void display_current_page(void)
     printf("[FM] Displaying page %d/%d, files %d-%d\n", 
            current_page + 1, total_pages, start_idx + 1, end_idx);
     
-    /* 清空列表 */
+    printf("[FM_PROF] clean_list_start\n");
     lv_obj_clean(fm_list);
+    printf("[FM_PROF] clean_list_done add_items_start\n");
     
-     /* 显示当前页的文件 */
      for (int i = start_idx; i < end_idx; i++) {
          FileEntry *entry = &file_entries[i];
          
@@ -662,8 +662,9 @@ static void display_current_page(void)
         }
     }
     
-    /* 更新页码指示器 */
+    printf("[FM_PROF] items_added update_indicator_start\n");
     update_page_indicator();
+    printf("[FM_PROF] display_page_done\n");
 }
 
 /**
@@ -777,16 +778,14 @@ static void next_page_cb(lv_event_t *e)
 
 static void refresh_file_list(const char *dir_path)
 {
-    printf("[FM] refresh_file_list called for: %s\n", dir_path);
+    printf("[FM_PROF] refresh_start: %s\n", dir_path);
     
-    /* 加载所有文件条目 */
     load_file_entries(dir_path);
+    printf("[FM_PROF] entries_loaded\n");
     
-    /* 显示第一页 */
     current_page = 0;
     display_current_page();
-    
-    printf("[FM] refresh_file_list done\n");
+    printf("[FM_PROF] page_displayed\n");
 }
 
 /*====================
@@ -1052,21 +1051,21 @@ void file_manager_init(void)
     /* 关闭所有滚动相关标志 */
     lv_obj_clear_flag(fm_list, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
     epd_disable_all_animations_recursive(fm_list);
-    printf("[FM] fm_list created\n");
+    printf("[FM_PROF] fm_list created\n");
     
-    /* 初始化分页系统 */
     init_pagination();
+    printf("[FM_PROF] pagination_init_done\n");
     
-    /* 创建页码指示器（竖排放在左侧） */
     create_page_indicator();
+    printf("[FM_PROF] page_indicator_done\n");
     
     strncpy(current_path, "/", sizeof(current_path) - 1);
     current_path[sizeof(current_path) - 1] = '\0';
-    printf("[FM] About to call refresh_file_list...\n");
+    printf("[FM_PROF] about_to_refresh\n");
     refresh_file_list(current_path);
-    printf("[FM] refresh_file_list done, loading screen...\n");
+    printf("[FM_PROF] refresh_done loading_screen\n");
     lv_disp_load_scr(fm_screen);
-    printf("[FM] Screen loaded, marking refresh...\n");
+    printf("[FM_PROF] screen_loaded\n");
     epd_mark_refresh_pending();
     
     /* 注册滑动回调到驱动层 - 由lv_port_indev.c在释放时调用，与LVGL事件解耦 */
@@ -1226,12 +1225,13 @@ lv_font_t *get_reader_font(void)
                 printf("[FONT] Loading TTF from PSRAM (size: %u bytes)\n", (unsigned int)s_ttf_data_size);
                 printf("[FONT] ABOUT TO CALL lv_tiny_ttf_create_data()...\n");
                 
-                custom_ttf_font = lv_tiny_ttf_create_data(s_ttf_data, s_ttf_data_size, 16);
+                custom_ttf_font = lv_tiny_ttf_create_data_ex(s_ttf_data, s_ttf_data_size, 16, 131072);
                 
                 printf("[FONT] lv_tiny_ttf_create_data() returned: %p\n", custom_ttf_font);
                 
                 if (custom_ttf_font != NULL) {
-                    printf("[FONT] TTF font loaded successfully: %p\n", custom_ttf_font);
+                    custom_ttf_font->fallback = &lv_font_misans_16;
+                    printf("[FONT] TTF font loaded successfully: %p (fallback=misans_16)\n", custom_ttf_font);
                     printf("[FONT] Font line height: %d\n", custom_ttf_font->line_height);
                     return custom_ttf_font;
                 } else {

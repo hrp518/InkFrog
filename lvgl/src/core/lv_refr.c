@@ -322,11 +322,23 @@ void _lv_disp_refr_timer(lv_timer_t * tmr)
         return;
     }
 
+    printf("[REFR_PROF] layout_start\n");
     lv_obj_update_layout(disp_refr->act_scr);
+    printf("[REFR_PROF] layout_done join_start\n");
 
     lv_refr_join_area();
+    printf("[REFR_PROF] join_done render_start\n");
+
     refr_sync_areas();
     refr_invalid_areas();
+    printf("[REFR_PROF] render_done\n");
+
+    extern int g_glyph_dsc_calls, g_glyph_dsc_cache_hits, g_glyph_dsc_stbtt_calls;
+    printf("[REFR_PROF] glyph_stats: total=%d cache_hits=%d stbtt_calls=%d\n",
+           g_glyph_dsc_calls, g_glyph_dsc_cache_hits, g_glyph_dsc_stbtt_calls);
+    g_glyph_dsc_calls = 0;
+    g_glyph_dsc_cache_hits = 0;
+    g_glyph_dsc_stbtt_calls = 0;
 
     /*If refresh happened ...*/
     if(disp_refr->inv_p != 0) {
