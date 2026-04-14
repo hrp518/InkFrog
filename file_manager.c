@@ -24,6 +24,10 @@
 #include "sys/sys_heap.h"
 #endif
 
+/* EPUB阅读器支持 */
+#include "epub_reader.h"
+#include "epub_viewer.h"
+
 /*====================
  *    全局变量
  *====================*/
@@ -70,12 +74,15 @@ static uint8_t *s_ttf_data = NULL;             /* 缓存TTF文件数据（PSRAM�
 static size_t s_ttf_data_size = 0;             /* TTF数据大小 */
 #endif
 
+/* EPUB阅读器相关 */
+static EpubReader *g_epub_reader = NULL;
+static EpubViewer *g_epub_viewer = NULL;
+
 /*====================
  *   函数声明
  *====================*/
 
 static void refresh_file_list(const char *dir_path);
-static void epd_disable_all_animations_recursive(lv_obj_t *obj);  /* 前向声明 */
 static void show_file_action_menu(const char *filename);
 static void open_text_viewer(const char *filepath);
 static void show_delete_confirm(const char *filepath);
@@ -97,6 +104,8 @@ static void create_page_indicator(void);
 static void update_page_indicator(void);
 static void prev_page_cb(lv_event_t *e);
 static void next_page_cb(lv_event_t *e);
+static void open_epub_viewer(const char *filepath);
+static void async_open_epub_wrapper(void *arg);
 
 /*====================
  *   触摸滑动相关变量（已迁移到lv_port_indev.c驱动层）
@@ -227,9 +236,13 @@ static void file_btn_cb(lv_event_t *e)
 {
     lv_obj_t *target = lv_event_get_target(e);
     char *path = (char*)lv_obj_get_user_data(target);
+    printf("[FM_DBG] file_btn_cb: target=%p, path=%p\n", target, path);
     if (path) {
+        printf("[FM_DBG] path content: '%s' (len=%d, first_bytes=%02X %02X %02X)\n",
+               path, (int)strlen(path), (unsigned char)path[0], (unsigned char)path[1], (unsigned char)path[2]);
         strncpy(selected_filepath, path, sizeof(selected_filepath) - 1);
         selected_filepath[sizeof(selected_filepath) - 1] = '\0';
+        printf("[FM_DBG] selected_filepath: '%s'\n", selected_filepath);
         const char *fname = strrchr(path, '/');
         if (fname) fname++; else fname = path;
         show_file_action_menu(fname);
@@ -279,14 +292,13 @@ static void action_btn_cb(lv_event_t *e)
     close_action_dialog();
     
     if (btn_idx == 0) {
-        // 打开文本
         open_text_viewer(selected_filepath);
     } else if (btn_idx == 1) {
-        // 删除
         show_delete_confirm(selected_filepath);
     } else if (btn_idx == 2) {
-        // 重命名 - 使用lv_async_call延时创建键盘，确保action_dialog被彻底销毁
         lv_async_call(show_rename_keyboard, (void*)selected_filepath);
+    } else if (btn_idx == 10) {
+        lv_async_call(async_open_epub_wrapper, selected_filepath);
     }
     // 取消按钮不做任何操作
 }
@@ -468,7 +480,7 @@ static void epd_disable_animations(lv_obj_t *obj)
     }
 }
 
-static void epd_disable_all_animations_recursive(lv_obj_t *obj)
+void epd_disable_all_animations_recursive(lv_obj_t *obj)
 {
     epd_disable_animations(obj);
     uint32_t child_cnt = lv_obj_get_child_cnt(obj);
@@ -484,6 +496,7 @@ static const char* get_file_icon(const char *filename, uint8_t is_dir)
     const char *ext = strrchr(filename, '.');
     if (ext) {
         if (strcasecmp(ext, ".txt") == 0 || strcasecmp(ext, ".md") == 0) return "[TXT]";
+        if (strcasecmp(ext, ".epub") == 0) return "[EPUB]";
         if (strcasecmp(ext, ".bmp") == 0 || strcasecmp(ext, ".jpg") == 0) return "[IMG]";
     }
     return "[FILE]";
@@ -631,12 +644,17 @@ static void display_current_page(void)
          
          /* 处理返回按钮 */
          if (entry->is_dir == 0xFF) {
-        lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, entry->name);
-        epd_disable_all_animations_recursive(btn);
-        lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-        if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
-        lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
-        continue;
+         lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, entry->name);
+         epd_disable_all_animations_recursive(btn);
+         lv_obj_set_style_border_width(btn, 1, LV_STATE_PRESSED);
+         lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUSED);
+         lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUS_KEY);
+         lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUSED);
+         lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUS_KEY);
+         lv_obj_t *lbl = lv_obj_get_child(btn, 0);
+         if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
+         lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
+         continue;
          }
          
          /* 普通文件/目录 */
@@ -646,6 +664,11 @@ static void display_current_page(void)
          
          lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, item_text);
         epd_disable_all_animations_recursive(btn);
+        lv_obj_set_style_border_width(btn, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUS_KEY);
         lv_obj_t *lbl = lv_obj_get_child(btn, 0);
         if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
         
@@ -808,8 +831,11 @@ static void show_file_action_menu(const char *filename)
 {
     close_action_dialog();
     
+    const char *ext = strrchr(filename, '.');
+    int is_epub = (ext && strcasecmp(ext, ".epub") == 0);
+    
     action_dialog = lv_obj_create(fm_screen);
-    lv_obj_set_size(action_dialog, 200, 150);
+    lv_obj_set_size(action_dialog, 200, is_epub ? 240 : 200);
     lv_obj_align(action_dialog, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(action_dialog, lv_color_white(), 0);
     epd_disable_all_animations_recursive(action_dialog);
@@ -826,57 +852,127 @@ static void show_file_action_menu(const char *filename)
     lv_obj_set_width(fname_label, 180);
     lv_obj_align(fname_label, LV_ALIGN_TOP_MID, 0, 25);
     
-    // 打开文本按钮
-    lv_obj_t *btn1 = lv_btn_create(action_dialog);
-    lv_obj_set_size(btn1, 80, 30);
-    lv_obj_align(btn1, LV_ALIGN_TOP_LEFT, 10, 55);
-    epd_disable_all_animations_recursive(btn1);
-    lv_obj_set_user_data(btn1, (void*)0);
-    lv_obj_add_event_cb(btn1, action_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *btn1_label = lv_label_create(btn1);
-    lv_label_set_text(btn1_label, "打开文本");
-    lv_obj_set_style_text_font(btn1_label, get_reader_font(), 0);
-    lv_obj_center(btn1_label);
-    
-    // 删除按钮
-    lv_obj_t *btn2 = lv_btn_create(action_dialog);
-    lv_obj_set_size(btn2, 80, 30);
-    lv_obj_align(btn2, LV_ALIGN_TOP_RIGHT, -10, 55);
-    epd_disable_all_animations_recursive(btn2);
-    lv_obj_set_user_data(btn2, (void*)1);
-    lv_obj_add_event_cb(btn2, action_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *btn2_label = lv_label_create(btn2);
-    lv_label_set_text(btn2_label, "删除");
-    lv_obj_set_style_text_font(btn2_label, get_reader_font(), 0);
-    lv_obj_center(btn2_label);
-    
-    // 取消按钮
-    lv_obj_t *btn3 = lv_btn_create(action_dialog);
-    lv_obj_set_size(btn3, 80, 30);
-    lv_obj_align(btn3, LV_ALIGN_BOTTOM_MID, 0, -10);
-    epd_disable_all_animations_recursive(btn3);
-    lv_obj_set_user_data(btn3, (void*)3);
-    lv_obj_add_event_cb(btn3, action_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *btn3_label = lv_label_create(btn3);
-    lv_label_set_text(btn3_label, "取消");
-    lv_obj_set_style_text_font(btn3_label, get_reader_font(), 0);
-    lv_obj_center(btn3_label);
-    
-    // 重命名按钮
-    lv_obj_t *btn4 = lv_btn_create(action_dialog);
-    lv_obj_set_size(btn4, 80, 30);
-    lv_obj_align(btn4, LV_ALIGN_BOTTOM_LEFT, 10, -10);
-    epd_disable_all_animations_recursive(btn4);
-    lv_obj_set_user_data(btn4, (void*)2);
-    lv_obj_add_event_cb(btn4, action_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    lv_obj_t *btn4_label = lv_label_create(btn4);
-    lv_label_set_text(btn4_label, "重命名");
-    lv_obj_set_style_text_font(btn4_label, get_reader_font(), 0);
-    lv_obj_center(btn4_label);
+    if (is_epub) {
+        lv_obj_t *btn_epub = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn_epub, 170, 35);
+        lv_obj_align(btn_epub, LV_ALIGN_TOP_LEFT, 15, 60);
+        epd_disable_all_animations_recursive(btn_epub);
+        lv_obj_set_style_border_width(btn_epub, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn_epub, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn_epub, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn_epub, (void*)10);
+        lv_obj_add_event_cb(btn_epub, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn_epub_label = lv_label_create(btn_epub);
+        lv_label_set_text(btn_epub_label, "打开EPUB阅读");
+        lv_obj_set_style_text_font(btn_epub_label, get_reader_font(), 0);
+        lv_obj_center(btn_epub_label);
+        
+        lv_obj_t *btn1 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn1, 80, 30);
+        lv_obj_align(btn1, LV_ALIGN_TOP_LEFT, 10, 105);
+        epd_disable_all_animations_recursive(btn1);
+        lv_obj_set_style_border_width(btn1, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn1, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn1, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn1, (void*)0);
+        lv_obj_add_event_cb(btn1, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn1_label = lv_label_create(btn1);
+        lv_label_set_text(btn1_label, "查看源码");
+        lv_obj_set_style_text_font(btn1_label, get_reader_font(), 0);
+        lv_obj_center(btn1_label);
+        
+        lv_obj_t *btn2 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn2, 80, 30);
+        lv_obj_align(btn2, LV_ALIGN_TOP_RIGHT, -10, 105);
+        epd_disable_all_animations_recursive(btn2);
+        lv_obj_set_style_border_width(btn2, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn2, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn2, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn2, (void*)1);
+        lv_obj_add_event_cb(btn2, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn2_label = lv_label_create(btn2);
+        lv_label_set_text(btn2_label, "删除");
+        lv_obj_set_style_text_font(btn2_label, get_reader_font(), 0);
+        lv_obj_center(btn2_label);
+        
+        lv_obj_t *btn3 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn3, 170, 30);
+        lv_obj_align(btn3, LV_ALIGN_TOP_LEFT, 15, 145);
+        epd_disable_all_animations_recursive(btn3);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn3, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn3, (void*)3);
+        lv_obj_add_event_cb(btn3, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn3_label = lv_label_create(btn3);
+        lv_label_set_text(btn3_label, "取消");
+        lv_obj_set_style_text_font(btn3_label, get_reader_font(), 0);
+        lv_obj_center(btn3_label);
+    } else {
+        lv_obj_t *btn1 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn1, 80, 30);
+        lv_obj_align(btn1, LV_ALIGN_TOP_LEFT, 10, 55);
+        epd_disable_all_animations_recursive(btn1);
+        lv_obj_set_style_border_width(btn1, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn1, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn1, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn1, (void*)0);
+        lv_obj_add_event_cb(btn1, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn1_label = lv_label_create(btn1);
+        lv_label_set_text(btn1_label, "打开文本");
+        lv_obj_set_style_text_font(btn1_label, get_reader_font(), 0);
+        lv_obj_center(btn1_label);
+        
+        lv_obj_t *btn2 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn2, 80, 30);
+        lv_obj_align(btn2, LV_ALIGN_TOP_RIGHT, -10, 55);
+        epd_disable_all_animations_recursive(btn2);
+        lv_obj_set_style_border_width(btn2, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn2, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn2, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn2, (void*)1);
+        lv_obj_add_event_cb(btn2, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn2_label = lv_label_create(btn2);
+        lv_label_set_text(btn2_label, "删除");
+        lv_obj_set_style_text_font(btn2_label, get_reader_font(), 0);
+        lv_obj_center(btn2_label);
+        
+        lv_obj_t *btn3 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn3, 80, 30);
+        lv_obj_align(btn3, LV_ALIGN_BOTTOM_MID, 0, -10);
+        epd_disable_all_animations_recursive(btn3);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn3, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn3, (void*)3);
+        lv_obj_add_event_cb(btn3, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn3_label = lv_label_create(btn3);
+        lv_label_set_text(btn3_label, "取消");
+        lv_obj_set_style_text_font(btn3_label, get_reader_font(), 0);
+        lv_obj_center(btn3_label);
+        
+        lv_obj_t *btn4 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn4, 80, 30);
+        lv_obj_align(btn4, LV_ALIGN_BOTTOM_LEFT, 10, -10);
+        epd_disable_all_animations_recursive(btn4);
+        lv_obj_set_style_border_width(btn4, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn4, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn4, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn4, (void*)2);
+        lv_obj_add_event_cb(btn4, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn4_label = lv_label_create(btn4);
+        lv_label_set_text(btn4_label, "重命名");
+        lv_obj_set_style_text_font(btn4_label, get_reader_font(), 0);
+        lv_obj_center(btn4_label);
+    }
     
     epd_mark_refresh_pending();
 }
@@ -892,6 +988,7 @@ static void open_text_viewer(const char *filepath)
     UINT br;
     static char text_content[2048];
     
+    printf("[FONT] Attempting to open: '%s' (len=%d)\n", filepath, (int)strlen(filepath));
     res = f_open(&fp, filepath, FA_READ);
     if (res != FR_OK) {
         printf("[FM] Failed to open file: %s, error: %d\n", filepath, res);
@@ -968,6 +1065,59 @@ static void show_delete_confirm(const char *filepath)
 }
 
 /*====================
+ *   EPUB阅读器
+ *====================*/
+
+static void async_open_epub_wrapper(void *arg)
+{
+    open_epub_viewer((const char *)arg);
+}
+
+static void open_epub_viewer(const char *filepath)
+{
+    printf("[FM] Opening EPUB: %s\n", filepath);
+    
+    if (g_epub_viewer) {
+        epub_viewer_destroy(g_epub_viewer);
+        g_epub_viewer = NULL;
+    }
+    if (g_epub_reader) {
+        epub_reader_destroy(g_epub_reader);
+        g_epub_reader = NULL;
+    }
+    
+    g_epub_reader = epub_reader_create();
+    if (!g_epub_reader) {
+        printf("[FM] Failed to create EPUB reader\n");
+        return;
+    }
+    
+    if (!epub_reader_open(g_epub_reader, filepath)) {
+        printf("[FM] Failed to open EPUB file\n");
+        epub_reader_destroy(g_epub_reader);
+        g_epub_reader = NULL;
+        return;
+    }
+    
+    printf("[FM] EPUB opened: %s, chapters: %d\n",
+           epub_reader_get_title(g_epub_reader),
+           epub_reader_get_chapter_count(g_epub_reader));
+    
+    g_epub_viewer = epub_viewer_create(g_epub_reader);
+    if (!g_epub_viewer) {
+        printf("[FM] Failed to create EPUB viewer\n");
+        epub_reader_destroy(g_epub_reader);
+        g_epub_reader = NULL;
+        return;
+    }
+    
+    epub_viewer_show(g_epub_viewer);
+    epub_viewer_goto_chapter(g_epub_viewer, 0);
+    
+    epd_mark_refresh_pending();
+}
+
+/*====================
  *   关闭文件管理器
  *====================*/
 
@@ -980,6 +1130,15 @@ void file_manager_close(void)
     if (viewer_screen) { lv_obj_del(viewer_screen); viewer_screen = NULL; }
     if (fm_list) { lv_obj_del(fm_list); fm_list = NULL; }
     if (fm_screen) { lv_obj_del(fm_screen); fm_screen = NULL; }
+    
+    if (g_epub_viewer) {
+        epub_viewer_destroy(g_epub_viewer);
+        g_epub_viewer = NULL;
+    }
+    if (g_epub_reader) {
+        epub_reader_destroy(g_epub_reader);
+        g_epub_reader = NULL;
+    }
     
     /* 清理分页系统资源 */
     page_indicator = NULL;

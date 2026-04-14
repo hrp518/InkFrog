@@ -45,6 +45,8 @@ void file_manager_close(void);
  */
 lv_font_t * get_reader_font(void);
 
+void epd_disable_all_animations_recursive(lv_obj_t *obj);
+
 #ifdef __cplusplus
 }
 #endif

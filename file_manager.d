@@ -208,7 +208,10 @@
  ../../../../include/kernel/os/os_mutex.h \
  ../../../../include/kernel/os/os_timer.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h \
- ../../../../include/sys/sys_heap.h
+ ../../../../include/sys/sys_heap.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/epub_reader.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/epub_viewer.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -633,3 +636,9 @@
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h:
 
 ../../../../include/sys/sys_heap.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/epub_reader.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/epub_viewer.h:
