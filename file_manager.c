@@ -68,6 +68,9 @@ static lv_obj_t *next_page_btn = NULL;    /* 下一页按钮 */
 
 #if LV_USE_TINY_TTF
 static lv_font_t *custom_ttf_font = NULL;     /* 动态加载的TTF字体 */
+static lv_font_t *custom_ttf_font_h1 = NULL;  /* TTF H1 标题字体 (22px) */
+static lv_font_t *custom_ttf_font_h2 = NULL;  /* TTF H2 标题字体 (20px) */
+static lv_font_t *custom_ttf_font_h3 = NULL;  /* TTF H3 标题字体 (18px) */
 static bool ttf_load_attempted = false;        /* 是否已尝试加载TTF */
 static char ttf_file_path[256] = {0};      /* 选中的TTF文件路径 */
 static uint8_t *s_ttf_data = NULL;             /* 缓存TTF文件数据（PSRAM） */
@@ -1411,6 +1414,77 @@ lv_font_t *get_reader_font(void)
     /* 返回内置字体 */
     printf("[FONT] Returning built-in font: %p\n", &lv_font_misans_16);
     return &lv_font_misans_16;
+}
+
+/* 为指定字号创建新的字体对象（复用同一TTF数据） */
+static lv_font_t *create_ttf_font_at_size(lv_coord_t font_size)
+{
+    if (s_ttf_data == NULL || s_ttf_data_size == 0) {
+        return NULL;
+    }
+    lv_font_t *font = lv_tiny_ttf_create_data_ex(s_ttf_data, s_ttf_data_size, font_size, 65536);
+    if (font != NULL) {
+        font->fallback = &lv_font_misans_16;
+    }
+    return font;
+}
+
+/* H1 标题字体 (22px) */
+lv_font_t *get_reader_font_h1(void)
+{
+    if (custom_ttf_font_h1 != NULL) {
+        return custom_ttf_font_h1;
+    }
+    /* 确保TTF已加载 */
+    if (s_ttf_data == NULL && !ttf_load_attempted) {
+        get_reader_font();  // 触发TTF加载
+    }
+    if (s_ttf_data == NULL) {
+        return &lv_font_misans_16;  // 无TTF，回退
+    }
+    custom_ttf_font_h1 = create_ttf_font_at_size(22);
+    if (custom_ttf_font_h1 == NULL) {
+        return &lv_font_misans_16;
+    }
+    return custom_ttf_font_h1;
+}
+
+/* H2 标题字体 (20px) */
+lv_font_t *get_reader_font_h2(void)
+{
+    if (custom_ttf_font_h2 != NULL) {
+        return custom_ttf_font_h2;
+    }
+    if (s_ttf_data == NULL && !ttf_load_attempted) {
+        get_reader_font();
+    }
+    if (s_ttf_data == NULL) {
+        return &lv_font_misans_16;
+    }
+    custom_ttf_font_h2 = create_ttf_font_at_size(20);
+    if (custom_ttf_font_h2 == NULL) {
+        return &lv_font_misans_16;
+    }
+    return custom_ttf_font_h2;
+}
+
+/* H3 标题字体 (18px) */
+lv_font_t *get_reader_font_h3(void)
+{
+    if (custom_ttf_font_h3 != NULL) {
+        return custom_ttf_font_h3;
+    }
+    if (s_ttf_data == NULL && !ttf_load_attempted) {
+        get_reader_font();
+    }
+    if (s_ttf_data == NULL) {
+        return &lv_font_misans_16;
+    }
+    custom_ttf_font_h3 = create_ttf_font_at_size(18);
+    if (custom_ttf_font_h3 == NULL) {
+        return &lv_font_misans_16;
+    }
+    return custom_ttf_font_h3;
 }
 
 #endif /* LV_USE_TINY_TTF */

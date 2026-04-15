@@ -49,7 +49,7 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 struct EpubViewer {
     EpubReader *reader;                    /* EPUB阅读器 */
     lv_obj_t *screen;                      /* 主屏幕 */
-    lv_obj_t *content_label;               /* 内容标签 */
+    lv_obj_t *content_container;           /* 内容容器（多label渲染标题/正文） */
     lv_obj_t *title_label;                /* 标题标签 */
     lv_obj_t *page_label;                 /* 页码标签 */
     lv_obj_t *toc_list;                   /* 目录列表 */
@@ -86,10 +86,19 @@ struct EpubViewer {
 #define CONTENT_X      10
 #define CONTENT_Y      50
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
-#define CONTENT_HEIGHT (SCREEN_HEIGHT - 100)
+#define CONTENT_HEIGHT (SCREEN_HEIGHT - 121)  /* 294: 留10px间距给nav_bar(底部), 50px nav_bar高度 */
 
 /* 字体配置 - 使用懒加载的阅读器字体（TTF优先，回退到系统字体） */
-#define FONT get_reader_font()
+#define FONT       get_reader_font()           /* 正文: 16px */
+#define FONT_H1    get_reader_font_h1()        /* H1:   22px */
+#define FONT_H2    get_reader_font_h2()        /* H2:   20px */
+#define FONT_H3    get_reader_font_h3()        /* H3:   18px */
+
+/* 行高配置 */
+#define LH_BODY    22                          /* 正文行高 */
+#define LH_H3      26                          /* H3 行高 */
+#define LH_H2      30                          /* H2 行高 */
+#define LH_H1      34                          /* H1 行高 */
 
 /* 行高和字符宽度（16号字体） */
 #define LINE_HEIGHT     22
@@ -245,8 +254,6 @@ static void toc_btn_cb(lv_event_t *e);
 static void toc_item_cb(lv_event_t *e);
 static void toc_btn_close_cb(lv_event_t *e);
 static void close_viewer_cb(lv_event_t *e);
-static void prev_chapter_cb(lv_event_t *e);
-static void next_chapter_cb(lv_event_t *e);
 static void page_prev_cb(lv_event_t *e);
 static void page_next_cb(lv_event_t *e);
 
@@ -287,6 +294,129 @@ static void strip_html_tags(const char *html, int html_len, char *output, int ou
         p++;
     }
     output[out_pos] = '\0';
+}
+
+/*
+ * 样式感知HTML标签剥离
+ * 识别 <h1>/<h2>/<h3> 并在文本中插入样式标记
+ * 格式: \x02LEVEL\x03  其中 LEVEL=0正文 1=H1 2=H2 3=H3 4=段落首行
+ */
+static int strip_html_tags_with_styles(const char *html, int html_len,
+                                       char *output, int out_size)
+{
+    int out_pos = 0;
+    int in_tag = 0;
+    const char *tag_start = NULL;
+    int current_level = 0;    /* 当前样式级别 */
+    const char *p = html;
+    const char *end = html + html_len;
+
+    /* 跳过起始位置的不完整 UTF-8 字符：
+     * 情况1：开头是后续字节(10xxxxxx) → 前一个字符的 lead byte 在上一块 buffer 中，被截断
+     * 情况2：开头是 lead byte 但后续字节不在 buffer 中 → 当前字符被截断 */
+    while (p < end) {
+        unsigned char uc = (unsigned char)*p;
+        int need = 0;
+        if ((uc & 0xE0) == 0xC0) need = 1;
+        else if ((uc & 0xF0) == 0xE0) need = 2;
+        else if ((uc & 0xF8) == 0xF0) need = 3;
+        else break; /* ASCII 或后续字节 → 正常开始 */
+        if (p + need >= end) {
+            p++; /* lead byte 但后续字节不在 buffer 中 → 不完整，跳过 */
+        } else {
+            break; /* 完整字符，从这里开始 */
+        }
+    }
+
+    /* 输出样式级别标记的辅助宏 */
+    #define EMIT_LEVEL(lvl) do { \
+        if (out_pos < out_size - 4) { \
+            output[out_pos++] = '\x02'; \
+            output[out_pos++] = '0' + (lvl); \
+            output[out_pos++] = '\x03'; \
+        } \
+    } while(0)
+
+    while (p < end && out_pos < out_size - 1) {
+        if (*p == '<') {
+            in_tag = 1;
+            tag_start = p;
+        } else if (*p == '>' && in_tag) {
+            in_tag = 0;
+            /* 分析标签名 */
+            int len = (int)(p - tag_start + 1);
+            if (len > 2 && tag_start[1] == '/') {
+                /* 闭合标签 */
+                if (strncasecmp(tag_start + 2, "h1", 2) == 0 ||
+                    strncasecmp(tag_start + 2, "h2", 2) == 0 ||
+                    strncasecmp(tag_start + 2, "h3", 2) == 0) {
+                    /* H标签闭合，恢复正文级别，并输出换行 */
+                    if (current_level > 0) {
+                        EMIT_LEVEL(0);
+                        current_level = 0;
+                        if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                    }
+                }
+            } else {
+                /* 开始标签 */
+                if (strncasecmp(tag_start + 1, "h1", 2) == 0 &&
+                    (tag_start[3] == '>' || tag_start[3] == ' ' || tag_start[3] == '>')) {
+                    if (current_level != 1) {
+                        if (out_pos > 0 && output[out_pos-1] != '\n') {
+                            if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                        }
+                        EMIT_LEVEL(1);
+                        current_level = 1;
+                    }
+                } else if (strncasecmp(tag_start + 1, "h2", 2) == 0) {
+                    if (current_level != 2) {
+                        if (out_pos > 0 && output[out_pos-1] != '\n') {
+                            if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                        }
+                        EMIT_LEVEL(2);
+                        current_level = 2;
+                    }
+                } else if (strncasecmp(tag_start + 1, "h3", 2) == 0) {
+                    if (current_level != 3) {
+                        if (out_pos > 0 && output[out_pos-1] != '\n') {
+                            if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                        }
+                        EMIT_LEVEL(3);
+                        current_level = 3;
+                    }
+                } else if (strncasecmp(tag_start + 1, "p", 1) == 0 ||
+                           strncasecmp(tag_start + 1, "div", 3) == 0 ||
+                           strncasecmp(tag_start + 1, "br", 2) == 0) {
+                    /* 块级标签：段落前无换行则加换行 */
+                    if (out_pos > 0 && output[out_pos-1] != '\n') {
+                        if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                    }
+                }
+            }
+        } else if (!in_tag) {
+            if (*p == '&') {
+                /* 暂时保留&，decode_html_entities会处理 */
+                if (out_pos < out_size - 1) output[out_pos++] = *p;
+            } else if (*p != '\r' && *p != '\n' && *p != '\t') {
+                if (out_pos < out_size - 1) output[out_pos++] = *p;
+            } else {
+                if (out_pos > 0 && output[out_pos-1] != '\n' &&
+                    output[out_pos-1] != ' ') {
+                    if (out_pos < out_size - 1) output[out_pos++] = ' ';
+                }
+            }
+        }
+        p++;
+    }
+
+    #undef EMIT_LEVEL
+
+    /* 末尾加换行 */
+    if (out_pos > 0 && output[out_pos-1] != '\n' && out_pos < out_size - 1) {
+        output[out_pos++] = '\n';
+    }
+    output[out_pos] = '\0';
+    return out_pos;
 }
 
 /* 解码HTML实体 */
@@ -521,11 +651,18 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
             
             /* 【核心逻辑】：如果满一页，并且当前不在 HTML 标签内部，则安全切断，记录精确偏移量！ */
             if (line_count >= LINES_PER_PAGE && !in_tag) {
-                
-                /* 【新增】：确保我们不在 UTF-8 字符的中间截断！
-                 * UTF-8 后续字节特征是 10xxxxxx (即 & 0xC0 == 0x80)
-                 * 如果下一个字节是后续字节，说明当前字符还没完，不能切！ */
-                if (i + 1 < br && (viewer->html_buf[i + 1] & 0xC0) == 0x80) {
+
+                /* 【修复 UTF-8 字符边界】：
+                 * 安全切断条件：当前字节必须不在多字节字符中间
+                 * 1. 当前字节是后续字节(10xxxxxx) → 前一个字符的 lead byte 被 buffer 边界打断，跳过
+                 * 2. 当前字节是 lead byte 且 i+1 有后续字节 → 当前字符还没写完，跳过
+                 * 正确逻辑：(当前字节 & 0xC0) == 0x80 → 后续字节，跳过
+                 *           当前字节是 lead byte 且 (i+1 < br && 下一字节也是后续字节) → 未写完，跳过
+                 */
+                unsigned char uc = (unsigned char)viewer->html_buf[i];
+                if ((uc & 0xC0) == 0x80 ||
+                    ((uc & 0xC0) == 0xC0 && i + 1 < br && (viewer->html_buf[i + 1] & 0xC0) == 0x80)) {
+                    /* UTF-8 字符被打断，跳过本次切页 */
                     continue;
                 }
 
@@ -556,17 +693,23 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
  */
 static void update_display(EpubViewer *viewer) {
     VIEW_LOG("=== update_display START ===\n");
-    if (!viewer || !viewer->content_label) return;
+    if (!viewer || !viewer->content_container) return;
     if (!viewer->page_offsets || viewer->total_pages == 0) {
-        lv_label_set_text(viewer->content_label, "加载中...");
+        /* 错误状态：使用单label简单显示 */
+        lv_obj_t *err = lv_label_create(viewer->content_container);
+        lv_obj_set_size(err, CONTENT_WIDTH, CONTENT_HEIGHT);
+        lv_obj_align(err, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_font(err, FONT, 0);
+        lv_obj_set_style_text_color(err, lv_color_black(), 0);
+        lv_label_set_text(err, "加载中...");
         return;
     }
-    
+
     if (viewer->current_page < 0) viewer->current_page = 0;
     if (viewer->current_page >= viewer->total_pages) {
         viewer->current_page = viewer->total_pages - 1;
     }
-    
+
     uint32_t start_offset = viewer->page_offsets[viewer->current_page];
     uint32_t end_offset;
     if (viewer->current_page + 1 < viewer->total_pages) {
@@ -574,160 +717,227 @@ static void update_display(EpubViewer *viewer) {
     } else {
         end_offset = 0xFFFFFFFF;
     }
-    
+
+    printf("[VIEWER] Page data: page=%d/%d total=%d offset=%u end=%u\n",
+           viewer->current_page + 1, viewer->total_pages, viewer->total_pages,
+           (unsigned int)start_offset, (unsigned int)end_offset);
+
     VIEW_LOG("DBG 1: Offset ready (start:%u, end:%u)\n", start_offset, end_offset);
-    
+
     FIL temp_fp;
     if (f_open(&temp_fp, viewer->temp_file_path, FA_READ) != FR_OK) {
-        lv_label_set_text(viewer->content_label, "文件打开失败");
+        lv_obj_t *err = lv_label_create(viewer->content_container);
+        lv_obj_align(err, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_font(err, FONT, 0);
+        lv_label_set_text(err, "文件打开失败");
         return;
     }
-    
+
     if (f_lseek(&temp_fp, start_offset) != FR_OK) {
         f_close(&temp_fp);
         return;
     }
-    
+
     uint32_t read_size = end_offset - start_offset;
     if (end_offset == 0xFFFFFFFF || read_size > (EPUB_WORK_BUF_SIZE - 1)) {
         read_size = EPUB_WORK_BUF_SIZE - 1;
     }
-    
+
     memset(viewer->html_buf, 0, EPUB_WORK_BUF_SIZE);
     UINT br = 0;
     f_read(&temp_fp, viewer->html_buf, read_size, &br);
     f_close(&temp_fp);
-    
-    VIEW_LOG("DBG 2: File read done (br:%u)\n", br);
-    
+
+    /* 打印前48字节的hex，方便分析 */
+    unsigned dump_len = br < 48 ? br : 48;
+    printf("[VIEWER] HTML hex: ");
+    for (unsigned i = 0; i < dump_len; i++) {
+        printf("%02X ", (unsigned char)viewer->html_buf[i]);
+    }
+    printf("\n");
+    printf("[VIEWER] HTML str: \"");
+    for (unsigned i = 0; i < dump_len; i++) {
+        unsigned char c = (unsigned char)viewer->html_buf[i];
+        printf("%c", (c >= 0x20 && c < 0x7F) ? c : '.');
+    }
+    printf("\"\n");
+
     if (br == 0 && read_size > 0) {
-        lv_label_set_text(viewer->content_label, "读取结束");
+        lv_obj_t *err = lv_label_create(viewer->content_container);
+        lv_obj_align(err, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_font(err, FONT, 0);
+        lv_label_set_text(err, "读取结束");
         return;
     }
-    
+
+    /* 清除旧内容（删除所有子label） */
+    lv_obj_clean(viewer->content_container);
+
+    /* ===== 样式感知HTML解析 ===== */
     memset(viewer->stripped_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-    strip_html_tags(viewer->html_buf, br, viewer->stripped_buf, EPUB_WORK_BUF_SIZE * 2);
-    VIEW_LOG("DBG 3: strip_html_tags done\n");
-    
+    strip_html_tags_with_styles(viewer->html_buf, br, viewer->stripped_buf, EPUB_WORK_BUF_SIZE * 2);
+    VIEW_LOG("DBG 3: strip_html_tags_with_styles done\n");
+
     memset(viewer->decoded_buf, 0, EPUB_WORK_BUF_SIZE * 2);
     decode_html_entities(viewer->stripped_buf, viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
     VIEW_LOG("DBG 4: decode_html_entities done\n");
-    
-    memset(viewer->page_text_buf, 0, EPUB_PAGE_TEXT_SIZE);
-    int decoded_len = strlen(viewer->decoded_buf);
-    if (decoded_len >= EPUB_PAGE_TEXT_SIZE) {
-        decoded_len = EPUB_PAGE_TEXT_SIZE - 1;
-    }
-    
-    int copy_start = 0;
-    if (viewer->current_page + 1 < viewer->total_pages) {
-        if (decoded_len > 0) {
-            unsigned char last_byte = (unsigned char)viewer->decoded_buf[decoded_len - 1];
-            while (decoded_len > 0 && (last_byte >= 0x80 && last_byte <= 0xBF)) {
-                decoded_len--;
-                if (decoded_len > 0) {
-                    last_byte = (unsigned char)viewer->decoded_buf[decoded_len - 1];
-                }
-            }
-        }
-    }
-    
-    memcpy(viewer->page_text_buf, viewer->decoded_buf + copy_start, decoded_len);
-    VIEW_LOG("DBG 5: text copied to page_text_buf\n");
-    
-    sanitize_utf8(viewer->page_text_buf);
-    VIEW_LOG("DBG 6: sanitize_utf8 done, len=%u\n", (unsigned)strlen(viewer->page_text_buf));
-    
-    // 强杀全角标点保护 LVGL 渲染器！
-    fix_chinese_punctuation(viewer->page_text_buf);
-    VIEW_LOG("DBG 6.1: fix_chinese_punctuation done\n");
-    
+
+    sanitize_utf8(viewer->decoded_buf);
+    fix_chinese_punctuation(viewer->decoded_buf);
+
     /* 修剪首尾空行 */
-    char *clean_text = viewer->page_text_buf;
+    char *clean_text = viewer->decoded_buf;
     while (*clean_text == '\n' || *clean_text == ' ' || *clean_text == '\r') {
         clean_text++;
     }
-    VIEW_LOG("DBG 7: final text len=%u\n", (unsigned)strlen(clean_text));
-    
-    /* 终极 UTF-8 防火墙：强制降级所有超出字库范围的字符 */
+
+    /* 过滤不支持字符 */
     filter_unsupported_chars(clean_text);
-    VIEW_LOG("DBG 7.1: filter_unsupported_chars done, final len=%u\n", (unsigned)strlen(clean_text));
-    
-    /* ======== 字库探针 + 安全换行排版 ======== */
 
-    lv_font_t *font = get_reader_font();
-    lv_obj_set_style_text_font(viewer->content_label, font, 0);
+    /* ===== 按样式标记 \x02LEVEL\x03 分割文本块，创建多label ===== */
+    int y_offset = 0;
+    const char *p = clean_text;
+    const char *block_start = clean_text;
+    int current_level = 0;  /* 0=正文 1=H1 2=H2 3=H3 */
+    lv_font_t *current_font = FONT;
+    int current_lh = LH_BODY;
 
-    int in_idx = 0;
-    int out_idx = 0;
-    int line_width_count = 0;
-    int max_line_width = 26;
+    while (*p) {
+        /* 检测样式标记 \x02N\x03 */
+        if ((unsigned char)*p == 0x02 && *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
+            /* 保存当前块（如果非空） */
+            if (p > block_start) {
+                int block_len = p - block_start;
+                /* 移除块末尾换行 */
+                while (block_len > 0 && (block_start[block_len - 1] == '\n' || block_start[block_len - 1] == ' ')) {
+                    block_len--;
+                }
+                if (block_len > 0) {
+                    /* 检查是否超出容器高度 */
+                    if (y_offset + current_lh > CONTENT_HEIGHT) break;
 
-    memset(viewer->reflowed_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-    lv_font_glyph_dsc_t dummy_dsc;
-    memset(&dummy_dsc, 0, sizeof(lv_font_glyph_dsc_t));
+                    lv_obj_t *line_label = lv_label_create(viewer->content_container);
+                    lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, y_offset);
+                    lv_obj_set_size(line_label, CONTENT_WIDTH, current_lh);
+                    lv_obj_set_style_text_font(line_label, current_font, 0);
+                    lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
+                    lv_obj_set_style_pad_top(line_label, 0, 0);
+                    lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
 
-    while (clean_text[in_idx] != '\0' && out_idx < (EPUB_WORK_BUF_SIZE * 2 - 5)) {
-        unsigned char head = (unsigned char)clean_text[in_idx];
-        int char_bytes = 1;
-        uint32_t unicode = head;
+                    /* 截断到临时缓冲区，用memcpy避免const指针写入 */
+                    memcpy(viewer->reflowed_buf, block_start, block_len);
+                    viewer->reflowed_buf[block_len] = '\0';
+                    lv_label_set_text(line_label, viewer->reflowed_buf);
 
-        if ((head & 0x80) == 0) { char_bytes = 1; }
-        else if ((head & 0xE0) == 0xC0) {
-            char_bytes = 2;
-            unicode = ((head & 0x1F) << 6) | (clean_text[in_idx+1] & 0x3F);
-        } else if ((head & 0xF0) == 0xE0) {
-            char_bytes = 3;
-            unicode = ((head & 0x0F) << 12) | ((clean_text[in_idx+1] & 0x3F) << 6) | (clean_text[in_idx+2] & 0x3F);
-        } else if ((head & 0xF8) == 0xF0) {
-            char_bytes = 4;
-            unicode = ((head & 0x07) << 18) | ((clean_text[in_idx+1] & 0x3F) << 12) | ((clean_text[in_idx+2] & 0x3F) << 6) | (clean_text[in_idx+3] & 0x3F);
-        }
+                    /* 打印标签信息（截断到20字节） */
+                    char dbg_text[24];
+                    int dbg_len = block_len > 20 ? 20 : block_len;
+                    memcpy(dbg_text, block_start, dbg_len);
+                    dbg_text[dbg_len] = '\0';
+                    printf("[VIEWER] LBL[%03d] y=%03d lh=%02d \"%s\"\n",
+                           (int)((y_offset * 10) / CONTENT_HEIGHT), y_offset, current_lh, dbg_text);
 
-        bool glyph_exists = true;
-        if (head != '\n' && unicode > 0x7E) {
-            if (lv_font_get_glyph_dsc(font, &dummy_dsc, unicode, 0) == false) {
-                glyph_exists = false;
+                    y_offset += current_lh;
+                }
             }
-        }
-
-        if (glyph_exists) {
-            for (int i = 0; i < char_bytes && clean_text[in_idx] != '\0'; i++) {
-                viewer->reflowed_buf[out_idx++] = clean_text[in_idx++];
+            /* 切换样式级别 */
+            current_level = *(p + 1) - '0';
+            p += 3;
+            block_start = p;
+            switch (current_level) {
+                case 1: current_font = FONT_H1; current_lh = LH_H1; break;
+                case 2: current_font = FONT_H2; current_lh = LH_H2; break;
+                case 3: current_font = FONT_H3; current_lh = LH_H3; break;
+                default: current_font = FONT; current_lh = LH_BODY; break;
             }
-            if (head != '\n') line_width_count += (char_bytes > 1 ? 2 : 1);
+        } else if (*p == '\n') {
+            /* 换行符：输出当前文本块（不带换行符） */
+            if (p > block_start) {
+                int block_len = p - block_start;
+                /* 移除末尾空格 */
+                while (block_len > 0 && (block_start[block_len - 1] == ' ')) {
+                    block_len--;
+                }
+                if (block_len > 0) {
+                    if (y_offset + current_lh > CONTENT_HEIGHT) break;
+
+                    lv_obj_t *line_label = lv_label_create(viewer->content_container);
+                    lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, y_offset);
+                    lv_obj_set_size(line_label, CONTENT_WIDTH, current_lh);
+                    lv_obj_set_style_text_font(line_label, current_font, 0);
+                    lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
+                    lv_obj_set_style_pad_top(line_label, 0, 0);
+                    lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
+
+                    memcpy(viewer->reflowed_buf, block_start, block_len);
+                    viewer->reflowed_buf[block_len] = '\0';
+                    lv_label_set_text(line_label, viewer->reflowed_buf);
+
+                    /* 打印标签信息（截断到20字节） */
+                    char dbg_text[24];
+                    int dbg_len = block_len > 20 ? 20 : block_len;
+                    memcpy(dbg_text, block_start, dbg_len);
+                    dbg_text[dbg_len] = '\0';
+                    printf("[VIEWER] LBL[%03d] y=%03d lh=%02d \"%s\"\n",
+                           (int)((y_offset * 10) / CONTENT_HEIGHT), y_offset, current_lh, dbg_text);
+
+                    y_offset += current_lh;
+                }
+            }
+            p++;
+            block_start = p;
         } else {
-            viewer->reflowed_buf[out_idx++] = ' ';
-            in_idx += char_bytes;
-            line_width_count += 1;
-        }
-
-        if (head == '\n') {
-            line_width_count = 0;
-        } else if (line_width_count >= max_line_width) {
-            viewer->reflowed_buf[out_idx++] = '\n';
-            line_width_count = 0;
+            p++;
         }
     }
-    viewer->reflowed_buf[out_idx] = '\0';
 
-    VIEW_LOG("DBG 8: Text safe! Rendering...\n");
-    
-    // 最终上屏
-    lv_label_set_long_mode(viewer->content_label, LV_LABEL_LONG_CLIP);
-    lv_label_set_text(viewer->content_label, viewer->reflowed_buf);
-    
-    VIEW_LOG("DBG 9: FULL SURVIVAL!!!\n");
-    
+    /* 输出最后一个块 */
+    if (p > block_start && y_offset < CONTENT_HEIGHT) {
+        int block_len = p - block_start;
+        while (block_len > 0 && (block_start[block_len - 1] == '\n' || block_start[block_len - 1] == ' ')) {
+            block_len--;
+        }
+        if (block_len > 0) {
+            lv_obj_t *line_label = lv_label_create(viewer->content_container);
+            lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, y_offset);
+            lv_obj_set_size(line_label, CONTENT_WIDTH, current_lh);
+            lv_obj_set_style_text_font(line_label, current_font, 0);
+            lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
+            lv_obj_set_style_pad_top(line_label, 0, 0);
+            lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
+
+            memcpy(viewer->reflowed_buf, block_start, block_len);
+            viewer->reflowed_buf[block_len] = '\0';
+            lv_label_set_text(line_label, viewer->reflowed_buf);
+
+            /* 打印标签信息（截断到20字节） */
+            char dbg_text[24];
+            int dbg_len = block_len > 20 ? 20 : block_len;
+            memcpy(dbg_text, block_start, dbg_len);
+            dbg_text[dbg_len] = '\0';
+            printf("[VIEWER] LBL[%03d] y=%03d lh=%02d \"%s\"\n",
+                   (int)((y_offset * 10) / CONTENT_HEIGHT), y_offset, current_lh, dbg_text);
+        }
+    }
+
+    /* 打印容器布局信息 */
+    printf("[VIEWER] CONTAINER: CONTENT_Y=%d CONTENT_HEIGHT=%d bottom=%d line_height=%d lines_fit=%d y_offset=%d\n",
+           CONTENT_Y, CONTENT_HEIGHT, CONTENT_Y + CONTENT_HEIGHT, LINE_HEIGHT,
+           CONTENT_HEIGHT / LINE_HEIGHT, y_offset);
+    printf("[VIEWER] CONTAINER: nav_bar top=%d (expected y=%d)\n",
+           CONTENT_Y + CONTENT_HEIGHT, 415 - 50);
+
+    VIEW_LOG("DBG: update_display done, y_offset=%d\n", y_offset);
+
     /* 更新页码与标题 */
     char page_str[64];
     snprintf(page_str, sizeof(page_str), "%d/%d", viewer->current_page + 1, viewer->total_pages);
     lv_label_set_text(viewer->page_label, page_str);
-    
+
     char title_str[64];
     snprintf(title_str, sizeof(title_str), "第%d章", viewer->current_chapter + 1);
     lv_label_set_text(viewer->title_label, title_str);
-    
+
     epd_mark_refresh_pending();
     VIEW_LOG("=== update_display END ===\n");
 }
@@ -801,22 +1011,31 @@ static void content_area_event_cb(lv_event_t *e) {
     if (code == LV_EVENT_CLICKED || code == LV_EVENT_RELEASED) {
         int x = point.x;
         int y = point.y;
-        
+
+        printf("[VIEWER] TOUCH raw: (%d,%d) filter: Y>%d && Y<%d\n",
+               x, y, CONTENT_Y, CONTENT_Y + CONTENT_HEIGHT);
+
         /* 过滤非内容区域 */
         if (x < CONTENT_X || x > CONTENT_X + CONTENT_WIDTH ||
             y < CONTENT_Y || y > CONTENT_Y + CONTENT_HEIGHT) {
+            printf("[VIEWER] TOUCH filtered out: x=%d not in [%d,%d] or y=%d not in [%d,%d]\n",
+                   x, CONTENT_X, CONTENT_X + CONTENT_WIDTH,
+                   y, CONTENT_Y, CONTENT_Y + CONTENT_HEIGHT);
             return;
         }
-        
+
         /* 根据触摸位置决定操作 */
         if (x < 80) {
             /* 左侧 - 上一页 */
+            printf("[VIEWER] TOUCH: prev page\n");
             prev_page_handler(viewer);
         } else if (x > 160) {
             /* 右侧 - 下一页 */
+            printf("[VIEWER] TOUCH: next page\n");
             next_page_handler(viewer);
         } else {
             /* 中间 - 显示/隐藏目录 */
+            printf("[VIEWER] TOUCH: show toc\n");
             epub_viewer_show_toc(viewer);
         }
     }
@@ -877,31 +1096,17 @@ static void close_viewer_cb(lv_event_t *e) {
     }
 }
 
-static void prev_chapter_cb(lv_event_t *e) {
-    lv_obj_t *btn = lv_event_get_target(e);
-    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
-    if (viewer && viewer->current_chapter > 0) {
-        epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1);
-    }
-}
-
-static void next_chapter_cb(lv_event_t *e) {
-    lv_obj_t *btn = lv_event_get_target(e);
-    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
-    if (viewer && viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
-        epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1);
-    }
-}
-
 static void page_prev_cb(lv_event_t *e) {
     lv_obj_t *btn = lv_event_get_target(e);
     EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
+    printf("[VIEWER] page_prev_cb: btn=%p viewer=%p\n", (void*)btn, (void*)viewer);
     if (viewer) prev_page_handler(viewer);
 }
 
 static void page_next_cb(lv_event_t *e) {
     lv_obj_t *btn = lv_event_get_target(e);
     EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
+    printf("[VIEWER] page_next_cb: btn=%p viewer=%p\n", (void*)btn, (void*)viewer);
     if (viewer) next_page_handler(viewer);
 }
 
@@ -1001,15 +1206,17 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_text_font(viewer->page_label, FONT, 0);
     lv_obj_align(viewer->page_label, LV_ALIGN_RIGHT_MID, -10, 0);
     
-    viewer->content_label = lv_label_create(viewer->screen);
-    lv_obj_set_size(viewer->content_label, CONTENT_WIDTH, CONTENT_HEIGHT);
-    lv_obj_align(viewer->content_label, LV_ALIGN_TOP_LEFT, CONTENT_X, CONTENT_Y);
-    lv_obj_set_style_text_font(viewer->content_label, FONT, 0);
-    lv_obj_set_style_text_color(viewer->content_label, lv_color_black(), 0);
-    lv_label_set_long_mode(viewer->content_label, LV_LABEL_LONG_CLIP);
+    viewer->content_container = lv_obj_create(viewer->screen);
+    lv_obj_set_size(viewer->content_container, CONTENT_WIDTH, CONTENT_HEIGHT);
+    lv_obj_align(viewer->content_container, LV_ALIGN_TOP_LEFT, CONTENT_X, CONTENT_Y);
+    lv_obj_set_style_bg_color(viewer->content_container, lv_color_white(), 0);
+    lv_obj_set_style_pad_all(viewer->content_container, 0, 0);
+    lv_obj_clear_flag(viewer->content_container, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
+    epd_disable_all_animations_recursive(viewer->content_container);
     
     lv_obj_set_user_data(viewer->screen, viewer);
     lv_obj_add_event_cb(viewer->screen, content_area_event_cb, LV_EVENT_CLICKED, viewer);
+    printf("[VIEWER] Event cb registered: screen=%p container=%p\n", (void*)viewer->screen, (void*)viewer->content_container);
     
     lv_obj_t *nav_bar = lv_obj_create(viewer->screen);
     lv_obj_set_size(nav_bar, SCREEN_WIDTH, 50);
@@ -1017,10 +1224,10 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_bg_color(nav_bar, lv_color_white(), 0);
     epd_disable_all_animations_recursive(nav_bar);
 
-    /* 第一行：翻页键 */
+    /* 导航按钮：一行排列 [上一页] [目录] [下一页] */
     lv_obj_t *page_prev_btn = lv_btn_create(nav_bar);
     lv_obj_set_size(page_prev_btn, 55, 22);
-    lv_obj_align(page_prev_btn, LV_ALIGN_TOP_LEFT, 5, 2);
+    lv_obj_align(page_prev_btn, LV_ALIGN_LEFT_MID, 5, 0);
     lv_obj_set_style_border_width(page_prev_btn, 1, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(page_prev_btn, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(page_prev_btn, 0, LV_STATE_FOCUSED);
@@ -1033,40 +1240,9 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_text_font(page_prev_label, FONT, 0);
     lv_obj_center(page_prev_label);
 
-    lv_obj_t *page_next_btn = lv_btn_create(nav_bar);
-    lv_obj_set_size(page_next_btn, 55, 22);
-    lv_obj_align(page_next_btn, LV_ALIGN_TOP_RIGHT, -5, 2);
-    lv_obj_set_style_border_width(page_next_btn, 1, LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(page_next_btn, 1, LV_STATE_FOCUSED);
-    lv_obj_set_style_outline_width(page_next_btn, 0, LV_STATE_FOCUSED);
-    lv_obj_set_user_data(page_next_btn, viewer);
-    lv_obj_add_event_cb(page_next_btn, page_next_cb, LV_EVENT_CLICKED, viewer);
-    epd_disable_all_animations_recursive(page_next_btn);
-
-    lv_obj_t *page_next_label = lv_label_create(page_next_btn);
-    lv_label_set_text(page_next_label, "下一页");
-    lv_obj_set_style_text_font(page_next_label, FONT, 0);
-    lv_obj_center(page_next_label);
-
-    /* 第二行：章导航键 */
-    lv_obj_t *prev_btn = lv_btn_create(nav_bar);
-    lv_obj_set_size(prev_btn, 70, 22);
-    lv_obj_align(prev_btn, LV_ALIGN_BOTTOM_LEFT, 5, 0);
-    lv_obj_set_style_border_width(prev_btn, 1, LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(prev_btn, 1, LV_STATE_FOCUSED);
-    lv_obj_set_style_outline_width(prev_btn, 0, LV_STATE_FOCUSED);
-    lv_obj_set_user_data(prev_btn, viewer);
-    lv_obj_add_event_cb(prev_btn, prev_chapter_cb, LV_EVENT_CLICKED, viewer);
-    epd_disable_all_animations_recursive(prev_btn);
-
-    lv_obj_t *prev_label = lv_label_create(prev_btn);
-    lv_label_set_text(prev_label, "上一章");
-    lv_obj_set_style_text_font(prev_label, FONT, 0);
-    lv_obj_center(prev_label);
-
     lv_obj_t *toc_btn_obj = lv_btn_create(nav_bar);
     lv_obj_set_size(toc_btn_obj, 50, 22);
-    lv_obj_align(toc_btn_obj, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_align(toc_btn_obj, LV_ALIGN_TOP_MID, 0, 14);
     lv_obj_set_style_border_width(toc_btn_obj, 1, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(toc_btn_obj, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(toc_btn_obj, 0, LV_STATE_FOCUSED);
@@ -1079,23 +1255,29 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_text_font(toc_label, FONT, 0);
     lv_obj_center(toc_label);
 
-    lv_obj_t *next_btn = lv_btn_create(nav_bar);
-    lv_obj_set_size(next_btn, 70, 22);
-    lv_obj_align(next_btn, LV_ALIGN_BOTTOM_RIGHT, -5, 0);
-    lv_obj_set_style_border_width(next_btn, 1, LV_STATE_PRESSED);
-    lv_obj_set_style_border_width(next_btn, 1, LV_STATE_FOCUSED);
-    lv_obj_set_style_outline_width(next_btn, 0, LV_STATE_FOCUSED);
-    lv_obj_set_user_data(next_btn, viewer);
-    lv_obj_add_event_cb(next_btn, next_chapter_cb, LV_EVENT_CLICKED, viewer);
-    epd_disable_all_animations_recursive(next_btn);
+    lv_obj_t *page_next_btn = lv_btn_create(nav_bar);
+    lv_obj_set_size(page_next_btn, 55, 22);
+    lv_obj_align(page_next_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+    lv_obj_set_style_border_width(page_next_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(page_next_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(page_next_btn, 0, LV_STATE_FOCUSED);
+    lv_obj_set_user_data(page_next_btn, viewer);
+    lv_obj_add_event_cb(page_next_btn, page_next_cb, LV_EVENT_CLICKED, viewer);
+    epd_disable_all_animations_recursive(page_next_btn);
 
-    lv_obj_t *next_label = lv_label_create(next_btn);
-    lv_label_set_text(next_label, "下一章");
-    lv_obj_set_style_text_font(next_label, FONT, 0);
-    lv_obj_center(next_label);
+    lv_obj_t *page_next_label = lv_label_create(page_next_btn);
+    lv_label_set_text(page_next_label, "下一页");
+    lv_obj_set_style_text_font(page_next_label, FONT, 0);
+    lv_obj_center(page_next_label);
     
     lv_disp_load_scr(viewer->screen);
-    
+
+    printf("[VIEWER] Layout: SCREEN=%dx%d HEADER_H=%d CONTENT_Y=%d CONTENT_H=%d CONTENT_bottom=%d NAVBAR_top=%d NAVBAR_bottom=%d\n",
+           SCREEN_WIDTH, SCREEN_HEIGHT, 40, CONTENT_Y, CONTENT_HEIGHT,
+           CONTENT_Y + CONTENT_HEIGHT, 415 - 50, 415);
+    printf("[VIEWER] Lines: fit=%d (294/22) label_h=%d\n",
+           CONTENT_HEIGHT / LINE_HEIGHT, LINE_HEIGHT);
+
     VIEW_LOG("Viewer shown\n");
 }
 
@@ -1118,7 +1300,7 @@ void epub_viewer_close(EpubViewer *viewer) {
         viewer->toc_list = NULL;
     }
     
-    viewer->content_label = NULL;
+    viewer->content_container = NULL;
     viewer->title_label = NULL;
     viewer->page_label = NULL;
 }
@@ -1191,7 +1373,10 @@ bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index) {
     if (build_page_index(viewer, chapter_index) != 0) {
         VIEW_ERR("Failed to build page index for chapter %d\n", chapter_index);
         /* 降级处理：显示错误信息 */
-        lv_label_set_text(viewer->content_label, "章节加载失败");
+        lv_obj_t *err = lv_label_create(viewer->content_container);
+        lv_obj_align(err, LV_ALIGN_TOP_LEFT, 0, 0);
+        lv_obj_set_style_text_font(err, FONT, 0);
+        lv_label_set_text(err, "章节加载失败");
         viewer->total_pages = 1;
         viewer->current_page = 0;
         return false;

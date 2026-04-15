@@ -511,6 +511,42 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
         strcpy(reader->spine[0].href, content_opf_path);
     }
 
+    /* ===== 解析 toc.ncx 生成目录 ===== */
+    char toc_path[256];
+    snprintf(toc_path, sizeof(toc_path), "%s/toc.ncx",
+             reader->book.base_path[0] ? reader->book.base_path : "EPUB");
+    size_t toc_size = 0;
+    char *toc_data = read_file_from_zip(reader, toc_path, &toc_size);
+    if (toc_data && toc_size > 0) {
+        reader->toc_count = 0;
+        const char *scan = toc_data;
+        while (reader->toc_count < EPUB_MAX_TOC_COUNT) {
+            char *np_start = strstr(scan, "<navPoint");
+            if (!np_start) break;
+            char *text_start = strstr(np_start, "<text>");
+            char *text_end = text_start ? strstr(text_start + 6, "</text>") : NULL;
+            char *content_start = strstr(np_start, "<content src=\"");
+            char *content_end = content_start ? strchr(content_start + 14, '"') : NULL;
+            if (text_start && text_end && content_start && content_end) {
+                int text_len = text_end - text_start - 6;
+                int href_len = content_end - content_start - 14;
+                if (text_len > 0 && text_len < 128 && href_len > 0 && href_len < 256) {
+                    strncpy(reader->toc[reader->toc_count].title,
+                            text_start + 6, text_len);
+                    reader->toc[reader->toc_count].title[text_len] = '\0';
+                    strncpy(reader->toc[reader->toc_count].href,
+                            content_start + 14, href_len);
+                    reader->toc[reader->toc_count].href[href_len] = '\0';
+                    reader->toc[reader->toc_count].spine_index = 0;
+                    reader->toc_count++;
+                }
+            }
+            scan = np_start + 8;
+        }
+        EPUB_LOG("Parsed %d TOC entries from toc.ncx\n", reader->toc_count);
+        free(toc_data);
+    }
+
     free(opf_data);
 
     reader->loaded = true;

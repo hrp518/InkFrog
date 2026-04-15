@@ -44,6 +44,9 @@ void file_manager_close(void);
  * @return 字体指针
  */
 lv_font_t * get_reader_font(void);
+lv_font_t * get_reader_font_h1(void);
+lv_font_t * get_reader_font_h2(void);
+lv_font_t * get_reader_font_h3(void);
 
 void epd_disable_all_animations_recursive(lv_obj_t *obj);
 
