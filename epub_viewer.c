@@ -247,6 +247,8 @@ static void toc_btn_close_cb(lv_event_t *e);
 static void close_viewer_cb(lv_event_t *e);
 static void prev_chapter_cb(lv_event_t *e);
 static void next_chapter_cb(lv_event_t *e);
+static void page_prev_cb(lv_event_t *e);
+static void page_next_cb(lv_event_t *e);
 
 /*====================
  *   HTML处理
@@ -827,37 +829,39 @@ static void content_area_event_cb(lv_event_t *e) {
 static void toc_item_cb(lv_event_t *e) {
     lv_obj_t *btn = lv_event_get_target(e);
     EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
-    
     if (!viewer) return;
-    
-    /* 获取按钮索引 */
-    uint32_t index = lv_btnmatrix_get_selected_btn(lv_obj_get_child(viewer->toc_list, 0));
-    
-    /* 跳转到对应章节 */
-    if (viewer->reader) {
-        int chapter = epub_reader_jump_to_toc(viewer->reader, index);
-        if (chapter >= 0) {
-            epub_viewer_goto_chapter(viewer, chapter);
-        } else {
-            /* 直接使用TOC索引对应的章节 */
-            EpubTocEntry *toc = epub_reader_get_toc(viewer->reader, index);
-            if (toc && toc->spine_index >= 0) {
-                epub_viewer_goto_chapter(viewer, toc->spine_index);
-            }
+
+    /* 按钮是 lv_list 内部对象的子节点，遍历其兄弟找索引 */
+    lv_obj_t *parent = lv_obj_get_parent(btn);
+    uint32_t btn_idx = 0;
+    uint32_t child_cnt = lv_obj_get_child_cnt(parent);
+    for (uint32_t i = 0; i < child_cnt; i++) {
+        if (lv_obj_get_child(parent, i) == btn) {
+            btn_idx = i;
+            break;
         }
     }
-    
-    /* 返回阅读界面 */
-    lv_obj_del_async(viewer->toc_list);
-    viewer->toc_list = NULL;
+
+    if (viewer->reader) {
+        int chapter = epub_reader_jump_to_toc(viewer->reader, btn_idx);
+        if (chapter >= 0) {
+            epub_viewer_goto_chapter(viewer, chapter);
+        }
+    }
+
+    if (viewer->toc_list) {
+        lv_obj_del_async(viewer->toc_list);
+        viewer->toc_list = NULL;
+    }
 }
 
 static void toc_btn_close_cb(lv_event_t *e) {
-    EpubViewer *viewer = (EpubViewer*)lv_event_get_user_data(e);
+    lv_obj_t *btn = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
     if (viewer && viewer->toc_list) {
         lv_obj_del_async(viewer->toc_list);
         viewer->toc_list = NULL;
-        epd_mark_refresh_pending(); // 【新增】
+        epd_mark_refresh_pending();
     }
 }
 
@@ -887,6 +891,18 @@ static void next_chapter_cb(lv_event_t *e) {
     if (viewer && viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
         epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1);
     }
+}
+
+static void page_prev_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
+    if (viewer) prev_page_handler(viewer);
+}
+
+static void page_next_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    EpubViewer *viewer = (EpubViewer*)lv_obj_get_user_data(btn);
+    if (viewer) next_page_handler(viewer);
 }
 
 /*====================
@@ -1000,47 +1016,79 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_align(nav_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(nav_bar, lv_color_white(), 0);
     epd_disable_all_animations_recursive(nav_bar);
-    
+
+    /* 第一行：翻页键 */
+    lv_obj_t *page_prev_btn = lv_btn_create(nav_bar);
+    lv_obj_set_size(page_prev_btn, 55, 22);
+    lv_obj_align(page_prev_btn, LV_ALIGN_TOP_LEFT, 5, 2);
+    lv_obj_set_style_border_width(page_prev_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(page_prev_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(page_prev_btn, 0, LV_STATE_FOCUSED);
+    lv_obj_set_user_data(page_prev_btn, viewer);
+    lv_obj_add_event_cb(page_prev_btn, page_prev_cb, LV_EVENT_CLICKED, viewer);
+    epd_disable_all_animations_recursive(page_prev_btn);
+
+    lv_obj_t *page_prev_label = lv_label_create(page_prev_btn);
+    lv_label_set_text(page_prev_label, "上一页");
+    lv_obj_set_style_text_font(page_prev_label, FONT, 0);
+    lv_obj_center(page_prev_label);
+
+    lv_obj_t *page_next_btn = lv_btn_create(nav_bar);
+    lv_obj_set_size(page_next_btn, 55, 22);
+    lv_obj_align(page_next_btn, LV_ALIGN_TOP_RIGHT, -5, 2);
+    lv_obj_set_style_border_width(page_next_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(page_next_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(page_next_btn, 0, LV_STATE_FOCUSED);
+    lv_obj_set_user_data(page_next_btn, viewer);
+    lv_obj_add_event_cb(page_next_btn, page_next_cb, LV_EVENT_CLICKED, viewer);
+    epd_disable_all_animations_recursive(page_next_btn);
+
+    lv_obj_t *page_next_label = lv_label_create(page_next_btn);
+    lv_label_set_text(page_next_label, "下一页");
+    lv_obj_set_style_text_font(page_next_label, FONT, 0);
+    lv_obj_center(page_next_label);
+
+    /* 第二行：章导航键 */
     lv_obj_t *prev_btn = lv_btn_create(nav_bar);
-    lv_obj_set_size(prev_btn, 70, 35);
-    lv_obj_align(prev_btn, LV_ALIGN_LEFT_MID, 5, 0);
+    lv_obj_set_size(prev_btn, 70, 22);
+    lv_obj_align(prev_btn, LV_ALIGN_BOTTOM_LEFT, 5, 0);
     lv_obj_set_style_border_width(prev_btn, 1, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(prev_btn, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(prev_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(prev_btn, viewer);
     lv_obj_add_event_cb(prev_btn, prev_chapter_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(prev_btn);
-    
+
     lv_obj_t *prev_label = lv_label_create(prev_btn);
     lv_label_set_text(prev_label, "上一章");
     lv_obj_set_style_text_font(prev_label, FONT, 0);
     lv_obj_center(prev_label);
-    
+
     lv_obj_t *toc_btn_obj = lv_btn_create(nav_bar);
-    lv_obj_set_size(toc_btn_obj, 70, 35);
-    lv_obj_align(toc_btn_obj, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_size(toc_btn_obj, 50, 22);
+    lv_obj_align(toc_btn_obj, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_border_width(toc_btn_obj, 1, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(toc_btn_obj, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(toc_btn_obj, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(toc_btn_obj, viewer);
     lv_obj_add_event_cb(toc_btn_obj, toc_btn_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(toc_btn_obj);
-    
+
     lv_obj_t *toc_label = lv_label_create(toc_btn_obj);
     lv_label_set_text(toc_label, "目录");
     lv_obj_set_style_text_font(toc_label, FONT, 0);
     lv_obj_center(toc_label);
-    
+
     lv_obj_t *next_btn = lv_btn_create(nav_bar);
-    lv_obj_set_size(next_btn, 70, 35);
-    lv_obj_align(next_btn, LV_ALIGN_RIGHT_MID, -5, 0);
+    lv_obj_set_size(next_btn, 70, 22);
+    lv_obj_align(next_btn, LV_ALIGN_BOTTOM_RIGHT, -5, 0);
     lv_obj_set_style_border_width(next_btn, 1, LV_STATE_PRESSED);
     lv_obj_set_style_border_width(next_btn, 1, LV_STATE_FOCUSED);
     lv_obj_set_style_outline_width(next_btn, 0, LV_STATE_FOCUSED);
     lv_obj_set_user_data(next_btn, viewer);
     lv_obj_add_event_cb(next_btn, next_chapter_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(next_btn);
-    
+
     lv_obj_t *next_label = lv_label_create(next_btn);
     lv_label_set_text(next_label, "下一章");
     lv_obj_set_style_text_font(next_label, FONT, 0);
@@ -1210,9 +1258,6 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
                 
                 lv_obj_t *btn = lv_list_add_btn(list, NULL, btn_text);
                 lv_obj_set_style_text_font(btn, FONT, 0);
-                lv_obj_set_user_data(btn, viewer);
-                
-                /* 保存TOC索引 */
                 lv_obj_set_user_data(btn, viewer);
                 lv_obj_add_event_cb(btn, toc_item_cb, LV_EVENT_CLICKED, NULL);
             }
