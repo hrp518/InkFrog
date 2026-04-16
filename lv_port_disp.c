@@ -76,12 +76,28 @@ static uint8_t epd_sync_can_refresh(void) {
 // EPD帧缓冲
 extern uint8_t framebuffer[EPD_BUFFER_SIZE];
 
-// LVGL绘制缓冲
+// LVGL绘制缓冲 - 使用PSRAM
 #ifdef __CONFIG_PSRAM
 static lv_color_t lv_draw_buf[EPD_HORZ * EPD_VERT] __attribute__((section(".psram_bss")));
 #else
 static lv_color_t lv_draw_buf[EPD_HORZ * EPD_VERT];
 #endif
+
+// 安全测试PSRAM是否可访问
+static int test_psram_access(void *addr, uint32_t size) {
+    volatile uint32_t test_word;
+    volatile uint8_t test_byte;
+
+    // 读取测试
+    test_word = *(volatile uint32_t *)addr;
+    test_byte = *(volatile uint8_t *)addr;
+
+    // 写入测试（保持原值）
+    *(volatile uint32_t *)addr = test_word;
+    *(volatile uint8_t *)addr = test_byte;
+
+    return 0;  // OK
+}
 static lv_disp_draw_buf_t disp_buf;
 static lv_disp_drv_t disp_drv;
 volatile uint8_t epd_refresh_requested = 0;   // 请求刷新EPD (exported for lv_refr.c)
@@ -234,7 +250,27 @@ static void epd_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *
  *===================*/
 
 void lv_port_disp_init(void) {
-    printf("[LVGL] Full EPD init...\r\n");
+    printf("[LVGL] === lv_port_disp_init START ===\r\n");
+
+    // ========== PSRAM访问测试 ==========
+    printf("[LVGL] Testing PSRAM access...\r\n");
+    extern uint32_t __psram_bss_start__;
+    extern uint32_t __psram_bss_end__;
+    uint32_t psram_bss_size = (uint32_t)&__psram_bss_end__ - (uint32_t)&__psram_bss_start__;
+    printf("[LVGL] PSRAM .bss section: start=0x%08X, end=0x%08X, size=%u bytes\r\n",
+           (unsigned int)&__psram_bss_start__, (unsigned int)&__psram_bss_end__, psram_bss_size);
+
+    // 测试lv_draw_buf地址是否可访问
+    printf("[LVGL] Testing lv_draw_buf at 0x%08X...\r\n", (unsigned int)lv_draw_buf);
+    if (test_psram_access(lv_draw_buf, sizeof(lv_draw_buf)) == 0) {
+        printf("[LVGL] PSRAM access OK, lv_draw_buf size=%u bytes\r\n", sizeof(lv_draw_buf));
+    } else {
+        printf("[LVGL] PSRAM access FAILED!\r\n");
+    }
+    // ====================================
+
+    // ========== EPD初始化 ==========
+    printf("[LVGL] Step 1: EPD_3IN52_Init() calling...\r\n");
     int init_retry = 0;
     while (EPD_3IN52_Init() != 0) {
         init_retry++;
@@ -244,27 +280,28 @@ void lv_port_disp_init(void) {
     if (init_retry > 0) {
         printf("[EPD] Init succeeded after %d retries\n", init_retry);
     }
+    printf("[LVGL] Step 1: EPD_3IN52_Init() DONE\r\n");
     
-    printf("[LVGL] Entering DU mode...\r\n");
+    printf("[LVGL] Step 2: EPD_3IN52_Init_DU() calling...\r\n");
     EPD_3IN52_Init_DU();
-    
-    printf("[LVGL] Clearing screen...\r\n");
+    printf("[LVGL] Step 2: EPD_3IN52_Init_DU() DONE\r\n");
+
+    printf("[LVGL] Step 3: Clearing framebuffer...\r\n");
     memset(framebuffer, 0xFF, EPD_BUFFER_SIZE);
-    
+    printf("[LVGL] Step 3: framebuffer cleared (%d bytes)\r\n", EPD_BUFFER_SIZE);
+
     // ========== 暴力硬件测试：脱离LVGL直接刷全黑 ==========
-    printf("[TEST] Writing all 0x00 to framebuffer...\r\n");
+    printf("[TEST] Writing all 0x00 to framebuffer for hardware test...\r\n");
     memset(framebuffer, 0x00, EPD_BUFFER_SIZE);
-    
+
     printf("[TEST] Calling EPD_3IN52_Display() - should show BLACK screen...\r\n");
     EPD_3IN52_Display();
-    
-    printf("[TEST] SPI hardware test complete. Screen should be BLACK now.\r\n");
-    // 删除阻塞循环，添加调试信息
-    printf("[TEST] Continuing to LVGL init...\r\n");
+    printf("[TEST] EPD_3IN52_Display() DONE\r\n");
     // =======================================================
-    
-    printf("[LVGL] Initial full screen refresh...\r\n");
+
+    printf("[LVGL] Step 4: EPD_3IN52_Display_DU() calling...\r\n");
     EPD_3IN52_Display_DU();
+    printf("[LVGL] Step 4: EPD_3IN52_Display_DU() DONE\r\n");
     
     printf("[LVGL] EPD ready\r\n");
     

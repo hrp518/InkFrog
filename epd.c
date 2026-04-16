@@ -247,15 +247,23 @@ static void EPD_SendData(uint8_t data)
     EpdSpiTransferCallback(data);
 }
 
-/* Reset EPD */
+/* Reset EPD - 临界区仅保护GPIO操作，防止中断在GPIO时序期间触发崩溃 */
 static void EPD_Reset(void)
 {
+    __disable_irq();
     HAL_GPIO_WritePin(GPIO_PORT_A, GPIO_PIN_9, GPIO_PIN_HIGH);
+    __enable_irq();
     OS_MSleep(200);
+
+    __disable_irq();
     HAL_GPIO_WritePin(GPIO_PORT_A, GPIO_PIN_9, GPIO_PIN_LOW);
+    __enable_irq();
     OS_MSleep(2);
+
+    __disable_irq();
     HAL_GPIO_WritePin(GPIO_PORT_A, GPIO_PIN_9, GPIO_PIN_HIGH);
-    OS_MSleep(200);
+    __enable_irq();
+    OS_MSleep(200);  // EPD需要时间完成内部初始化
 }
 
 /* Forward declaration - used for self-healing from unknown/inconsistent EPD state */
@@ -441,14 +449,35 @@ int EPD_3IN52_Init(void)
 {
     int ret;
 
+    printf("[EPD_Init] === EPD_3IN52_Init START ===\r\n");
+
     /* Initialize GPIO */
+    printf("[EPD_Init] Step 1: EPD_GPIO_Init()...\r\n");
     EPD_GPIO_Init();
+    printf("[EPD_Init] Step 1: DONE\r\n");
 
     EPD_3IN52_Flag = 0;
 
 retry_init:
+    printf("[EPD_Init] Step 2: EPD_Reset()...\r\n");
     EPD_Reset();
+    printf("[EPD_Init] Step 2: DONE\r\n");
 
+    printf("[EPD_Init] Step 2b: Waiting for EPD ready after reset...\r\n");
+    int timeout = 0;
+    while (timeout < 3000) {
+        if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) break;
+        OS_MSleep(1);
+        timeout++;
+    }
+    if (timeout >= 3000) {
+        printf("[EPD_Init] Step 2b: BUSY timeout, forcing reset...\n");
+        EPD_ForceReset();
+        OS_MSleep(500);
+    }
+    printf("[EPD_Init] Step 2b: EPD ready, sending panel settings...\r\n");
+
+    printf("[EPD_Init] Step 3: Sending panel settings...\r\n");
     EPD_SendCommand(0x00);  // panel setting PSR
     EPD_SendData(0xFF);
     EPD_SendData(0x01);
@@ -485,31 +514,38 @@ retry_init:
 
     EPD_SendCommand(0x50);
     EPD_SendData(0xB7);
+    printf("[EPD_Init] Step 3: DONE\r\n");
 
     // Check if EPD is ready before proceeding
+    printf("[EPD_Init] Step 4: EPD_CheckReady() - waiting for BUSY HIGH...\r\n");
     ret = EPD_CheckReady();
     if (ret != 0) {
-        printf("[EPD] Init failed: EPD not responding, forcing full reset...\n");
+        printf("[EPD_Init] Step 4: FAILED, forcing full reset...\n");
         EPD_ForceReset();
         OS_MSleep(500);
         ret = EPD_CheckReady();
         if (ret != 0) {
-            printf("[EPD] Init failed: EPD still not responding after force reset\n");
+            printf("[EPD_Init] Step 4: FAILED AGAIN after force reset\n");
             return -1;
         }
-        printf("[EPD] Init: EPD recovered after force reset, retrying init sequence...\n");
+        printf("[EPD_Init] Step 4: recovered after force reset, retrying...\n");
         goto retry_init;
     }
+    printf("[EPD_Init] Step 4: EPD_CheckReady() PASSED\r\n");
 
     // CRITICAL FIX: Add delay after EPD_CheckReady() returns
     // EPD needs time to stabilize after BUSY goes HIGH before we can safely send commands
     OS_MSleep(200);
-
+    printf("[EPD_Init] Step 5: EPD_3IN52_Clear() - waiting for clear to complete...\r\n");
     EPD_3IN52_Clear();
+    printf("[EPD_Init] Step 5: DONE\r\n");
 
+    printf("[EPD_Init] Step 6: Sending DATA_START_TRANSMISSION_1...\r\n");
     EPD_SendCommand(0x13);  // DATA_START_TRANSMISSION_1
     OS_MSleep(2);
-    
+    printf("[EPD_Init] Step 6: DONE\r\n");
+    printf("[EPD_Init] === EPD_3IN52_Init END ===\r\n");
+
     return 0;
 }
 
@@ -525,17 +561,93 @@ void EPD_3IN52_Show(void)
     // If sleep is needed, call EPD_3IN52_Sleep() explicitly
 }
 
-/* Display frame buffer */
+/* Display frame buffer - 带完整EPD状态恢复机制 */
 void EPD_3IN52_Display(void)
 {
+    int timeout;
+
+    printf("[EPD_Display] === START ===\r\n");
+
+    // 步骤1: 等待EPD从上次操作中恢复
+    printf("[EPD_Display] Step 1: Waiting for EPD idle...\r\n");
+    timeout = 0;
+    while (timeout < 5000) {
+        if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) {
+            printf("[EPD_Display] EPD idle (waited %dms)\r\n", timeout);
+            break;
+        }
+        OS_MSleep(1);
+        timeout++;
+    }
+
+    if (timeout >= 5000) {
+        printf("[EPD_Display] EPD still busy after 5s, forcing reset...\r\n");
+        EPD_ForceReset();
+        OS_MSleep(1000);  // 等待EPD完全恢复
+
+        // 再等一次
+        timeout = 0;
+        while (timeout < 5000) {
+            if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) break;
+            OS_MSleep(1);
+            timeout++;
+        }
+        if (timeout >= 5000) {
+            printf("[EPD_Display] EPD not responding, skipping display\r\n");
+            return;
+        }
+        printf("[EPD_Display] EPD recovered after force reset\r\n");
+    }
+
+    // 步骤2: 重新发送面板初始化序列（确保EPD处于正确状态）
+    printf("[EPD_Display] Step 2: Re-initializing panel...\r\n");
+    EPD_SendCommand(0x00);
+    EPD_SendData(0xFF);
+    EPD_SendData(0x01);
+
+    EPD_SendCommand(0x01);
+    EPD_SendData(0x03);
+    EPD_SendData(0x10);
+    EPD_SendData(0x3F);
+    EPD_SendData(0x3F);
+    EPD_SendData(0x03);
+
+    EPD_SendCommand(0x06);
+    EPD_SendData(0x37);
+    EPD_SendData(0x3D);
+    EPD_SendData(0x3D);
+
+    EPD_SendCommand(0x60);
+    EPD_SendData(0x22);
+
+    EPD_SendCommand(0x82);
+    EPD_SendData(0x07);
+
+    EPD_SendCommand(0x30);
+    EPD_SendData(0x09);
+
+    EPD_SendCommand(0xe3);
+    EPD_SendData(0x88);
+
+    EPD_SendCommand(0x50);
+    EPD_SendData(0xB7);
+
+    OS_MSleep(200);  // 等待EPD稳定
+
+    // 步骤3: 发送帧数据
+    printf("[EPD_Display] Step 3: Sending framebuffer (%d bytes)...\r\n", 240 * 415 / 8);
     EPD_SendCommand(0x13);
-    
-    // Send framebuffer to EPD
     for (int i = 0; i < 240 * 415 / 8; i++) {
         EPD_SendData(framebuffer[i]);
     }
-    
-    EPD_3IN52_Show();
+
+    // 步骤4: 触发刷新
+    printf("[EPD_Display] Step 4: Triggering GC refresh...\r\n");
+    EPD_3IN52_lut_GC();
+    EPD_3IN52_refresh();
+    OS_MSleep(2);
+
+    printf("[EPD_Display] === DONE ===\r\n");
 }
 
 /* Fill frame buffer with pattern */
@@ -782,12 +894,16 @@ static void EPD_3IN52_lut_DU(void)
 /* Initialize EPD for DU (fast) refresh mode */
 void EPD_3IN52_Init_DU(void)
 {
+    printf("[EPD_Init_DU] === EPD_3IN52_Init_DU START ===\r\n");
     EPD_3IN52_Flag = 0;
 
 retry_dinit:
+    printf("[EPD_Init_DU] Step 1: EPD_Reset()...\r\n");
     EPD_Reset();
+    printf("[EPD_Init_DU] Step 1: DONE\r\n");
 
     // Wait for BUSY HIGH (idle), retry with force reset if needed
+    printf("[EPD_Init_DU] Step 2: Waiting for BUSY HIGH...\r\n");
     int timeout = 0;
     while (timeout < 3000) {
         if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) break;
@@ -795,7 +911,7 @@ retry_dinit:
         timeout++;
     }
     if (timeout >= 3000) {
-        printf("[EPD] Init_DU: BUSY timeout after reset, forcing hardware reset...\n");
+        printf("[EPD_Init_DU] Step 2: BUSY timeout after reset, forcing hardware reset...\n");
         EPD_ForceReset();
         OS_MSleep(500);
         timeout = 0;
@@ -805,10 +921,12 @@ retry_dinit:
             timeout++;
         }
         if (timeout >= 3000) {
-            printf("[EPD] Init_DU: still busy after force reset, proceeding anyway\n");
+            printf("[EPD_Init_DU] Step 2: still busy after force reset, proceeding anyway\n");
         }
     }
+    printf("[EPD_Init_DU] Step 2: DONE (timeout=%dms)\r\n", timeout);
 
+    printf("[EPD_Init_DU] Step 3: Sending panel settings...\r\n");
     EPD_SendCommand(0x00);  // panel setting PSR
     EPD_SendData(0xFF);
     EPD_SendData(0x01);
@@ -845,8 +963,10 @@ retry_dinit:
 
     EPD_SendCommand(0x50);
     EPD_SendData(0xB7);
+    printf("[EPD_Init_DU] Step 3: DONE\r\n");
 
     // Verify BUSY is HIGH before proceeding (EPD is idle and ready)
+    printf("[EPD_Init_DU] Step 4: Verifying BUSY HIGH...\r\n");
     timeout = 0;
     while (timeout < 3000) {
         if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_8) == GPIO_PIN_HIGH) break;
@@ -854,12 +974,13 @@ retry_dinit:
         timeout++;
     }
     if (timeout >= 3000) {
-        printf("[EPD] Init_DU: BUSY not HIGH after config, retrying full init...\n");
+        printf("[EPD_Init_DU] Step 4: BUSY not HIGH, retrying full init...\n");
         EPD_ForceReset();
         goto retry_dinit;
     }
+    printf("[EPD_Init_DU] Step 4: DONE, EPD ready\r\n");
 
-    printf("[EPD] DU mode initialized\r\n");
+    printf("[EPD_Init_DU] === EPD_3IN52_Init_DU END ===\r\n");
 }
 
 /* Display using DU (fast) refresh - for partial/full screen updates */

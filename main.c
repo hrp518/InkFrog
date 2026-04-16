@@ -554,7 +554,11 @@ int main(void)
     
     /* 初始化LVGL - lv_port_disp_init()会初始化EPD */
     printf("[MAIN] Step 1: Calling lv_init()...\r\n");
+
+    printf("[MAIN] Calling lv_init()...\r\n");
+    fflush(stdout);
     lv_init();
+    printf("[MAIN] lv_init() returned\r\n");
     printf("[MAIN] Step 1: lv_init() completed\r\n");
     
     /* 初始化显示端口 */
