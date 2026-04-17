@@ -486,7 +486,6 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
 
         viewer->chapter_decoded_cache = (char*)_dma_malloc(cache_size, DMAHEAP_PSRAM);
         if (!viewer->chapter_decoded_cache) {
-            f_close(&temp_fp);
             VIEW_ERR("Cache alloc failed (%u bytes), falling back to streaming\n", cache_size);
             viewer->use_cache_mode = false;
         } else {
@@ -759,6 +758,8 @@ static void update_display(EpubViewer *viewer) {
             uint32_t decoded_chars = 0;
             int output_pos = 0;
 
+            uint32_t need = page_end - page_start;
+
             while (total_read < read_range) {
                 UINT chunk = 0;
                 if (f_read(&temp_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &chunk) != FR_OK || chunk == 0)
@@ -781,31 +782,31 @@ static void update_display(EpubViewer *viewer) {
                     const char *src = viewer->decoded_buf + skip_in_chunk;
                     uint32_t src_len = chunk_chars - skip_in_chunk;
 
-                    /* 计算本页需要多少字符 */
-                    uint32_t need = page_end - page_start;
                     uint32_t copy_len = (src_len > need) ? need : src_len;
 
                     if (output_pos + copy_len < EPUB_WORK_BUF_SIZE * 2 - 1) {
                         memcpy(viewer->page_text_buf + output_pos, src, copy_len);
                         output_pos += copy_len;
+                        need -= copy_len;
                     }
 
                     skip_chars = decoded_chars; /* 后续块不再跳过 */
                 } else if (decoded_chars >= skip_chars) {
-                    /* 正常追加 */
-                    uint32_t need = page_end - page_start;
+                    /* 正常追加，不超过 page_end 边界 */
                     uint32_t copy_len = (chunk_chars > need) ? need : chunk_chars;
 
                     if (output_pos + copy_len < EPUB_WORK_BUF_SIZE * 2 - 1) {
                         memcpy(viewer->page_text_buf + output_pos, viewer->decoded_buf, copy_len);
                         output_pos += copy_len;
+                        need -= copy_len;
                     }
+                    if (need == 0) break;
                 }
 
                 decoded_chars += chunk_chars;
                 total_read += chunk;
 
-                if (decoded_chars >= page_end || output_pos >= page_end - page_start)
+                if (decoded_chars >= page_end)
                     break;
             }
 

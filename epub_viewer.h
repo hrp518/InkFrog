@@ -33,8 +33,8 @@ extern "C" {
 #define EPUB_VIEWER_LINE_SPACE  6        /* 行间距 */
 
 /* PSRAM 章节缓存阈值（字节，解码后字符数） */
-/* <= 160KB 时全缓存；> 160KB 时流式 */
-#define EPUB_CACHE_THRESHOLD     (160 * 1024)
+/* <= 96KB 时全缓存；> 96KB 时流式 */
+#define EPUB_CACHE_THRESHOLD     (96 * 1024)
 
 /*====================
  *   显示模式
