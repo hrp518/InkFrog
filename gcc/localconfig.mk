@@ -20,8 +20,8 @@ export __CONFIG_PSRAM_CHIP_OPI32 := y
 # Make PSRAM all cacheable to skip DMAHEAP_PSRAM_LENGTH dependency
 export __CONFIG_PSRAM_ALL_CACHEABLE := y
 
-# PSRAM DMA Heap size (KB)
-export __CONFIG_DMAHEAP_PSRAM_SIZE := 256
+# PSRAM DMA Heap size (KB) - 扩大给EPUB章节缓存使用
+export __CONFIG_DMAHEAP_PSRAM_SIZE := 384
 
 # LVGL source path for include
 export PRJ_EXTRA_INCLUDE := -I../../demo/LVGL_withSDandNetwork/lvgl/src -I../../demo/LVGL_withSDandNetwork/third_party/miniz

@@ -239,8 +239,8 @@ static size_t miniz_extract_to_fatfs_cb(void *pOpaque, mz_uint64 file_ofs, const
  * @param reader EPUB阅读器
  * @param chapter_index 章节索引
  * @param temp_file_path 临时文件路径
- * @return 0成功，-1失败
- * 
+ * @return 解压后字节数（>0成功），-1失败
+ *
  * 核心思想：利用mz_zip_reader_extract_to_callback边解压边写入SD卡，
  * 内存占用只有几KB（回调缓冲区），彻底解决大章节OOM问题。
  */
@@ -305,8 +305,8 @@ int epub_reader_extract_chapter_to_file(EpubReader *reader, int chapter_index, c
         }
     }
     
-    EPUB_LOG("Chapter %d extracted to temp file successfully\n", chapter_index);
-    return 0;
+    EPUB_LOG("Chapter %d extracted to temp file successfully (%u bytes)\n", chapter_index, (unsigned)extracted_size);
+    return (int)extracted_size;
 }
 
 static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t *out_size) {

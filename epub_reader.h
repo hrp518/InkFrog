@@ -97,7 +97,7 @@ EpubTocEntry* epub_reader_get_toc(EpubReader *reader, int index);
 int epub_reader_read_chapter(EpubReader *reader, int chapter_index, char *buffer, int buffer_size);
 int epub_reader_jump_to_toc(EpubReader *reader, int toc_index);
 
-/* 流式解析支持 - 将章节解压到SD卡临时文件 */
+/* 流式解析支持 - 将章节解压到SD卡临时文件，返回解压后字节数（>0成功，-1失败） */
 int epub_reader_extract_chapter_to_file(EpubReader *reader, int chapter_index, const char *temp_file_path);
 
 #ifdef __cplusplus
