@@ -5,7 +5,7 @@
  * 核心改进：
  * - 根Bug修复：update_display()以前没用page_char_offsets[]做精确定位，导致
  *   第一页读章末8KB（字节偏移与字符偏移错位），翻页只有7-8行
- * - 自适应双模式：章节<=160KB全缓存（直接切片），>160KB流式（按需读文件）
+ * - 自适应双模式：章节<=96KB全缓存（直接切片），>96KB流式（按需读文件）
  * - 充分利用PSRAM（扩大堆到384KB）
  * - 字体样式感知：H1/H2/H3正确区分（大小+粗体）
  * - HTML解析增强：pre标签保留格式、更多实体解码
@@ -44,10 +44,7 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define EPUB_WORK_BUF_SIZE          8192   /* 工作缓冲区：8KB */
 #define EPUB_CHUNK_DECODED         16384   /* 每块解码后大小 */
 
-/* PSRAM 缓存模式阈值（<=160KB全缓存，>160KB流式） */
-#ifndef EPUB_CACHE_THRESHOLD
-#define EPUB_CACHE_THRESHOLD        (160 * 1024)
-#endif
+/* PSRAM 缓存模式阈值（<=96KB全缓存，>96KB流式）统一在 epub_viewer.h */
 
 struct EpubViewer {
     EpubReader *reader;
@@ -67,16 +64,18 @@ struct EpubViewer {
 
     /* 【双模式核心】章节内容 */
     char *chapter_decoded_cache;   /* 全章解码缓存（PSRAM，可选） */
-    uint32_t chapter_decoded_len;  /* 缓存字符数（解码后） */
+    uint32_t chapter_decoded_len;  /* canonical decoded stream总字节数 */
     uint32_t chapter_uncomp_size;  /* 解压后章节总大小（字节） */
     bool use_cache_mode;           /* true=缓存模式 false=流式模式 */
 
     /* 流式解析核心：页码-字符偏移索引 */
-    uint32_t *page_char_offsets;  /* [page_index] = decoded_char_offset */
+    uint32_t *page_char_offsets;   /* [page_index] = canonical decoded stream byte offset */
+    uint8_t *page_start_styles;    /* [page_index] = page start style level */
     int max_pages;
     int total_pages;
     int current_page;
     char temp_file_path[64];
+    char decoded_file_path[64];
 
     int current_chapter;
     epub_chapter_loaded_cb chapter_cb;
@@ -121,6 +120,14 @@ static void decode_html_entities(const char *input, char *output, int out_size);
 static void sanitize_utf8(char *str);
 static void fix_chinese_punctuation(char *str);
 static void filter_unsupported_chars(char *str);
+static void strip_style_markers(char *str);
+static void filter_unsupported_chars_ex(char *str, bool preserve_markers);
+static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
+                                      lv_font_t *font, int line_height,
+                                      int target_height);
+static int flush_render_block(EpubViewer *viewer, const char *block_start, int block_len,
+                              lv_font_t *font, int line_height, int *y_offset);
+static int build_decoded_stream(EpubViewer *viewer);
 
 /* 流式解析核心 */
 static int build_page_index(EpubViewer *viewer, int chapter_index);
@@ -187,12 +194,45 @@ static void sanitize_utf8(char *str) {
     }
 }
 
-/* 过滤不在字库范围内的字符，防止LVGL索引崩溃 */
-static void filter_unsupported_chars(char *str) {
+/* 剥离样式标记 \x02N\x03（用于显示前清理） */
+static void strip_style_markers(char *str) {
+    char *read_ptr = str;
+    char *write_ptr = str;
+    int markers_stripped = 0;
+    while (*read_ptr) {
+        if ((unsigned char)*read_ptr == 0x02 &&
+            *(read_ptr+1) >= '0' && *(read_ptr+1) <= '3' &&
+            (unsigned char)*(read_ptr+2) == 0x03) {
+            read_ptr += 3;
+            markers_stripped++;
+        } else {
+            *write_ptr++ = *read_ptr++;
+        }
+    }
+    *write_ptr = '\0';
+    if (markers_stripped > 0) {
+        VIEW_LOG("[STRIP] removed %d style markers\n", markers_stripped);
+    }
+}
+
+static void filter_unsupported_chars_ex(char *str, bool preserve_markers) {
     unsigned char *read_ptr = (unsigned char *)str;
     unsigned char *write_ptr = (unsigned char *)str;
+    int chars_filtered = 0;
 
     while (*read_ptr) {
+        if (!preserve_markers && (read_ptr[0] == 0x02 || read_ptr[0] == 0x03)) {
+            read_ptr++;
+            chars_filtered++;
+            continue;
+        }
+        if (preserve_markers && read_ptr[0] == 0x02 && read_ptr[1] >= '0' && read_ptr[1] <= '3' && read_ptr[2] == 0x03) {
+            *write_ptr++ = *read_ptr++;
+            *write_ptr++ = *read_ptr++;
+            *write_ptr++ = *read_ptr++;
+            continue;
+        }
+
         uint32_t unicode = 0;
         int char_len = 0;
 
@@ -211,11 +251,10 @@ static void filter_unsupported_chars(char *str) {
 
         if (unicode == 0x0A || (unicode >= 0x20 && unicode <= 0x7E) ||
             (unicode >= 0x4E00 && unicode <= 0x9FA5) ||
-            (unicode >= 0x3000 && unicode <= 0x303F) /* CJK标点 */) {
+            (unicode >= 0x3000 && unicode <= 0x303F)) {
             for (int i = 0; i < char_len; i++) *write_ptr++ = read_ptr[i];
         } else {
-            if (unicode == 0xFF08 || unicode == 0x3014) *write_ptr++ = '(';
-            else if (unicode == 0xFF09 || unicode == 0x3015) *write_ptr++ = ')';
+            if (unicode == 0xFF08 || unicode == 0xFF09) *write_ptr++ = '(';
             else if (unicode == 0xFF01) *write_ptr++ = '!';
             else if (unicode == 0xFF1A) *write_ptr++ = ':';
             else if (unicode == 0xFF1B) *write_ptr++ = ';';
@@ -232,6 +271,13 @@ static void filter_unsupported_chars(char *str) {
         read_ptr += char_len;
     }
     *write_ptr = '\0';
+    if (chars_filtered > 0) {
+        VIEW_LOG("[FILTER] stripped %d control chars\n", chars_filtered);
+    }
+}
+
+static void filter_unsupported_chars(char *str) {
+    filter_unsupported_chars_ex(str, false);
 }
 
 /**
@@ -306,30 +352,17 @@ static int strip_html_tags_with_styles(const char *html, int html_len,
                 }
             } else {
                 /* 开始标签 */
-                if (strncasecmp(tag_start + 1, "h1", 2) == 0 &&
-                    (tag_start[3] == '>' || tag_start[3] == ' ')) {
-                    if (current_level != 1) {
+                if ((tag_start[1] == 'h' || tag_start[1] == 'H') &&
+                    (tag_start[2] >= '1' && tag_start[2] <= '6')) {
+                    /* 更健壮的检测：h1-h6，允许任意后续字符（属性、空格、>等） */
+                    int level = tag_start[2] - '0';
+                    if (current_level != level) {
                         if (out_pos > 0 && output[out_pos-1] != '\n') {
                             if (out_pos < out_size - 1) output[out_pos++] = '\n';
                         }
-                        EMIT_LEVEL(1);
-                        current_level = 1;
-                    }
-                } else if (strncasecmp(tag_start + 1, "h2", 2) == 0) {
-                    if (current_level != 2) {
-                        if (out_pos > 0 && output[out_pos-1] != '\n') {
-                            if (out_pos < out_size - 1) output[out_pos++] = '\n';
-                        }
-                        EMIT_LEVEL(2);
-                        current_level = 2;
-                    }
-                } else if (strncasecmp(tag_start + 1, "h3", 2) == 0) {
-                    if (current_level != 3) {
-                        if (out_pos > 0 && output[out_pos-1] != '\n') {
-                            if (out_pos < out_size - 1) output[out_pos++] = '\n';
-                        }
-                        EMIT_LEVEL(3);
-                        current_level = 3;
+                        VIEW_LOG("[HTML] H%d tag: %.*s\n", level, 20, tag_start);
+                        EMIT_LEVEL(level);
+                        current_level = level;
                     }
                 } else if (strncasecmp(tag_start + 1, "p", 1) == 0 ||
                            strncasecmp(tag_start + 1, "div", 3) == 0 ||
@@ -421,6 +454,10 @@ static void free_page_index(EpubViewer *viewer) {
         _dma_free(viewer->page_char_offsets, 0);
         viewer->page_char_offsets = NULL;
     }
+    if (viewer->page_start_styles) {
+        _dma_free(viewer->page_start_styles, 0);
+        viewer->page_start_styles = NULL;
+    }
     if (viewer->chapter_decoded_cache) {
         _dma_free(viewer->chapter_decoded_cache, 0);
         viewer->chapter_decoded_cache = NULL;
@@ -429,18 +466,184 @@ static void free_page_index(EpubViewer *viewer) {
     viewer->total_pages = 0;
     viewer->use_cache_mode = false;
     viewer->chapter_decoded_len = 0;
+    viewer->decoded_file_path[0] = '\0';
+}
+
+/* 计算指定高度需要多少 UTF-8 安全字节 */
+static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
+                                      lv_font_t *font, int line_height,
+                                      int target_height) {
+    if (!text || text_len == 0 || target_height <= 0) return 0;
+
+    uint32_t low = 0;
+    uint32_t high = text_len;
+    uint32_t best = 0;
+    char work_buf[512];
+
+    while (low <= high) {
+        uint32_t mid = low + ((high - low) / 2);
+        while (mid > 0 && (((unsigned char)text[mid]) & 0xC0) == 0x80) {
+            mid--;
+        }
+        if (mid == 0) mid = 1;
+        if (mid >= sizeof(work_buf)) mid = sizeof(work_buf) - 1;
+
+        memcpy(work_buf, text, mid);
+        work_buf[mid] = '\0';
+
+        lv_point_t txt_size;
+        lv_txt_get_size(&txt_size, work_buf, font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+        int actual_h = txt_size.y;
+        if (actual_h < line_height) actual_h = line_height;
+
+        if (actual_h <= target_height) {
+            best = mid;
+            low = mid + 1;
+        } else {
+            if (mid == 0) break;
+            high = mid - 1;
+        }
+    }
+
+    if (best == 0) {
+        uint32_t mid = text_len < sizeof(work_buf) - 1 ? text_len : sizeof(work_buf) - 1;
+        while (mid > 0 && (((unsigned char)text[mid]) & 0xC0) == 0x80) {
+            mid--;
+        }
+        if (mid == 0) mid = 1;
+        best = mid;
+    }
+    return best;
+}
+
+static int flush_render_block(EpubViewer *viewer, const char *block_start, int block_len,
+                              lv_font_t *font, int line_height, int *y_offset) {
+    if (!viewer || !block_start || block_len <= 0 || !font || !y_offset) return 0;
+
+    while (block_len > 0 && (block_start[block_len - 1] == '\n' || block_start[block_len - 1] == ' ')) {
+        block_len--;
+    }
+    if (block_len <= 0) return 0;
+
+    memcpy(viewer->reflowed_buf, block_start, block_len);
+    viewer->reflowed_buf[block_len] = '\0';
+
+    lv_point_t txt_size;
+    lv_txt_get_size(&txt_size, viewer->reflowed_buf, font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+    int actual_h = txt_size.y;
+    if (actual_h < line_height) actual_h = line_height;
+    if (*y_offset + actual_h > CONTENT_HEIGHT) return 0;
+
+    lv_obj_t *line_label = lv_label_create(viewer->content_container);
+    lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, *y_offset);
+    lv_obj_set_size(line_label, CONTENT_WIDTH, actual_h);
+    lv_obj_set_style_text_font(line_label, font, 0);
+    lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
+    lv_obj_set_style_pad_top(line_label, 0, 0);
+    lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(line_label, viewer->reflowed_buf);
+
+    *y_offset += actual_h;
+    return actual_h;
+}
+
+static int write_decoded_chunk(FIL *decoded_fp, const char *buf, uint32_t len,
+                               uint32_t *stream_offset, char *cache_ptr, uint32_t *cache_left) {
+    if (!decoded_fp || !buf || len == 0 || !stream_offset) return 0;
+
+    UINT bw = 0;
+    if (f_write(decoded_fp, buf, len, &bw) != FR_OK || bw != len) {
+        return -1;
+    }
+
+    if (cache_ptr && cache_left && *cache_left > len + 1) {
+        memcpy(cache_ptr, buf, len);
+        cache_ptr[len] = '\0';
+        *cache_left -= len;
+    }
+
+    *stream_offset += len;
+    return (int)len;
+}
+
+static int build_decoded_stream(EpubViewer *viewer) {
+    VIEW_LOG("[DECODE] build_decoded_stream ENTRY\n");
+    FIL html_fp;
+    FIL decoded_fp;
+    
+    VIEW_LOG("[DECODE] decoded_file_path='%s'\n", viewer->decoded_file_path);
+    FRESULT fr = f_open(&html_fp, viewer->temp_file_path, FA_READ);
+    VIEW_LOG("[DECODE] f_open html result=%d\n", fr);
+    if (fr != FR_OK) return -1;
+    
+    VIEW_LOG("[DECODE] temp_file='%s'\n", viewer->temp_file_path);
+    fr = f_open(&decoded_fp, viewer->decoded_file_path, FA_CREATE_ALWAYS | FA_WRITE);
+    VIEW_LOG("[DECODE] f_open decoded result=%d\n", fr);
+    if (fr != FR_OK) {
+        f_close(&html_fp);
+        return -1;
+    }
+
+    uint32_t stream_offset = 0;
+    char *cache_ptr = viewer->chapter_decoded_cache;
+    uint32_t cache_left = 0;
+    if (viewer->use_cache_mode && cache_ptr) {
+        cache_left = EPUB_CACHE_THRESHOLD + 4096;
+    } else {
+        cache_ptr = NULL;
+    }
+
+    VIEW_LOG("[DECODE] starting read loop, cache_mode=%d cache_ptr=%p\n", viewer->use_cache_mode, cache_ptr);
+    int loop_count = 0;
+    while (1) {
+        UINT br = 0;
+        fr = f_read(&html_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &br);
+        VIEW_LOG("[DECODE] f_read loop=%d fr=%d br=%u\n", loop_count++, fr, br);
+        if (fr != FR_OK || br == 0) break;
+
+        memset(viewer->stripped_buf, 0, EPUB_WORK_BUF_SIZE * 2);
+        int stripped_len = strip_html_tags_with_styles(viewer->html_buf, (int)br, viewer->stripped_buf, EPUB_WORK_BUF_SIZE * 2);
+        VIEW_LOG("[DECODE] stripped_len=%d\n", stripped_len);
+
+        memset(viewer->decoded_buf, 0, EPUB_WORK_BUF_SIZE * 2);
+        decode_html_entities(viewer->stripped_buf, viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
+        sanitize_utf8(viewer->decoded_buf);
+        fix_chinese_punctuation(viewer->decoded_buf);
+        filter_unsupported_chars_ex(viewer->decoded_buf, true);
+
+        uint32_t chunk_len = strlen(viewer->decoded_buf);
+        VIEW_LOG("[DECODE] chunk_len=%u stream_off=%u\n", chunk_len, stream_offset);
+        if (chunk_len > 0) {
+            UINT bw = 0;
+            fr = f_write(&decoded_fp, viewer->decoded_buf, chunk_len, &bw);
+            VIEW_LOG("[DECODE] f_write result=%d bw=%u\n", fr, bw);
+            if (fr != FR_OK || bw != chunk_len) {
+                f_close(&html_fp);
+                f_close(&decoded_fp);
+                return -1;
+            }
+            if (cache_ptr && cache_left > chunk_len) {
+                memcpy(cache_ptr, viewer->decoded_buf, chunk_len);
+                cache_ptr += chunk_len;
+                cache_left -= chunk_len;
+                *cache_ptr = '\0';
+            }
+            stream_offset += chunk_len;
+        }
+    }
+
+    VIEW_LOG("[DECODE] read loop done, stream_offset=%u\n", stream_offset);
+    f_close(&html_fp);
+    VIEW_LOG("[DECODE] html_fp closed\n");
+    f_close(&decoded_fp);
+    VIEW_LOG("[DECODE] decoded_fp closed\n");
+    viewer->chapter_decoded_len = stream_offset;
+    VIEW_LOG("[DECODE] DONE chapter_decoded_len=%u\n", stream_offset);
+    return 0;
 }
 
 /**
- * @brief 构建页码索引（自适应双模式）
- *
- * 1. 解压章节到临时文件（记录解压后总大小）
- * 2. 判断章节大小决定缓存模式：
- *    - <= EPUB_CACHE_THRESHOLD → 缓存模式：全量解码到 chapter_decoded_cache
- *    - >  EPUB_CACHE_THRESHOLD → 流式模式：流式读取建索引
- * 3. 构建 page_char_offsets[]（统一使用"解码后字符偏移"）
- *
- * @return 0成功，-1失败
+ * @brief 构建页码索引（decoded temp file canonical stream）
  */
 static int build_page_index(EpubViewer *viewer, int chapter_index) {
     if (!viewer || !viewer->reader) return -1;
@@ -448,42 +651,29 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
     VIEW_LOG("Building page index for chapter %d...\n", chapter_index);
     free_page_index(viewer);
     strncpy(viewer->temp_file_path, "0:/epub_temp.html", sizeof(viewer->temp_file_path) - 1);
+    strncpy(viewer->decoded_file_path, "0:/epub_temp.decoded", sizeof(viewer->decoded_file_path) - 1);
 
-    /* 解压章节到临时文件，获取解压后总大小 */
-    uint32_t uncomp_size = epub_reader_extract_chapter_to_file(
-        viewer->reader, chapter_index, viewer->temp_file_path);
-    if ((int)uncomp_size < 0) {
+    int ret = epub_reader_extract_chapter_to_file(viewer->reader, chapter_index, viewer->temp_file_path);
+    if (ret < 0) {
         VIEW_ERR("Failed to extract chapter\n");
         return -1;
     }
+    uint32_t uncomp_size = (uint32_t)ret;
     viewer->chapter_uncomp_size = uncomp_size;
-    VIEW_LOG("Chapter uncompressed size: %u bytes, threshold=%d\n",
-             uncomp_size, EPUB_CACHE_THRESHOLD);
+    VIEW_LOG("Chapter uncompressed size: %u bytes, threshold=%d\n", uncomp_size, EPUB_CACHE_THRESHOLD);
 
-    /* 判断模式：<=160KB用缓存，>160KB用流式 */
     viewer->use_cache_mode = (uncomp_size <= EPUB_CACHE_THRESHOLD);
-
     viewer->max_pages = EPUB_MAX_PAGES_PER_CHAPTER;
-    viewer->page_char_offsets = (uint32_t*)_dma_malloc(
-        viewer->max_pages * sizeof(uint32_t), DMAHEAP_PSRAM);
-    if (!viewer->page_char_offsets) return -1;
+    viewer->page_char_offsets = (uint32_t*)_dma_malloc(viewer->max_pages * sizeof(uint32_t), DMAHEAP_PSRAM);
+    viewer->page_start_styles = (uint8_t*)_dma_malloc(viewer->max_pages * sizeof(uint8_t), DMAHEAP_PSRAM);
+    if (!viewer->page_char_offsets || !viewer->page_start_styles) return -1;
     memset(viewer->page_char_offsets, 0, viewer->max_pages * sizeof(uint32_t));
+    memset(viewer->page_start_styles, 0, viewer->max_pages * sizeof(uint8_t));
 
-    FIL temp_fp;
-    if (f_open(&temp_fp, viewer->temp_file_path, FA_READ) != FR_OK) return -1;
-
-    uint32_t decoded_char_count = 0;
-    int page_count = 1;
-    viewer->page_char_offsets[0] = 0;
-
-    /* ========== 缓存模式：全量解码到 PSRAM ========== */
     if (viewer->use_cache_mode) {
-        /* 分配章节解码缓存（对齐到4KB） */
         uint32_t cache_size = (uncomp_size + 4095) & ~4095UL;
         if (cache_size < 4096) cache_size = 4096;
-        /* 确保不超过阈值 + 一点余量 */
         if (cache_size > EPUB_CACHE_THRESHOLD + 4096) cache_size = EPUB_CACHE_THRESHOLD + 4096;
-
         viewer->chapter_decoded_cache = (char*)_dma_malloc(cache_size, DMAHEAP_PSRAM);
         if (!viewer->chapter_decoded_cache) {
             VIEW_ERR("Cache alloc failed (%u bytes), falling back to streaming\n", cache_size);
@@ -494,217 +684,126 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
         }
     }
 
-    /* ========== 流式遍历：建 page_char_offsets[] ========== */
-    int y_offset = 0;
+    if (build_decoded_stream(viewer) != 0) {
+        VIEW_ERR("Failed to build decoded stream\n");
+        return -1;
+    }
+
+    FIL decoded_fp;
+    if (f_open(&decoded_fp, viewer->decoded_file_path, FA_READ) != FR_OK) return -1;
+    VIEW_LOG("[IDX] scanning decoded stream, stack-safe mode\n");
+
+    viewer->page_char_offsets[0] = 0;
+    viewer->page_start_styles[0] = 0;
+
+    uint32_t stream_offset = 0;
+    int page_count = 1;
+    int page_y_offset = 0;
     int current_level = 0;
-    int current_lh = LH_BODY;
     lv_font_t *current_font = FONT;
-    char *cache_ptr = viewer->chapter_decoded_cache; /* 缓存写入位置 */
-    uint32_t cache_left = viewer->use_cache_mode ? EPUB_CACHE_THRESHOLD : 0;
+    int current_lh = LH_BODY;
+
+    int block_cap = EPUB_WORK_BUF_SIZE * 2 - 1;
+    int block_len = 0;
+    uint32_t block_start_offset = 0;
 
     while (1) {
         UINT br = 0;
-        f_read(&temp_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &br);
-        if (br == 0) break;
+        if (f_read(&decoded_fp, viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2 - 1, &br) != FR_OK || br == 0) break;
+        viewer->decoded_buf[br] = '\0';
 
-        /* 解析HTML并去标签 */
-        memset(viewer->stripped_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-        int stripped_len = strip_html_tags_with_styles(
-            viewer->html_buf, (int)br, viewer->stripped_buf, EPUB_WORK_BUF_SIZE * 2);
-
-        /* 解码HTML实体 */
-        memset(viewer->decoded_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-        decode_html_entities(viewer->stripped_buf, viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
-        sanitize_utf8(viewer->decoded_buf);
-        fix_chinese_punctuation(viewer->decoded_buf);
-
-        /* 缓存模式：将解码后内容追加到缓存 */
-        if (viewer->use_cache_mode && viewer->chapter_decoded_cache) {
-            uint32_t decoded_len = strlen(viewer->decoded_buf);
-            if (decoded_len > 0 && cache_left > decoded_len + 1) {
-                memcpy(cache_ptr, viewer->decoded_buf, decoded_len);
-                cache_ptr[decoded_len] = '\0';
-                cache_ptr += decoded_len;
-                cache_left -= decoded_len;
-            }
-        }
-
-        /* 边遍历边建页码索引（分页判断） */
         const char *p = viewer->decoded_buf;
-        const char *block_start = viewer->decoded_buf;
-
-        while (*p) {
-            /* 检测样式标记 \x02N\x03 */
-            if ((unsigned char)*p == 0x02 && *(p+1) >= '0' && *(p+1) <= '3' &&
-                (unsigned char)*(p+2) == 0x03) {
-                if (p > block_start) {
-                    int block_len = (int)(p - block_start);
-                    while (block_len > 0 && (block_start[block_len-1] == '\n' || block_start[block_len-1] == ' '))
-                        block_len--;
-                    if (block_len > 0) {
-                        memcpy(viewer->reflowed_buf, block_start, block_len);
-                        viewer->reflowed_buf[block_len] = '\0';
-
-                        lv_point_t txt_size;
-                        lv_txt_get_size(&txt_size, viewer->reflowed_buf, current_font, 0, 0,
-                                       CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-                        int actual_h = txt_size.y;
-                        if (actual_h < current_lh) actual_h = current_lh;
-
-                        y_offset += actual_h;
-                        decoded_char_count += block_len;
-
-                        if (y_offset >= CONTENT_HEIGHT && page_count < viewer->max_pages) {
-                            viewer->page_char_offsets[page_count] = decoded_char_count - block_len;
-                            page_count++;
-                            y_offset = actual_h;
-                        }
-                    }
-                }
-                current_level = *(p+1) - '0';
-                p += 3;
-                block_start = p;
+        const char *end = viewer->decoded_buf + br;
+        while (p < end && *p) {
+            if ((unsigned char)*p == 0x02 && (p + 2) < end && *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
+                current_level = *(p + 1) - '0';
                 switch (current_level) {
                     case 1: current_font = FONT_H1; current_lh = LH_H1; break;
                     case 2: current_font = FONT_H2; current_lh = LH_H2; break;
                     case 3: current_font = FONT_H3; current_lh = LH_H3; break;
                     default: current_font = FONT; current_lh = LH_BODY; break;
                 }
-            } else if (*p == '\n') {
-                if (p > block_start) {
-                    int block_len = (int)(p - block_start);
-                    while (block_len > 0 && (block_start[block_len-1] == ' ')) block_len--;
-                    if (block_len > 0) {
-                        memcpy(viewer->reflowed_buf, block_start, block_len);
-                        viewer->reflowed_buf[block_len] = '\0';
+                if (block_len == 0) {
+                    block_start_offset = stream_offset;
+                }
+                if (block_len + 3 < block_cap) {
+                    memcpy(viewer->reflowed_buf + block_len, p, 3);
+                    block_len += 3;
+                }
+                p += 3;
+                stream_offset += 3;
+                continue;
+            }
 
-                        lv_point_t txt_size;
-                        lv_txt_get_size(&txt_size, viewer->reflowed_buf, current_font, 0, 0,
-                                       CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-                        int actual_h = txt_size.y;
-                        if (actual_h < current_lh) actual_h = current_lh;
-
-                        y_offset += actual_h;
-                        decoded_char_count += block_len;
-
-                        if (y_offset >= CONTENT_HEIGHT && page_count < viewer->max_pages) {
-                            viewer->page_char_offsets[page_count] = decoded_char_count - block_len;
-                            page_count++;
-                            y_offset = actual_h;
-                        }
+            if (*p == '\n') {
+                if (block_len > 0) {
+                    viewer->reflowed_buf[block_len] = '\0';
+                    memcpy(viewer->page_text_buf, viewer->reflowed_buf, block_len + 1);
+                    strip_style_markers(viewer->page_text_buf);
+                    lv_point_t txt_size;
+                    lv_txt_get_size(&txt_size, viewer->page_text_buf, current_font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+                    int actual_h = txt_size.y;
+                    if (actual_h < current_lh) actual_h = current_lh;
+                    if (page_y_offset > 0 && page_y_offset + actual_h > CONTENT_HEIGHT && page_count < viewer->max_pages) {
+                        viewer->page_char_offsets[page_count] = block_start_offset;
+                        viewer->page_start_styles[page_count] = (uint8_t)current_level;
+                        page_count++;
+                        page_y_offset = actual_h;
+                    } else {
+                        page_y_offset += actual_h;
                     }
+                    block_len = 0;
+                    VIEW_LOG("[IDX] first block measured\n");
                 }
                 p++;
-                block_start = p;
-                decoded_char_count++;
-            } else {
-                p++;
-                decoded_char_count++;
+                stream_offset++;
+                block_start_offset = stream_offset;
+                continue;
             }
+
+            int char_len = 1;
+            unsigned char uc = (unsigned char)*p;
+            if ((uc & 0xE0) == 0xC0 && (p + 1) < end) char_len = 2;
+            else if ((uc & 0xF0) == 0xE0 && (p + 2) < end) char_len = 3;
+            else if ((uc & 0xF8) == 0xF0 && (p + 3) < end) char_len = 4;
+
+            if (block_len == 0) {
+                block_start_offset = stream_offset;
+            }
+            if (block_len + char_len < block_cap) {
+                memcpy(viewer->reflowed_buf + block_len, p, char_len);
+                block_len += char_len;
+            }
+            p += char_len;
+            stream_offset += char_len;
         }
     }
-    f_close(&temp_fp);
 
-    viewer->chapter_decoded_len = decoded_char_count;
+    if (block_len > 0) {
+        viewer->reflowed_buf[block_len] = '\0';
+        memcpy(viewer->page_text_buf, viewer->reflowed_buf, block_len + 1);
+        strip_style_markers(viewer->page_text_buf);
+        lv_point_t txt_size;
+        lv_txt_get_size(&txt_size, viewer->page_text_buf, current_font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+        int actual_h = txt_size.y;
+        if (actual_h < current_lh) actual_h = current_lh;
+        if (page_y_offset > 0 && page_y_offset + actual_h > CONTENT_HEIGHT && page_count < viewer->max_pages) {
+            viewer->page_char_offsets[page_count] = block_start_offset;
+            viewer->page_start_styles[page_count] = (uint8_t)current_level;
+            page_count++;
+        }
+    }
+
+    f_close(&decoded_fp);
     viewer->total_pages = page_count;
-    VIEW_LOG("Page index built: %d pages (chars=%u, mode=%s)\n",
-             viewer->total_pages, decoded_char_count,
-             viewer->use_cache_mode ? "CACHE" : "STREAMING");
+    VIEW_LOG("Page index built: %d pages (chars=%u, mode=%s)\n", viewer->total_pages,
+             viewer->chapter_decoded_len, viewer->use_cache_mode ? "CACHE" : "STREAMING");
     return 0;
 }
 
-/*====================
- *   渲染显示（双模式）
- *====================*/
-
-/* 计算指定高度需要多少解码字符 */
-static uint32_t calc_chars_for_height(const char *text_start, uint32_t text_len,
-                                       int target_height) {
-    uint32_t used_chars = 0;
-    int y_offset = 0;
-    int current_level = 0;
-    int current_lh = LH_BODY;
-    lv_font_t *current_font = FONT;
-
-    const char *p = text_start;
-    const char *end = text_start + text_len;
-    const char *block_start = text_start;
-    char work_buf[256];
-
-    while (*p && p < end) {
-        if ((unsigned char)*p == 0x02 && *(p+1) >= '0' && *(p+1) <= '3' &&
-            (unsigned char)*(p+2) == 0x03) {
-            if (p > block_start) {
-                int block_len = (int)(p - block_start);
-                while (block_len > 0 && (block_start[block_len-1] == '\n' || block_start[block_len-1] == ' '))
-                    block_len--;
-                if (block_len > 0 && block_len < (int)sizeof(work_buf)) {
-                    memcpy(work_buf, block_start, block_len);
-                    work_buf[block_len] = '\0';
-
-                    lv_point_t txt_size;
-                    lv_txt_get_size(&txt_size, work_buf, current_font, 0, 0,
-                                   CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-                    int actual_h = txt_size.y;
-                    if (actual_h < current_lh) actual_h = current_lh;
-                    y_offset += actual_h;
-                    used_chars += (p - block_start);
-
-                    if (y_offset >= target_height) return used_chars;
-                }
-            }
-            current_level = *(p+1) - '0';
-            p += 3;
-            block_start = p;
-            switch (current_level) {
-                case 1: current_font = FONT_H1; current_lh = LH_H1; break;
-                case 2: current_font = FONT_H2; current_lh = LH_H2; break;
-                case 3: current_font = FONT_H3; current_lh = LH_H3; break;
-                default: current_font = FONT; current_lh = LH_BODY; break;
-            }
-        } else if (*p == '\n') {
-            if (p > block_start) {
-                int block_len = (int)(p - block_start);
-                while (block_len > 0 && (block_start[block_len-1] == ' ')) block_len--;
-                if (block_len > 0 && block_len < (int)sizeof(work_buf)) {
-                    memcpy(work_buf, block_start, block_len);
-                    work_buf[block_len] = '\0';
-
-                    lv_point_t txt_size;
-                    lv_txt_get_size(&txt_size, work_buf, current_font, 0, 0,
-                                   CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-                    int actual_h = txt_size.y;
-                    if (actual_h < current_lh) actual_h = current_lh;
-                    y_offset += actual_h;
-                    used_chars += (p - block_start);
-
-                    if (y_offset >= target_height) return used_chars;
-                }
-            }
-            p++;
-            block_start = p;
-            used_chars++;
-        } else {
-            p++;
-            used_chars++;
-        }
-    }
-
-    /* 最后一个块 */
-    if (p > block_start) {
-        int block_len = (int)(p - block_start);
-        while (block_len > 0 && (block_start[block_len-1] == '\n' || block_start[block_len-1] == ' '))
-            block_len--;
-        if (block_len > 0) used_chars += block_len;
-    }
-    return used_chars;
-}
 
 /**
- * @brief 显示当前页（自适应双模式）
- *
- * 缓存模式：从 chapter_decoded_cache 切片
- * 流式模式：从临时文件按需读取并解码
+ * @brief 显示当前页（canonical decoded stream）
  */
 static void update_display(EpubViewer *viewer) {
     VIEW_LOG("=== update_display START ===\n");
@@ -720,101 +819,43 @@ static void update_display(EpubViewer *viewer) {
     }
 
     if (viewer->current_page < 0) viewer->current_page = 0;
-    if (viewer->current_page >= viewer->total_pages)
-        viewer->current_page = viewer->total_pages - 1;
+    if (viewer->current_page >= viewer->total_pages) viewer->current_page = viewer->total_pages - 1;
 
     uint32_t page_start = viewer->page_char_offsets[viewer->current_page];
     uint32_t page_end = (viewer->current_page + 1 < viewer->total_pages)
                           ? viewer->page_char_offsets[viewer->current_page + 1]
                           : viewer->chapter_decoded_len;
+    uint8_t current_level = viewer->page_start_styles ? viewer->page_start_styles[viewer->current_page] : 0;
 
     VIEW_LOG("Page %d/%d: char_start=%u char_end=%u mode=%s\n",
              viewer->current_page + 1, viewer->total_pages,
              page_start, page_end,
              viewer->use_cache_mode ? "CACHE" : "STREAMING");
 
-    /* ========== 提取页面文本 ========== */
     const char *page_text = NULL;
-    uint32_t page_text_len = 0;
+    uint32_t page_text_len = page_end - page_start;
 
     if (viewer->use_cache_mode && viewer->chapter_decoded_cache) {
-        /* 缓存模式：直接从缓存切片 */
         page_text = viewer->chapter_decoded_cache + page_start;
-        page_text_len = page_end - page_start;
     } else {
-        /* 流式模式：从临时文件读取并解码 */
-        FIL temp_fp;
-        if (f_open(&temp_fp, viewer->temp_file_path, FA_READ) == FR_OK) {
-            /* 流式读取：从文件头部开始，跳过 page_start 个解码字符 */
-            uint32_t skip_chars = page_start;
-
-            /* 读取足够大的范围（取较大值保证覆盖） */
-            uint32_t read_range = page_end - page_start + EPUB_WORK_BUF_SIZE;
-            if (read_range > 65536) read_range = 65536;
-
-            memset(viewer->html_buf, 0, EPUB_WORK_BUF_SIZE);
-            UINT br = 0;
-            uint32_t total_read = 0;
-            uint32_t decoded_chars = 0;
-            int output_pos = 0;
-
-            uint32_t need = page_end - page_start;
-
-            while (total_read < read_range) {
-                UINT chunk = 0;
-                if (f_read(&temp_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &chunk) != FR_OK || chunk == 0)
-                    break;
-
-                memset(viewer->stripped_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-                int slen = strip_html_tags_with_styles(viewer->html_buf, (int)chunk,
-                                                       viewer->stripped_buf, EPUB_WORK_BUF_SIZE * 2);
-
-                memset(viewer->decoded_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-                decode_html_entities(viewer->stripped_buf, viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
-                sanitize_utf8(viewer->decoded_buf);
-                fix_chinese_punctuation(viewer->decoded_buf);
-
-                uint32_t chunk_chars = strlen(viewer->decoded_buf);
-
-                if (decoded_chars < skip_chars && decoded_chars + chunk_chars > skip_chars) {
-                    /* 跳过部分 */
-                    uint32_t skip_in_chunk = skip_chars - decoded_chars;
-                    const char *src = viewer->decoded_buf + skip_in_chunk;
-                    uint32_t src_len = chunk_chars - skip_in_chunk;
-
-                    uint32_t copy_len = (src_len > need) ? need : src_len;
-
-                    if (output_pos + copy_len < EPUB_WORK_BUF_SIZE * 2 - 1) {
-                        memcpy(viewer->page_text_buf + output_pos, src, copy_len);
-                        output_pos += copy_len;
-                        need -= copy_len;
-                    }
-
-                    skip_chars = decoded_chars; /* 后续块不再跳过 */
-                } else if (decoded_chars >= skip_chars) {
-                    /* 正常追加，不超过 page_end 边界 */
-                    uint32_t copy_len = (chunk_chars > need) ? need : chunk_chars;
-
-                    if (output_pos + copy_len < EPUB_WORK_BUF_SIZE * 2 - 1) {
-                        memcpy(viewer->page_text_buf + output_pos, viewer->decoded_buf, copy_len);
-                        output_pos += copy_len;
-                        need -= copy_len;
-                    }
-                    if (need == 0) break;
-                }
-
-                decoded_chars += chunk_chars;
-                total_read += chunk;
-
-                if (decoded_chars >= page_end)
-                    break;
-            }
-
-            viewer->page_text_buf[output_pos] = '\0';
-            page_text = viewer->page_text_buf;
-            page_text_len = output_pos;
-            f_close(&temp_fp);
+        FIL decoded_fp;
+        if (f_open(&decoded_fp, viewer->decoded_file_path, FA_READ) != FR_OK) {
+            return;
         }
+        if (f_lseek(&decoded_fp, page_start) != FR_OK) {
+            f_close(&decoded_fp);
+            return;
+        }
+        if (page_text_len > EPUB_WORK_BUF_SIZE * 2 - 1) page_text_len = EPUB_WORK_BUF_SIZE * 2 - 1;
+        UINT br = 0;
+        if (f_read(&decoded_fp, viewer->page_text_buf, page_text_len, &br) != FR_OK) {
+            f_close(&decoded_fp);
+            return;
+        }
+        f_close(&decoded_fp);
+        viewer->page_text_buf[br] = '\0';
+        page_text = viewer->page_text_buf;
+        page_text_len = br;
     }
 
     if (!page_text || page_text_len == 0) {
@@ -826,133 +867,48 @@ static void update_display(EpubViewer *viewer) {
         return;
     }
 
-    /* 复制到工作缓冲区（保留样式标记） */
     uint32_t copy_len = (page_text_len < EPUB_WORK_BUF_SIZE * 2 - 1) ? page_text_len : (EPUB_WORK_BUF_SIZE * 2 - 1);
     memcpy(viewer->decoded_buf, page_text, copy_len);
     viewer->decoded_buf[copy_len] = '\0';
 
-    filter_unsupported_chars(viewer->decoded_buf);
-
-    /* 修剪首尾空行 */
-    char *clean_text = viewer->decoded_buf;
-    while (*clean_text == '\n' || *clean_text == ' ' || *clean_text == '\r') clean_text++;
-
-    /* 去除末尾空行 */
-    char *end_ptr = clean_text + strlen(clean_text) - 1;
-    while (end_ptr > clean_text && (*end_ptr == '\n' || *end_ptr == ' ')) *end_ptr-- = '\0';
-
-    /* ========== 多Label渲染（样式感知） ========== */
     lv_obj_clean(viewer->content_container);
 
+    const char *p = viewer->decoded_buf;
+    const char *block_start = p;
     int y_offset = 0;
-    const char *p = clean_text;
-    const char *block_start = clean_text;
-    int current_level = 0;
     lv_font_t *current_font = FONT;
     int current_lh = LH_BODY;
+    switch (current_level) {
+        case 1: current_font = FONT_H1; current_lh = LH_H1; break;
+        case 2: current_font = FONT_H2; current_lh = LH_H2; break;
+        case 3: current_font = FONT_H3; current_lh = LH_H3; break;
+        default: current_font = FONT; current_lh = LH_BODY; break;
+    }
 
     while (*p) {
-        if ((unsigned char)*p == 0x02 && *(p+1) >= '0' && *(p+1) <= '3' &&
-            (unsigned char)*(p+2) == 0x03) {
-            if (p > block_start) {
-                int block_len = (int)(p - block_start);
-                while (block_len > 0 && (block_start[block_len-1] == '\n' || block_start[block_len-1] == ' '))
-                    block_len--;
-                if (block_len > 0) {
-                    if (y_offset + current_lh > CONTENT_HEIGHT) break;
-
-                    memcpy(viewer->reflowed_buf, block_start, block_len);
-                    viewer->reflowed_buf[block_len] = '\0';
-
-                    lv_point_t txt_size;
-                    lv_txt_get_size(&txt_size, viewer->reflowed_buf, current_font, 0, 0,
-                                   CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-                    int actual_h = txt_size.y;
-                    if (actual_h < current_lh) actual_h = current_lh;
-
-                    lv_obj_t *line_label = lv_label_create(viewer->content_container);
-                    lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, y_offset);
-                    lv_obj_set_size(line_label, CONTENT_WIDTH, actual_h);
-                    lv_obj_set_style_text_font(line_label, current_font, 0);
-                    lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
-                    lv_obj_set_style_pad_top(line_label, 0, 0);
-                    lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
-                    lv_label_set_text(line_label, viewer->reflowed_buf);
-
-                    y_offset += actual_h;
-                }
-            }
-            current_level = *(p+1) - '0';
-            p += 3;
-            block_start = p;
+        if ((unsigned char)*p == 0x02 && *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
+            flush_render_block(viewer, block_start, (int)(p - block_start), current_font, current_lh, &y_offset);
+            current_level = *(p + 1) - '0';
             switch (current_level) {
                 case 1: current_font = FONT_H1; current_lh = LH_H1; break;
                 case 2: current_font = FONT_H2; current_lh = LH_H2; break;
                 case 3: current_font = FONT_H3; current_lh = LH_H3; break;
                 default: current_font = FONT; current_lh = LH_BODY; break;
             }
-        } else if (*p == '\n') {
-            if (p > block_start) {
-                int block_len = (int)(p - block_start);
-                while (block_len > 0 && (block_start[block_len-1] == ' ')) block_len--;
-                if (block_len > 0) {
-                    if (y_offset + current_lh > CONTENT_HEIGHT) break;
-
-                    memcpy(viewer->reflowed_buf, block_start, block_len);
-                    viewer->reflowed_buf[block_len] = '\0';
-
-                    lv_point_t txt_size;
-                    lv_txt_get_size(&txt_size, viewer->reflowed_buf, current_font, 0, 0,
-                                   CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-                    int actual_h = txt_size.y;
-                    if (actual_h < current_lh) actual_h = current_lh;
-
-                    lv_obj_t *line_label = lv_label_create(viewer->content_container);
-                    lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, y_offset);
-                    lv_obj_set_size(line_label, CONTENT_WIDTH, actual_h);
-                    lv_obj_set_style_text_font(line_label, current_font, 0);
-                    lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
-                    lv_obj_set_style_pad_top(line_label, 0, 0);
-                    lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
-                    lv_label_set_text(line_label, viewer->reflowed_buf);
-
-                    y_offset += actual_h;
-                }
-            }
+            p += 3;
+            block_start = p;
+            continue;
+        }
+        if (*p == '\n') {
+            flush_render_block(viewer, block_start, (int)(p - block_start), current_font, current_lh, &y_offset);
             p++;
             block_start = p;
-        } else {
-            p++;
+            continue;
         }
+        p++;
     }
+    flush_render_block(viewer, block_start, (int)(p - block_start), current_font, current_lh, &y_offset);
 
-    /* 最后一个块 */
-    if (*block_start && y_offset < CONTENT_HEIGHT) {
-        int block_len = (int)(p - block_start);
-        while (block_len > 0 && (block_start[block_len-1] == '\n' || block_start[block_len-1] == ' '))
-            block_len--;
-        if (block_len > 0) {
-            memcpy(viewer->reflowed_buf, block_start, block_len);
-            viewer->reflowed_buf[block_len] = '\0';
-
-            lv_point_t txt_size;
-            lv_txt_get_size(&txt_size, viewer->reflowed_buf, current_font, 0, 0,
-                           CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
-            int actual_h = txt_size.y;
-            if (actual_h < current_lh) actual_h = current_lh;
-
-            lv_obj_t *line_label = lv_label_create(viewer->content_container);
-            lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, y_offset);
-            lv_obj_set_size(line_label, CONTENT_WIDTH, actual_h);
-            lv_obj_set_style_text_font(line_label, current_font, 0);
-            lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
-            lv_obj_set_style_pad_top(line_label, 0, 0);
-            lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
-            lv_label_set_text(line_label, viewer->reflowed_buf);
-        }
-    }
-
-    /* 更新页码与标题 */
     char page_str[64];
     snprintf(page_str, sizeof(page_str), "%d/%d", viewer->current_page + 1, viewer->total_pages);
     lv_label_set_text(viewer->page_label, page_str);
@@ -1133,6 +1089,7 @@ EpubViewer* epub_viewer_create(EpubReader *reader) {
     memset(viewer->decoded_buf, 0, EPUB_WORK_BUF_SIZE * 2);
     memset(viewer->reflowed_buf, 0, EPUB_WORK_BUF_SIZE * 2);
     memset(viewer->page_text_buf, 0, EPUB_WORK_BUF_SIZE * 2);
+    viewer->decoded_file_path[0] = '\0';
 
     VIEW_LOG("Buffers allocated: html=%dKB stripped=%dKB decoded=%dKB reflowed=%dKB page_text=%dKB\n",
              EPUB_WORK_BUF_SIZE/1024, EPUB_WORK_BUF_SIZE*2/1024,

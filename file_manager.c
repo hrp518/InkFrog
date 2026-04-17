@@ -10,6 +10,7 @@
  */
 
 #include "file_manager.h"
+#include "heap_debug.h"
 #include "lvgl/lvgl.h"
 #include "lv_port_disp.h"
 #include "lv_port_indev.h"
@@ -72,6 +73,7 @@ static lv_font_t *custom_ttf_font_h1 = NULL;  /* TTF H1 标题字体 (22px) */
 static lv_font_t *custom_ttf_font_h2 = NULL;  /* TTF H2 标题字体 (20px) */
 static lv_font_t *custom_ttf_font_h3 = NULL;  /* TTF H3 标题字体 (18px) */
 static bool ttf_load_attempted = false;        /* 是否已尝试加载TTF */
+static bool ttf_path_discovered = false;       /* 是否已完成最小TTF发现 */
 static char ttf_file_path[256] = {0};      /* 选中的TTF文件路径 */
 static uint8_t *s_ttf_data = NULL;             /* 缓存TTF文件数据（PSRAM） */
 static size_t s_ttf_data_size = 0;             /* TTF数据大小 */
@@ -109,6 +111,10 @@ static void prev_page_cb(lv_event_t *e);
 static void next_page_cb(lv_event_t *e);
 static void open_epub_viewer(const char *filepath);
 static void async_open_epub_wrapper(void *arg);
+static int find_smallest_ttf_font(void);
+static int read_ttf_file_to_psram(void);
+static int ensure_ttf_path_discovered(void);
+static int ensure_reader_font_loaded(void);
 
 /*====================
  *   触摸滑动相关变量（已迁移到lv_port_indev.c驱动层）
@@ -116,6 +122,29 @@ static void async_open_epub_wrapper(void *arg);
 
 // touch_start_y, touch_moved 已迁移到驱动层，不再需要
 #define SWIPE_THRESHOLD 8           /* 滑动阈值（像素） */
+
+#if LV_USE_TINY_TTF
+static void print_memory_stats_internal(const char *tag)
+{
+    printf("[MEM] ==== %s ====\n", tag ? tag : "(null)");
+    print_heap_info();
+    psram_heap_info();
+    dma_heap_info();
+}
+#else
+static void print_memory_stats_internal(const char *tag)
+{
+    printf("[MEM] ==== %s ====\n", tag ? tag : "(null)");
+    print_heap_info();
+    psram_heap_info();
+    dma_heap_info();
+}
+#endif
+
+void file_manager_print_memory_stats(const char *tag)
+{
+    print_memory_stats_internal(tag);
+}
 
 /*====================
  *   回调函数
@@ -1081,6 +1110,54 @@ static void async_open_epub_wrapper(void *arg)
     open_epub_viewer((const char *)arg);
 }
 
+static int ensure_ttf_path_discovered(void)
+{
+#if LV_USE_TINY_TTF
+    if (ttf_path_discovered) {
+        return (ttf_file_path[0] != '\0') ? 0 : -1;
+    }
+    ttf_path_discovered = true;
+    print_memory_stats_internal("before_find_smallest_ttf_font");
+    int ret = find_smallest_ttf_font();
+    print_memory_stats_internal("after_find_smallest_ttf_font");
+    return ret;
+#else
+    return -1;
+#endif
+}
+
+static int ensure_reader_font_loaded(void)
+{
+#if LV_USE_TINY_TTF
+    if (custom_ttf_font != NULL) {
+        return 0;
+    }
+    if (ttf_load_attempted) {
+        return (custom_ttf_font != NULL) ? 0 : -1;
+    }
+    ttf_load_attempted = true;
+    printf("[FONT] Attempting deferred TTF font load...\n");
+    if (ensure_ttf_path_discovered() == 0) {
+        print_memory_stats_internal("before_read_ttf_to_psram");
+        if (read_ttf_file_to_psram() == 0) {
+            print_memory_stats_internal("after_read_ttf_to_psram");
+            printf("[FONT] Loading TTF from PSRAM (size: %u bytes)\n", (unsigned int)s_ttf_data_size);
+            custom_ttf_font = lv_tiny_ttf_create_data_ex(s_ttf_data, s_ttf_data_size, 16, 32768);
+            printf("[FONT] lv_tiny_ttf_create_data_ex returned: %p\n", custom_ttf_font);
+            print_memory_stats_internal("after_create_ttf_font");
+            if (custom_ttf_font != NULL) {
+                custom_ttf_font->fallback = &lv_font_misans_16;
+                return 0;
+            }
+        }
+    }
+    printf("[FONT] Deferred TTF load failed, using built-in fallback\n");
+    return -1;
+#else
+    return -1;
+#endif
+}
+
 static void open_epub_viewer(const char *filepath)
 {
     printf("[FM] Opening EPUB: %s\n", filepath);
@@ -1110,6 +1187,10 @@ static void open_epub_viewer(const char *filepath)
     printf("[FM] EPUB opened: %s, chapters: %d\n",
            epub_reader_get_title(g_epub_reader),
            epub_reader_get_chapter_count(g_epub_reader));
+
+    file_manager_print_memory_stats("before_prepare_reader_fonts");
+    file_manager_prepare_reader_fonts();
+    file_manager_print_memory_stats("after_prepare_reader_fonts");
     
     g_epub_viewer = epub_viewer_create(g_epub_reader);
     if (!g_epub_viewer) {
@@ -1373,45 +1454,17 @@ static int read_ttf_file_to_psram(void)
  */
 lv_font_t *get_reader_font(void)
 {
-    /* 如果已经加载过TTF字体，直接返回 */
     if (custom_ttf_font != NULL) {
         return custom_ttf_font;
     }
-    
-    /* 首次调用：尝试加载TTF字体 */
-    if (!ttf_load_attempted) {
-        ttf_load_attempted = true;
-        
-        printf("[FONT] Attempting to load TTF font from SD card...\n");
-        
-        /* 查找最小的TTF文件 */
-        if (find_smallest_ttf_font() == 0) {
-            /* 先将TTF文件读取到PSRAM */
-            if (read_ttf_file_to_psram() == 0) {
-                /* 使用Tiny-TTF从内存数据加载字体 */
-                printf("[FONT] Loading TTF from PSRAM (size: %u bytes)\n", (unsigned int)s_ttf_data_size);
-                printf("[FONT] ABOUT TO CALL lv_tiny_ttf_create_data()...\n");
-                
-                custom_ttf_font = lv_tiny_ttf_create_data_ex(s_ttf_data, s_ttf_data_size, 16, 131072);
-                
-                printf("[FONT] lv_tiny_ttf_create_data() returned: %p\n", custom_ttf_font);
-                
-                if (custom_ttf_font != NULL) {
-                    custom_ttf_font->fallback = &lv_font_misans_16;
-                    printf("[FONT] TTF font loaded successfully: %p (fallback=misans_16)\n", custom_ttf_font);
-                    printf("[FONT] Font line height: %d\n", custom_ttf_font->line_height);
-                    return custom_ttf_font;
-                } else {
-                    printf("[FONT] Failed to load TTF font, using fallback\n");
-                }
-            }
+
+    if (!ttf_path_discovered) {
+        printf("[FONT] Discovering smallest TTF font path only...\n");
+        if (ensure_ttf_path_discovered() != 0) {
+            printf("[FONT] No usable TTF discovered, using built-in fallback\n");
         }
-        
-        /* 加载失败，回退到内置字体C */
-        printf("[FONT] Using built-in misans font as fallback\n");
     }
-    
-    /* 返回内置字体 */
+
     printf("[FONT] Returning built-in font: %p\n", &lv_font_misans_16);
     return &lv_font_misans_16;
 }
@@ -1427,6 +1480,15 @@ static lv_font_t *create_ttf_font_at_size(lv_coord_t font_size)
         font->fallback = &lv_font_misans_16;
     }
     return font;
+}
+
+int file_manager_prepare_reader_fonts(void)
+{
+#if LV_USE_TINY_TTF
+    return ensure_reader_font_loaded();
+#else
+    return -1;
+#endif
 }
 
 /* H1 标题字体 (22px) */

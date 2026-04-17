@@ -29,6 +29,7 @@
 #include "fs/fatfs/ff.h"
 #include "common/framework/fs_ctrl.h"
 #include "file_manager.h"
+#include "heap_debug.h"
 #include "wlan_manager.h"
 #include "http_server.h"
 
@@ -752,12 +753,16 @@ int main(void)
            http_server_is_running() ? "enabled" : "disabled");
 
     /* UI创建完毕，启动后台任务 */
+    printf("[Display] create disp_task stack=%d\r\n", 8192);
+    print_heap_info();
+    psram_heap_info();
+    dma_heap_info();
     if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
-                        OS_PRIORITY_NORMAL, 2048) != 0) {
+                        OS_PRIORITY_NORMAL, 8192) != 0) {
         printf("[ERROR] Failed to create disp_task\r\n");
     }
     if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 16384) != 0) {
+                        OS_PRIORITY_NORMAL, 32768) != 0) {
         printf("[ERROR] Failed to create lvgl_task\r\n");
     }
 

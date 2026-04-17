@@ -47,6 +47,8 @@ lv_font_t * get_reader_font(void);
 lv_font_t * get_reader_font_h1(void);
 lv_font_t * get_reader_font_h2(void);
 lv_font_t * get_reader_font_h3(void);
+int file_manager_prepare_reader_fonts(void);
+void file_manager_print_memory_stats(const char *tag);
 
 void epd_disable_all_animations_recursive(lv_obj_t *obj);
 
