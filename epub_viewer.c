@@ -292,23 +292,14 @@ static int strip_html_tags_with_styles(const char *html, int html_len,
 {
     int out_pos = 0;
     int in_tag = 0;
-    int in_pre = 0;      /* <pre>标签内：保留原始换行 */
+    int in_pre = 0;
+    int in_head = 0;
+    int in_style = 0;
+    int in_script = 0;
     const char *tag_start = NULL;
     int current_level = 0;
     const char *p = html;
     const char *end = html + html_len;
-
-    /* 跳过起始不完整UTF-8字符 */
-    while (p < end) {
-        unsigned char uc = (unsigned char)*p;
-        int need = 0;
-        if ((uc & 0xE0) == 0xC0) need = 1;
-        else if ((uc & 0xF0) == 0xE0) need = 2;
-        else if ((uc & 0xF8) == 0xF0) need = 3;
-        else break;
-        if (p + need >= end) { p++; }
-        else break;
-    }
 
     #define EMIT_LEVEL(lvl) do { \
         if (out_pos < out_size - 4) { \
@@ -322,67 +313,72 @@ static int strip_html_tags_with_styles(const char *html, int html_len,
         if (*p == '<') {
             in_tag = 1;
             tag_start = p;
-
-            /* 检测pre/code标签（保留原始格式） */
-            if (strncasecmp(p + 1, "pre", 3) == 0 ||
-                strncasecmp(p + 1, "code", 4) == 0) {
-                in_pre = 1;
-            }
-
         } else if (*p == '>' && in_tag) {
             in_tag = 0;
+            int closing = (tag_start && (tag_start + 1) < end && tag_start[1] == '/');
+            const char *name = closing ? tag_start + 2 : tag_start + 1;
 
-            /* 检测闭合pre/code */
-            if (tag_start && strncasecmp(tag_start + 1, "/pre", 4) == 0) {
-                in_pre = 0;
+            if (!closing) {
+                if (strncasecmp(name, "head", 4) == 0) in_head = 1;
+                else if (strncasecmp(name, "style", 5) == 0) in_style = 1;
+                else if (strncasecmp(name, "script", 6) == 0) in_script = 1;
+                else if (strncasecmp(name, "pre", 3) == 0 || strncasecmp(name, "code", 4) == 0) in_pre = 1;
+            } else {
+                if (strncasecmp(name, "head", 4) == 0) in_head = 0;
+                else if (strncasecmp(name, "style", 5) == 0) in_style = 0;
+                else if (strncasecmp(name, "script", 6) == 0) in_script = 0;
+                else if (strncasecmp(name, "pre", 3) == 0 || strncasecmp(name, "code", 4) == 0) in_pre = 0;
             }
 
-            int len = (int)(p - tag_start + 1);
-
-            if (len > 2 && tag_start[1] == '/') {
-                /* 闭合标签 */
-                if (strncasecmp(tag_start + 2, "h1", 2) == 0 ||
-                    strncasecmp(tag_start + 2, "h2", 2) == 0 ||
-                    strncasecmp(tag_start + 2, "h3", 2) == 0) {
-                    if (current_level > 0) {
-                        EMIT_LEVEL(0);
-                        current_level = 0;
-                        if (out_pos < out_size - 1) output[out_pos++] = '\n';
-                    }
-                }
-            } else {
-                /* 开始标签 */
-                if ((tag_start[1] == 'h' || tag_start[1] == 'H') &&
-                    (tag_start[2] >= '1' && tag_start[2] <= '6')) {
-                    /* 更健壮的检测：h1-h6，允许任意后续字符（属性、空格、>等） */
-                    int level = tag_start[2] - '0';
-                    if (current_level != level) {
-                        if (out_pos > 0 && output[out_pos-1] != '\n') {
+            if (!(in_head || in_style || in_script)) {
+                int len = (int)(p - tag_start + 1);
+                if (len > 2 && tag_start[1] == '/') {
+                    if (strncasecmp(tag_start + 2, "h1", 2) == 0 ||
+                        strncasecmp(tag_start + 2, "h2", 2) == 0 ||
+                        strncasecmp(tag_start + 2, "h3", 2) == 0) {
+                        if (current_level > 0) {
+                            EMIT_LEVEL(0);
+                            current_level = 0;
                             if (out_pos < out_size - 1) output[out_pos++] = '\n';
                         }
-                        VIEW_LOG("[HTML] H%d tag: %.*s\n", level, 20, tag_start);
-                        EMIT_LEVEL(level);
-                        current_level = level;
                     }
-                } else if (strncasecmp(tag_start + 1, "p", 1) == 0 ||
-                           strncasecmp(tag_start + 1, "div", 3) == 0 ||
-                           strncasecmp(tag_start + 1, "br", 2) == 0) {
-                    if (out_pos > 0 && output[out_pos-1] != '\n') {
-                        if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                } else {
+                    if ((tag_start + 2) < end && (tag_start[1] == 'h' || tag_start[1] == 'H') &&
+                        (tag_start[2] >= '1' && tag_start[2] <= '6')) {
+                        int level = tag_start[2] - '0';
+                        if (current_level != level) {
+                            if (out_pos > 0 && output[out_pos - 1] != '\n') {
+                                if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                            }
+                            int dbg_len = (int)(end - tag_start);
+                            if (dbg_len > 20) dbg_len = 20;
+                            if (dbg_len < 0) dbg_len = 0;
+                            VIEW_LOG("[HTML] H%d tag: %.*s\n", level, dbg_len, tag_start);
+                            EMIT_LEVEL(level);
+                            current_level = level;
+                        }
+                    } else if (strncasecmp(tag_start + 1, "p", 1) == 0 ||
+                               strncasecmp(tag_start + 1, "div", 3) == 0 ||
+                               strncasecmp(tag_start + 1, "br", 2) == 0) {
+                        if (out_pos > 0 && output[out_pos - 1] != '\n') {
+                            if (out_pos < out_size - 1) output[out_pos++] = '\n';
+                        }
                     }
                 }
             }
         } else if (!in_tag) {
+            if (in_head || in_style || in_script) {
+                p++;
+                continue;
+            }
             if (*p == '&') {
                 if (out_pos < out_size - 1) output[out_pos++] = *p;
             } else if (*p == '\n') {
-                /* 在pre标签外：换行分隔段落 */
                 if (!in_pre) {
-                    if (out_pos > 0 && output[out_pos-1] != '\n') {
+                    if (out_pos > 0 && output[out_pos - 1] != '\n') {
                         if (out_pos < out_size - 1) output[out_pos++] = '\n';
                     }
                 } else {
-                    /* 在pre标签内：保留原始换行 */
                     if (out_pos < out_size - 1) output[out_pos++] = '\n';
                 }
             } else if (*p != '\r' && *p != '\t') {
@@ -394,7 +390,7 @@ static int strip_html_tags_with_styles(const char *html, int html_len,
 
     #undef EMIT_LEVEL
 
-    if (out_pos > 0 && output[out_pos-1] != '\n' && out_pos < out_size - 1) {
+    if (out_pos > 0 && output[out_pos - 1] != '\n' && out_pos < out_size - 1) {
         output[out_pos++] = '\n';
     }
     output[out_pos] = '\0';
@@ -478,7 +474,12 @@ static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
     uint32_t low = 0;
     uint32_t high = text_len;
     uint32_t best = 0;
-    char work_buf[512];
+    char work_buf[2048];
+
+    if (high > sizeof(work_buf) - 1) high = sizeof(work_buf) - 1;
+
+    VIEW_LOG("[CBH] enter text_len=%u high=%u tgt=%d\n", text_len, high, target_height);
+    int cbh_iter = 0;
 
     while (low <= high) {
         uint32_t mid = low + ((high - low) / 2);
@@ -487,6 +488,7 @@ static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
         }
         if (mid == 0) mid = 1;
         if (mid >= sizeof(work_buf)) mid = sizeof(work_buf) - 1;
+        if (mid < low) mid = low;
 
         memcpy(work_buf, text, mid);
         work_buf[mid] = '\0';
@@ -495,6 +497,12 @@ static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
         lv_txt_get_size(&txt_size, work_buf, font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
         int actual_h = txt_size.y;
         if (actual_h < line_height) actual_h = line_height;
+
+        cbh_iter++;
+        if (cbh_iter <= 3 || (cbh_iter % 5) == 0) {
+            VIEW_LOG("[CBH] iter=%d low=%u mid=%u high=%u h=%d\n",
+                     cbh_iter, low, mid, high, actual_h);
+        }
 
         if (actual_h <= target_height) {
             best = mid;
@@ -513,6 +521,7 @@ static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
         if (mid == 0) mid = 1;
         best = mid;
     }
+    VIEW_LOG("[CBH] exit best=%u iters=%d\n", best, cbh_iter);
     return best;
 }
 
@@ -525,6 +534,8 @@ static int flush_render_block(EpubViewer *viewer, const char *block_start, int b
     }
     if (block_len <= 0) return 0;
 
+    int max_copy = EPUB_WORK_BUF_SIZE * 2 - 1;
+    if (block_len > max_copy) block_len = max_copy;
     memcpy(viewer->reflowed_buf, block_start, block_len);
     viewer->reflowed_buf[block_len] = '\0';
 
@@ -532,19 +543,59 @@ static int flush_render_block(EpubViewer *viewer, const char *block_start, int b
     lv_txt_get_size(&txt_size, viewer->reflowed_buf, font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
     int actual_h = txt_size.y;
     if (actual_h < line_height) actual_h = line_height;
-    if (*y_offset + actual_h > CONTENT_HEIGHT) return 0;
+
+    int remaining = CONTENT_HEIGHT - *y_offset;
+    if (remaining < line_height) return 0;
+
+    if (actual_h <= remaining) {
+        lv_obj_t *line_label = lv_label_create(viewer->content_container);
+        lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, *y_offset);
+        lv_obj_set_size(line_label, CONTENT_WIDTH, actual_h);
+        lv_obj_set_style_text_font(line_label, font, 0);
+        lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
+        lv_obj_set_style_pad_top(line_label, 0, 0);
+        lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(line_label, viewer->reflowed_buf);
+        *y_offset += actual_h;
+        return actual_h;
+    }
+
+    memcpy(viewer->page_text_buf, block_start, block_len);
+    viewer->page_text_buf[block_len] = '\0';
+    strip_style_markers(viewer->page_text_buf);
+    uint32_t stripped_len = strlen(viewer->page_text_buf);
+
+    uint32_t fit_bytes = calc_bytes_for_height(viewer->page_text_buf, stripped_len, font, line_height, remaining);
+    if (fit_bytes == 0) return 0;
+
+    int raw_pos = 0;
+    int stripped_count = 0;
+    while (raw_pos < block_len && stripped_count < (int)fit_bytes) {
+        if ((unsigned char)viewer->reflowed_buf[raw_pos] == 0x02 &&
+            raw_pos + 2 < block_len &&
+            (unsigned char)viewer->reflowed_buf[raw_pos + 2] == 0x03) {
+            raw_pos += 3;
+        } else {
+            raw_pos++;
+            stripped_count++;
+        }
+    }
+
+    viewer->reflowed_buf[raw_pos] = '\0';
+    lv_txt_get_size(&txt_size, viewer->reflowed_buf, font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+    int trunc_h = txt_size.y;
+    if (trunc_h < line_height) trunc_h = line_height;
 
     lv_obj_t *line_label = lv_label_create(viewer->content_container);
     lv_obj_align(line_label, LV_ALIGN_TOP_LEFT, 0, *y_offset);
-    lv_obj_set_size(line_label, CONTENT_WIDTH, actual_h);
+    lv_obj_set_size(line_label, CONTENT_WIDTH, trunc_h);
     lv_obj_set_style_text_font(line_label, font, 0);
     lv_obj_set_style_text_color(line_label, lv_color_black(), 0);
     lv_obj_set_style_pad_top(line_label, 0, 0);
     lv_label_set_long_mode(line_label, LV_LABEL_LONG_WRAP);
     lv_label_set_text(line_label, viewer->reflowed_buf);
-
-    *y_offset += actual_h;
-    return actual_h;
+    *y_offset += trunc_h;
+    return trunc_h;
 }
 
 static int write_decoded_chunk(FIL *decoded_fp, const char *buf, uint32_t len,
@@ -567,15 +618,15 @@ static int write_decoded_chunk(FIL *decoded_fp, const char *buf, uint32_t len,
 }
 
 static int build_decoded_stream(EpubViewer *viewer) {
-    VIEW_LOG("[DECODE] build_decoded_stream ENTRY\n");
+    VIEW_LOG("[DECODE] build_decoded_stream ENTRY (streaming)\n");
     FIL html_fp;
     FIL decoded_fp;
-    
+
     VIEW_LOG("[DECODE] decoded_file_path='%s'\n", viewer->decoded_file_path);
     FRESULT fr = f_open(&html_fp, viewer->temp_file_path, FA_READ);
     VIEW_LOG("[DECODE] f_open html result=%d\n", fr);
     if (fr != FR_OK) return -1;
-    
+
     VIEW_LOG("[DECODE] temp_file='%s'\n", viewer->temp_file_path);
     fr = f_open(&decoded_fp, viewer->decoded_file_path, FA_CREATE_ALWAYS | FA_WRITE);
     VIEW_LOG("[DECODE] f_open decoded result=%d\n", fr);
@@ -584,61 +635,194 @@ static int build_decoded_stream(EpubViewer *viewer) {
         return -1;
     }
 
-    uint32_t stream_offset = 0;
-    char *cache_ptr = viewer->chapter_decoded_cache;
-    uint32_t cache_left = 0;
-    if (viewer->use_cache_mode && cache_ptr) {
-        cache_left = EPUB_CACHE_THRESHOLD + 4096;
-    } else {
-        cache_ptr = NULL;
+    FSIZE_t file_size = f_size(&html_fp);
+    VIEW_LOG("[DECODE] file_size=%lu\n", (unsigned long)file_size);
+
+    char *carry_buf = (char *)_dma_malloc(2048, DMAHEAP_PSRAM);
+    if (!carry_buf) {
+        VIEW_ERR("[DECODE] carry alloc failed\n");
+        f_close(&html_fp);
+        f_close(&decoded_fp);
+        return -1;
     }
 
-    VIEW_LOG("[DECODE] starting read loop, cache_mode=%d cache_ptr=%p\n", viewer->use_cache_mode, cache_ptr);
-    int loop_count = 0;
-    while (1) {
-        UINT br = 0;
-        fr = f_read(&html_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &br);
-        VIEW_LOG("[DECODE] f_read loop=%d fr=%d br=%u\n", loop_count++, fr, br);
-        if (fr != FR_OK || br == 0) break;
+    uint32_t carry_len = 0;
+    uint32_t total_decoded_len = 0;
+    char *cache_ptr = viewer->chapter_decoded_cache;
+    uint32_t cache_left = viewer->chapter_uncomp_size * 2 + 4096;
+    bool cache_active = (viewer->use_cache_mode && cache_ptr != NULL);
+    carry_buf[0] = '\0';
 
-        memset(viewer->stripped_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-        int stripped_len = strip_html_tags_with_styles(viewer->html_buf, (int)br, viewer->stripped_buf, EPUB_WORK_BUF_SIZE * 2);
-        VIEW_LOG("[DECODE] stripped_len=%d\n", stripped_len);
+    {
+        UINT total_scanned = 0;
+        bool head_found = false;
+        while (total_scanned < file_size) {
+            UINT brr = 0;
+            fr = f_read(&html_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &brr);
+            if (fr != FR_OK || brr == 0) break;
+            viewer->html_buf[brr] = '\0';
 
-        memset(viewer->decoded_buf, 0, EPUB_WORK_BUF_SIZE * 2);
-        decode_html_entities(viewer->stripped_buf, viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
-        sanitize_utf8(viewer->decoded_buf);
-        fix_chinese_punctuation(viewer->decoded_buf);
-        filter_unsupported_chars_ex(viewer->decoded_buf, true);
+            const char *head_end = NULL;
+            const char *p1 = strstr(viewer->html_buf, "</head>");
+            const char *p2 = strstr(viewer->html_buf, "</HEAD>");
+            if (p1 && (!p2 || p1 < p2)) head_end = p1;
+            else if (p2) head_end = p2;
 
-        uint32_t chunk_len = strlen(viewer->decoded_buf);
-        VIEW_LOG("[DECODE] chunk_len=%u stream_off=%u\n", chunk_len, stream_offset);
-        if (chunk_len > 0) {
-            UINT bw = 0;
-            fr = f_write(&decoded_fp, viewer->decoded_buf, chunk_len, &bw);
-            VIEW_LOG("[DECODE] f_write result=%d bw=%u\n", fr, bw);
-            if (fr != FR_OK || bw != chunk_len) {
-                f_close(&html_fp);
-                f_close(&decoded_fp);
-                return -1;
+            if (head_end) {
+                const char *after_head = head_end + 7;
+                const char *body_tag = strstr(after_head, "<body");
+                if (body_tag) {
+                    const char *body_close = strchr(body_tag, '>');
+                    if (body_close) after_head = body_close + 1;
+                }
+                uint32_t skip_to = total_scanned + (uint32_t)(after_head - viewer->html_buf);
+                f_lseek(&html_fp, skip_to);
+                head_found = true;
+                VIEW_LOG("[DECODE] skipped head, body_offset=%lu\n", (unsigned long)skip_to);
+                break;
             }
-            if (cache_ptr && cache_left > chunk_len) {
-                memcpy(cache_ptr, viewer->decoded_buf, chunk_len);
-                cache_ptr += chunk_len;
-                cache_left -= chunk_len;
-                *cache_ptr = '\0';
-            }
-            stream_offset += chunk_len;
+            total_scanned += brr;
+        }
+        if (!head_found) {
+            f_lseek(&html_fp, 0);
+            VIEW_LOG("[DECODE] no <head> tag, processing from start\n");
         }
     }
 
-    VIEW_LOG("[DECODE] read loop done, stream_offset=%u\n", stream_offset);
+    while (1) {
+        UINT br = 0;
+        fr = f_read(&html_fp, viewer->html_buf, EPUB_WORK_BUF_SIZE, &br);
+        if (fr != FR_OK || br == 0) break;
+        viewer->html_buf[br] = '\0';
+
+        uint32_t work_len = carry_len;
+        if (carry_len > 0) {
+            memcpy(viewer->stripped_buf, carry_buf, carry_len);
+        }
+        memcpy(viewer->stripped_buf + carry_len, viewer->html_buf, br);
+        work_len += br;
+        viewer->stripped_buf[work_len] = '\0';
+
+        uint32_t safe_end = work_len;
+
+        {
+            int j;
+            for (j = (int)safe_end - 1; j >= 0 && j > (int)safe_end - 200; j--) {
+                if ((unsigned char)viewer->stripped_buf[j] == '>') break;
+                if ((unsigned char)viewer->stripped_buf[j] == '<') { safe_end = (uint32_t)j; break; }
+            }
+        }
+
+        if (safe_end > 0 && safe_end < work_len) {
+            int amp_pos = -1;
+            int semi_found = 0;
+            int j;
+            for (j = (int)safe_end - 1; j >= 0 && j > (int)safe_end - 16; j--) {
+                if (viewer->stripped_buf[j] == ';') { semi_found = 1; break; }
+                if (viewer->stripped_buf[j] == '&') { amp_pos = j; break; }
+            }
+            if (amp_pos >= 0 && !semi_found) {
+                safe_end = (uint32_t)amp_pos;
+            }
+        }
+
+        if (safe_end > 0 && safe_end < work_len) {
+            int check_start = (int)safe_end - 4;
+            if (check_start < 0) check_start = 0;
+            for (int k = (int)safe_end - 1; k >= check_start; k--) {
+                unsigned char c = (unsigned char)viewer->stripped_buf[k];
+                if (c < 0x80) continue;
+                if ((c & 0xC0) == 0x80) continue;
+                int expected = 1;
+                if ((c & 0xF8) == 0xF0) expected = 4;
+                else if ((c & 0xF0) == 0xE0) expected = 3;
+                else if ((c & 0xE0) == 0xC0) expected = 2;
+                if (k + expected > (int)safe_end) {
+                    safe_end = (uint32_t)k;
+                    break;
+                }
+            }
+        }
+
+        if (safe_end > 0) {
+            viewer->stripped_buf[safe_end] = '\0';
+
+            int slen = strip_html_tags_with_styles(
+                viewer->stripped_buf, (int)safe_end,
+                viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
+
+            if (slen > 0) {
+                decode_html_entities(viewer->decoded_buf,
+                                     viewer->reflowed_buf, EPUB_WORK_BUF_SIZE * 2);
+                sanitize_utf8(viewer->reflowed_buf);
+                fix_chinese_punctuation(viewer->reflowed_buf);
+                filter_unsupported_chars_ex(viewer->reflowed_buf, true);
+
+                uint32_t flen = strlen(viewer->reflowed_buf);
+                if (flen > 0) {
+                    UINT bw = 0;
+                    fr = f_write(&decoded_fp, viewer->reflowed_buf, flen, &bw);
+                    if (fr != FR_OK || bw != flen) {
+                        VIEW_ERR("[DECODE] f_write failed fr=%d\n", fr);
+                        _dma_free(carry_buf, 0);
+                        f_close(&html_fp);
+                        f_close(&decoded_fp);
+                        return -1;
+                    }
+                    if (cache_active && cache_left > flen + 1) {
+                        memcpy(cache_ptr, viewer->reflowed_buf, flen);
+                        cache_ptr += flen;
+                        cache_left -= flen;
+                    }
+                    total_decoded_len += flen;
+                }
+            }
+        }
+
+        carry_len = work_len - safe_end;
+        if (carry_len > 0) {
+            if (carry_len >= 2047) carry_len = 2047;
+            memcpy(carry_buf, viewer->stripped_buf + safe_end, carry_len);
+        }
+        carry_buf[carry_len] = '\0';
+    }
+
+    if (carry_len > 0) {
+        carry_buf[carry_len] = '\0';
+        int slen = strip_html_tags_with_styles(
+            carry_buf, (int)carry_len,
+            viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
+        if (slen > 0) {
+            decode_html_entities(viewer->decoded_buf,
+                                 viewer->reflowed_buf, EPUB_WORK_BUF_SIZE * 2);
+            sanitize_utf8(viewer->reflowed_buf);
+            fix_chinese_punctuation(viewer->reflowed_buf);
+            filter_unsupported_chars_ex(viewer->reflowed_buf, true);
+
+            uint32_t flen = strlen(viewer->reflowed_buf);
+            if (flen > 0) {
+                UINT bw = 0;
+                fr = f_write(&decoded_fp, viewer->reflowed_buf, flen, &bw);
+                if (fr == FR_OK && bw == flen) {
+                    if (cache_active && cache_left > flen + 1) {
+                        memcpy(cache_ptr, viewer->reflowed_buf, flen);
+                    }
+                    total_decoded_len += flen;
+                }
+            }
+        }
+    }
+
+    if (cache_active && cache_ptr) {
+        *cache_ptr = '\0';
+    }
+
+    _dma_free(carry_buf, 0);
     f_close(&html_fp);
-    VIEW_LOG("[DECODE] html_fp closed\n");
     f_close(&decoded_fp);
-    VIEW_LOG("[DECODE] decoded_fp closed\n");
-    viewer->chapter_decoded_len = stream_offset;
-    VIEW_LOG("[DECODE] DONE chapter_decoded_len=%u\n", stream_offset);
+
+    viewer->chapter_decoded_len = total_decoded_len;
+    VIEW_LOG("[DECODE] DONE streaming total_decoded_len=%u\n", total_decoded_len);
     return 0;
 }
 
@@ -723,6 +907,9 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
                     case 3: current_font = FONT_H3; current_lh = LH_H3; break;
                     default: current_font = FONT; current_lh = LH_BODY; break;
                 }
+                VIEW_LOG("[IDX] style L%d font=%p lh=%d blk=%d ofs=%u\n",
+                         current_level, current_font, current_lh, block_len,
+                         (unsigned)stream_offset);
                 if (block_len == 0) {
                     block_start_offset = stream_offset;
                 }
@@ -740,20 +927,67 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
                     viewer->reflowed_buf[block_len] = '\0';
                     memcpy(viewer->page_text_buf, viewer->reflowed_buf, block_len + 1);
                     strip_style_markers(viewer->page_text_buf);
+                    VIEW_LOG("[IDX] \\n block_len=%d page_y=%d page=%d\n",
+                             block_len, page_y_offset, page_count);
+                    VIEW_LOG("[IDX] measuring block (lv_txt_get_size)...\n");
                     lv_point_t txt_size;
                     lv_txt_get_size(&txt_size, viewer->page_text_buf, current_font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
                     int actual_h = txt_size.y;
                     if (actual_h < current_lh) actual_h = current_lh;
+                    VIEW_LOG("[IDX] measure done: h=%d > CONTENT_HEIGHT=%d?\n", actual_h, CONTENT_HEIGHT);
+
                     if (page_y_offset > 0 && page_y_offset + actual_h > CONTENT_HEIGHT && page_count < viewer->max_pages) {
                         viewer->page_char_offsets[page_count] = block_start_offset;
                         viewer->page_start_styles[page_count] = (uint8_t)current_level;
                         page_count++;
+                        page_y_offset = 0;
+                        VIEW_LOG("[IDX] new page (overflow), now page=%d\n", page_count);
+                    }
+
+                    if (actual_h > CONTENT_HEIGHT && page_count < viewer->max_pages) {
+                        uint32_t s_len = strlen(viewer->page_text_buf);
+                        uint32_t s_off = 0;
+                        int split_iter = 0;
+
+                        VIEW_LOG("[IDX] SPLIT start s_len=%u\n", s_len);
+                        while (actual_h > CONTENT_HEIGHT && s_off < s_len && page_count < viewer->max_pages) {
+                            split_iter++;
+                            VIEW_LOG("[IDX] split iter=%d s_off=%u s_len=%u\n", split_iter, s_off, s_len);
+                            uint32_t fit = calc_bytes_for_height(
+                                viewer->page_text_buf + s_off, s_len - s_off,
+                                current_font, current_lh, CONTENT_HEIGHT);
+                            if (fit == 0) break;
+                            s_off += fit;
+                            if (s_off >= s_len) { actual_h = 0; break; }
+
+                            int ri = 0, si = 0;
+                            while (ri < block_len && si < (int)s_off) {
+                                if ((unsigned char)viewer->reflowed_buf[ri] == 0x02 &&
+                                    ri + 2 < block_len &&
+                                    (unsigned char)viewer->reflowed_buf[ri + 2] == 0x03) {
+                                    ri += 3;
+                                } else {
+                                    ri++;
+                                    si++;
+                                }
+                            }
+
+                            viewer->page_char_offsets[page_count] = block_start_offset + ri;
+                            viewer->page_start_styles[page_count] = (uint8_t)current_level;
+                            page_count++;
+                            VIEW_LOG("[IDX] split page=%d raw_off=%u\n", page_count, block_start_offset + ri);
+
+                            lv_txt_get_size(&txt_size, viewer->page_text_buf + s_off,
+                                            current_font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+                            actual_h = txt_size.y;
+                            if (actual_h < current_lh) actual_h = current_lh;
+                        }
+                        VIEW_LOG("[IDX] SPLIT done iters=%d\n", split_iter);
                         page_y_offset = actual_h;
                     } else {
                         page_y_offset += actual_h;
                     }
                     block_len = 0;
-                    VIEW_LOG("[IDX] first block measured\n");
                 }
                 p++;
                 stream_offset++;
@@ -783,19 +1017,76 @@ static int build_page_index(EpubViewer *viewer, int chapter_index) {
         viewer->reflowed_buf[block_len] = '\0';
         memcpy(viewer->page_text_buf, viewer->reflowed_buf, block_len + 1);
         strip_style_markers(viewer->page_text_buf);
+        VIEW_LOG("[IDX] FINAL block_len=%d page_y=%d page=%d\n",
+                 block_len, page_y_offset, page_count);
+        VIEW_LOG("[IDX] measuring final block...\n");
         lv_point_t txt_size;
         lv_txt_get_size(&txt_size, viewer->page_text_buf, current_font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
         int actual_h = txt_size.y;
         if (actual_h < current_lh) actual_h = current_lh;
+        VIEW_LOG("[IDX] final measure done: h=%d\n", actual_h);
+
         if (page_y_offset > 0 && page_y_offset + actual_h > CONTENT_HEIGHT && page_count < viewer->max_pages) {
             viewer->page_char_offsets[page_count] = block_start_offset;
             viewer->page_start_styles[page_count] = (uint8_t)current_level;
             page_count++;
+            page_y_offset = 0;
+            VIEW_LOG("[IDX] final new page, now page=%d\n", page_count);
+        }
+
+        if (actual_h > CONTENT_HEIGHT && page_count < viewer->max_pages) {
+            uint32_t s_len = strlen(viewer->page_text_buf);
+            uint32_t s_off = 0;
+            int split_iter = 0;
+
+            VIEW_LOG("[IDX] FINAL SPLIT start s_len=%u\n", s_len);
+            while (actual_h > CONTENT_HEIGHT && s_off < s_len && page_count < viewer->max_pages) {
+                split_iter++;
+                VIEW_LOG("[IDX] final split iter=%d s_off=%u\n", split_iter, s_off);
+                uint32_t fit = calc_bytes_for_height(
+                    viewer->page_text_buf + s_off, s_len - s_off,
+                    current_font, current_lh, CONTENT_HEIGHT);
+                if (fit == 0) break;
+                s_off += fit;
+                if (s_off >= s_len) { actual_h = 0; break; }
+
+                int ri = 0, si = 0;
+                while (ri < block_len && si < (int)s_off) {
+                    if ((unsigned char)viewer->reflowed_buf[ri] == 0x02 &&
+                        ri + 2 < block_len &&
+                        (unsigned char)viewer->reflowed_buf[ri + 2] == 0x03) {
+                        ri += 3;
+                    } else {
+                        ri++;
+                        si++;
+                    }
+                }
+
+                viewer->page_char_offsets[page_count] = block_start_offset + ri;
+                viewer->page_start_styles[page_count] = (uint8_t)current_level;
+                page_count++;
+
+                lv_txt_get_size(&txt_size, viewer->page_text_buf + s_off,
+                                current_font, 0, 0, CONTENT_WIDTH, LV_LABEL_LONG_WRAP);
+                actual_h = txt_size.y;
+                if (actual_h < current_lh) actual_h = current_lh;
+            }
+            VIEW_LOG("[IDX] FINAL SPLIT done iters=%d\n", split_iter);
         }
     }
 
     f_close(&decoded_fp);
     viewer->total_pages = page_count;
+
+    {
+        int dump_pages = page_count < 10 ? page_count : 10;
+        VIEW_LOG("[IDX] First %d page offsets:\n", dump_pages);
+        for (int i = 0; i < dump_pages; i++) {
+            VIEW_LOG("[IDX] page[%d] offset=%u style=%d\n", i,
+                     viewer->page_char_offsets[i], viewer->page_start_styles[i]);
+        }
+    }
+
     VIEW_LOG("Page index built: %d pages (chars=%u, mode=%s)\n", viewer->total_pages,
              viewer->chapter_decoded_len, viewer->use_cache_mode ? "CACHE" : "STREAMING");
     return 0;
@@ -871,11 +1162,25 @@ static void update_display(EpubViewer *viewer) {
     memcpy(viewer->decoded_buf, page_text, copy_len);
     viewer->decoded_buf[copy_len] = '\0';
 
+    {
+        int dump_len = (int)copy_len;
+        if (dump_len > 200) dump_len = 200;
+        VIEW_LOG("[PAGE_TEXT] len=%u first200:'%.*s'\n", copy_len, dump_len, viewer->decoded_buf);
+        int newline_count = 0;
+        int style_marker_count = 0;
+        for (uint32_t i = 0; i < copy_len; i++) {
+            if (viewer->decoded_buf[i] == '\n') newline_count++;
+            if ((unsigned char)viewer->decoded_buf[i] == 0x02) style_marker_count++;
+        }
+        VIEW_LOG("[PAGE_TEXT] newlines=%d style_markers=%d level=%d\n", newline_count, style_marker_count, current_level);
+    }
+
     lv_obj_clean(viewer->content_container);
 
     const char *p = viewer->decoded_buf;
     const char *block_start = p;
     int y_offset = 0;
+    int render_block_count = 0;
     lv_font_t *current_font = FONT;
     int current_lh = LH_BODY;
     switch (current_level) {
@@ -887,7 +1192,13 @@ static void update_display(EpubViewer *viewer) {
 
     while (*p) {
         if ((unsigned char)*p == 0x02 && *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
-            flush_render_block(viewer, block_start, (int)(p - block_start), current_font, current_lh, &y_offset);
+            int blen = (int)(p - block_start);
+            if (blen > 0) {
+                render_block_count++;
+                int dlen = blen > 60 ? 60 : blen;
+                VIEW_LOG("[RENDER_BLK #%d] len=%d y=%d '%.*s'\n", render_block_count, blen, y_offset, dlen, block_start);
+            }
+            flush_render_block(viewer, block_start, blen, current_font, current_lh, &y_offset);
             current_level = *(p + 1) - '0';
             switch (current_level) {
                 case 1: current_font = FONT_H1; current_lh = LH_H1; break;
@@ -900,14 +1211,29 @@ static void update_display(EpubViewer *viewer) {
             continue;
         }
         if (*p == '\n') {
-            flush_render_block(viewer, block_start, (int)(p - block_start), current_font, current_lh, &y_offset);
+            int blen = (int)(p - block_start);
+            if (blen > 0) {
+                render_block_count++;
+                int dlen = blen > 60 ? 60 : blen;
+                VIEW_LOG("[RENDER_BLK #%d] len=%d y=%d '%.*s'\n", render_block_count, blen, y_offset, dlen, block_start);
+            }
+            flush_render_block(viewer, block_start, blen, current_font, current_lh, &y_offset);
             p++;
             block_start = p;
             continue;
         }
         p++;
     }
-    flush_render_block(viewer, block_start, (int)(p - block_start), current_font, current_lh, &y_offset);
+    {
+        int blen = (int)(p - block_start);
+        if (blen > 0) {
+            render_block_count++;
+            int dlen = blen > 60 ? 60 : blen;
+            VIEW_LOG("[RENDER_BLK #%d FINAL] len=%d y=%d '%.*s'\n", render_block_count, blen, y_offset, dlen, block_start);
+        }
+        flush_render_block(viewer, block_start, blen, current_font, current_lh, &y_offset);
+    }
+    VIEW_LOG("[PAGE_SUMMARY] blocks=%d final_y=%d\n", render_block_count, y_offset);
 
     char page_str[64];
     snprintf(page_str, sizeof(page_str), "%d/%d", viewer->current_page + 1, viewer->total_pages);

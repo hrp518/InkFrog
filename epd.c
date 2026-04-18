@@ -263,7 +263,7 @@ static void EPD_Reset(void)
     __disable_irq();
     HAL_GPIO_WritePin(GPIO_PORT_A, GPIO_PIN_9, GPIO_PIN_HIGH);
     __enable_irq();
-    OS_MSleep(200);  // EPD需要时间完成内部初始化
+    OS_MSleep(200);
 }
 
 /* Forward declaration - used for self-healing from unknown/inconsistent EPD state */
