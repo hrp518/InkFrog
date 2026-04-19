@@ -15,6 +15,7 @@
 #include <string.h>
 #include "driver/chip/hal_gpio.h"
 #include "kernel/os/os.h"
+#include "kernel/os/os_mutex.h"
 
 /* Frame buffer - 240x415 pixels = 12450 bytes */
 /* Note: framebuffer must be accessible by lv_port_disp.c, so NOT static */

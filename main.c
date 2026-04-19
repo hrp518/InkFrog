@@ -511,6 +511,24 @@ int main(void)
     /* 执行FatFs文件系统测试（FatFs内部会初始化SD卡） */
     fatfs_filesystem_test();
     
+    /* 初始化LVGL - lv_port_disp_init()会初始化EPD */
+    printf("[MAIN] Step 1: Calling lv_init()...\r\n");
+    printf("[MAIN] Calling lv_init()...\r\n");
+    fflush(stdout);
+    lv_init();
+    printf("[MAIN] lv_init() returned\r\n");
+    printf("[MAIN] Step 1: lv_init() completed\r\n");
+    
+    /* 初始化显示端口 */
+    printf("[MAIN] Step 2: Calling lv_port_disp_init()...\r\n");
+    lv_port_disp_init();
+    printf("[MAIN] Step 2: lv_port_disp_init() completed\r\n");
+    
+    /* 初始化输入端口 (触摸) */
+    printf("[MAIN] Step 3: Calling lv_port_indev_init()...\r\n");
+    lv_port_indev_init();
+    printf("[MAIN] Step 3: lv_port_indev_init() completed\r\n");
+    
     /*====================
      * 网络初始化
      *===================*/
@@ -552,25 +570,6 @@ int main(void)
         }
     }
     printf("\r\n");
-    
-    /* 初始化LVGL - lv_port_disp_init()会初始化EPD */
-    printf("[MAIN] Step 1: Calling lv_init()...\r\n");
-
-    printf("[MAIN] Calling lv_init()...\r\n");
-    fflush(stdout);
-    lv_init();
-    printf("[MAIN] lv_init() returned\r\n");
-    printf("[MAIN] Step 1: lv_init() completed\r\n");
-    
-    /* 初始化显示端口 */
-    printf("[MAIN] Step 2: Calling lv_port_disp_init()...\r\n");
-    lv_port_disp_init();
-    printf("[MAIN] Step 2: lv_port_disp_init() completed\r\n");
-    
-    /* 初始化输入端口 (触摸) */
-    printf("[MAIN] Step 3: Calling lv_port_indev_init()...\r\n");
-    lv_port_indev_init();
-    printf("[MAIN] Step 3: lv_port_indev_init() completed\r\n");
     
     /* 创建演示UI - 控件测试 */
     

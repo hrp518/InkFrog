@@ -254,6 +254,49 @@ if (touch_cnt == -2) {
 
 ---
 
+## 2026/4/19 21:54 - EPD随机崩溃修复
+
+### 问题描述
+LVGL_withSDandNetwork项目出现随机崩溃，表现为usage fault (UFSR:0x2 INVSTATE)。
+崩溃有一定随机性，reset几次就能正常运行一次。详细分析见 `C:\XR872\EPD随机崩溃分析.md`。
+
+### 根因
+http_server线程栈仅2048字节严重不足，初始化期间EPD的SPI传输(12450字节bit-bang)与http_server线程并发运行导致栈溢出，
+损坏相邻线程PSP栈，返回地址被覆写。
+
+### 修复内容
+
+1. **main.c - 重排初始化顺序**
+   - 将 lv_init() → lv_port_disp_init() → lv_port_indev_init() 提到网络初始化之前
+   - EPD初始化期间只有main线程运行，零线程竞争
+
+2. **http_server.c - 增大线程栈**
+   - OS_ThreadCreate栈参数从2048→4096字节
+
+3. **epd.c - 添加mutex头文件**
+   - 添加 #include "kernel/os/os_mutex.h"，为后续SPI互斥保护做准备
+
+### 编译结果
+- 编译成功，无error
+- IMG: image/xr872/xr_system.img (883544 bytes)
+
+### 编译命令备忘
+```bash
+# 编译
+C:/XR872/bin/bash.exe -lc "cd /home/Administrator/xradio-skylark-sdk-master/project/demo/LVGL_withSDandNetwork/gcc && rm -f objects_response.txt && make build"
+
+# 生成IMG (使用自动校准的cfg)
+C:/XR872/bin/bash.exe -lc "cd /home/Administrator/xradio-skylark-sdk-master/project/demo/LVGL_withSDandNetwork/image/xr872 && /home/Administrator/xradio-skylark-sdk-master/tools/mkimage.exe -O -c image_auto_cal.cfg -o xr_system.img"
+```
+
+### 心得
+- Windows环境下使用 `C:/XR872/bin/bash.exe -lc "命令"` 执行bash命令
+- 复杂的sed/脚本修改应写成.sh脚本文件，再用bash执行，避免引号嵌套问题
+- 嵌入式多线程环境下，初始化顺序至关重要——先初始化硬件(EPD)，再启动网络服务
+- FreeRTOS线程栈大小要留足余量，2048字节对HTTP服务远远不够
+
+---
+
 ## 2026/3/22 09:44 - SD卡EXT_LDO电压稳定化修改
 
 ### 问题描述

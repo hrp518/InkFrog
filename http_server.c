@@ -1233,10 +1233,10 @@ int http_server_start(void)
     printf("[HTTP] Thread stack size = 2048 bytes\r\n");
     printf("[HTTP] g_http_thread.handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
     
-    /* 将线程栈从 4096 降为 2048 */
+    /* Fix: 增大线程栈从2048到4096，防止栈溢出导致随机崩溃 */
     if (OS_ThreadCreate(&g_http_thread, "http_server",
                         http_server_thread, NULL,
-                        OS_PRIORITY_NORMAL, 2048) != 0) {
+                        OS_PRIORITY_NORMAL, 4096) != 0) {
         HTTP_LOG("Failed to create thread");
         g_http_running = 0;
         return -1;
