@@ -286,22 +286,14 @@ void lv_port_disp_init(void) {
     EPD_3IN52_Init_DU();
     printf("[LVGL] Step 2: EPD_3IN52_Init_DU() DONE\r\n");
 
-    printf("[LVGL] Step 3: Clearing framebuffer...\r\n");
-    memset(framebuffer, 0xFF, EPD_BUFFER_SIZE);
-    printf("[LVGL] Step 3: framebuffer cleared (%d bytes)\r\n", EPD_BUFFER_SIZE);
+     printf("[LVGL] Step 3: Clearing framebuffer to white...\r\n");
+     memset(framebuffer, 0xFF, EPD_BUFFER_SIZE);
+     printf("[LVGL] Step 3: framebuffer cleared (%d bytes)\r\n", EPD_BUFFER_SIZE);
 
-    // ========== 暴力硬件测试：脱离LVGL直接刷全黑 ==========
-    printf("[TEST] Writing all 0x00 to framebuffer for hardware test...\r\n");
-    memset(framebuffer, 0x00, EPD_BUFFER_SIZE);
-
-    printf("[TEST] Calling EPD_3IN52_Display() - should show BLACK screen...\r\n");
-    EPD_3IN52_Display();
-    printf("[TEST] EPD_3IN52_Display() DONE\r\n");
-    // =======================================================
-
-    printf("[LVGL] Step 4: EPD_3IN52_Display_DU() calling...\r\n");
-    EPD_3IN52_Display_DU();
-    printf("[LVGL] Step 4: EPD_3IN52_Display_DU() DONE\r\n");
+     /*
+      * 删除旧的黑屏硬件测试帧。
+      * 正式初始化时不应先刷一帧全黑，而应让第一次完整刷新直接显示首页。
+      */
     
     printf("[LVGL] EPD ready\r\n");
     
@@ -418,23 +410,24 @@ void epd_do_refresh(void) {
     lv_disp_t * disp_before = lv_disp_get_default();
     printf("[EPD] Starting display (T=%ums) inv_p_before=%d\n", t, disp_before ? disp_before->inv_p : -1);
     
+    /* 挂起LVGL任务，执行EPD刷新（关键：只在挂起期间做硬件刷新） */
     vTaskSuspend(lvgl_thread.handle);
     EPD_3IN52_Display_DU();
+    vTaskResume(lvgl_thread.handle);
     
     lv_disp_t * disp = lv_disp_get_default();
     int inv_p_during = disp ? disp->inv_p : -1;
     printf("[EPD] Display done (T=%ums, epd_cost=%ums) inv_p_during=%d\n", epd_get_tick(), epd_get_tick() - t, inv_p_during);
 
+    /* 【关键修复】FM close卡死问题修复：
+     * 1. 不再根据 inv_p 是否大于0来决定是否重新 invalidate
+     * 2. 只做必要的状态清理：重置 inv_p，保持 invalidation 开启
+     * 3. 不乱改 disp 状态，让 flush_cb 的正常流程处理下次刷新
+     */
     if (disp) {
-        if (disp->inv_p > 0) {
-            printf("[EPD] inv_p=%d during display, re-invalidating active screen\n", disp->inv_p);
-            disp->inv_p = 0;
-            lv_disp_enable_invalidation(disp, true);
-            lv_obj_invalidate(disp->act_scr);
-        } else {
-            disp->inv_p = 0;
-            lv_disp_enable_invalidation(disp, false);
-        }
+        disp->inv_p = 0;
+        /* 保持 invalidation 开启，让正常的 LVGL 渲染流程处理 */
+        lv_disp_enable_invalidation(disp, true);
     }
 
     epd_refresh_in_progress = 0;
@@ -442,8 +435,7 @@ void epd_do_refresh(void) {
     epd_sync.last_refresh_time = epd_get_tick();
     epd_sync.state = EPD_STATE_IDLE;
 
-    vTaskResume(lvgl_thread.handle);
-    printf("[EPD] LVGL resumed, invalidation DISABLED\n");
+    printf("[EPD] LVGL resumed, invalidation ENABLED (inv_p cleared)\n");
 }
 
 /*====================

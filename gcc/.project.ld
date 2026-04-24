@@ -13,8 +13,8 @@ __XIP_END = ORIGIN(FLASH) + LENGTH(FLASH) -1;
 __PSRAM_BASE = ORIGIN(PSRAM);
 __PSRAM_LENGTH = LENGTH(PSRAM);
 __PSRAM_END = ORIGIN(PSRAM) + LENGTH(PSRAM) -1;
-__DMAHEAP_PSRAM_BASE = __PSRAM_BASE + __PSRAM_LENGTH - 256*1024;
-__DMAHEAP_PSRAM_LENGTH = 256*1024;
+__DMAHEAP_PSRAM_BASE = __PSRAM_BASE + __PSRAM_LENGTH - 384*1024;
+__DMAHEAP_PSRAM_LENGTH = 384*1024;
 __DMAHEAP_PSRAM_END = __DMAHEAP_PSRAM_BASE + __DMAHEAP_PSRAM_LENGTH -1;
 /* Linker script to place sections and symbol values. Should be used together
  * with other linker script that defines memory regions FLASH and RAM.
@@ -217,6 +217,22 @@ SECTIONS
         *project/common/apps/cedarx/sound_ctrl/soundControl_rtos.o (.text .text.* .rodata .rodata.*)
         *project/common/apps/cedarx/sound_ctrl/soundStreamControl.o (.text .text.* .rodata .rodata.*)
         *command.o (.text .text.* .rodata .rodata.*)
+        /* CoreMark benchmark */
+        *coremark*.o (.text .text.* .rodata .rodata.*)
+        /* Stage-1 XIP whitelist: LVGL misc pure utility/math helpers only */
+        *lv_area.o (.text .text.* .rodata .rodata.*)
+        *lv_color.o (.text .text.* .rodata .rodata.*)
+        *lv_math.o (.text .text.* .rodata .rodata.*)
+        *lv_printf.o (.text .text.* .rodata .rodata.*)
+        *lv_utils.o (.text .text.* .rodata .rodata.*)
+        /* Stage-2 XIP whitelist: LVGL mid-layer text/style/container helpers */
+        *lv_ll.o (.text .text.* .rodata .rodata.*)
+        *lv_lru.o (.text .text.* .rodata .rodata.*)
+        *lv_bidi.o (.text .text.* .rodata .rodata.*)
+        *lv_txt.o (.text .text.* .rodata .rodata.*)
+        *lv_txt_ap.o (.text .text.* .rodata .rodata.*)
+        *lv_style.o (.text .text.* .rodata .rodata.*)
+        *lv_style_gen.o (.text .text.* .rodata .rodata.*)
         *(.xip_text* .xip_rodata*)
         . = ALIGN(4);
         __xip_end__ = .;

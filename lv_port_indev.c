@@ -15,6 +15,8 @@
 #include "lvgl/lvgl.h"
 #include "chsc6540.h"
 #include "driver/chip/hal_gpio.h"
+#include "lv_port_indev.h"
+#include "screensaver.h"
 
 // 前向声明
 extern void epd_notify_touch_down(void);
@@ -27,16 +29,6 @@ extern void epd_notify_touch_up(void);
 // 触摸IC的INT引脚连接到PA05
 #define TOUCH_INT_PIN   GPIO_PIN_5
 #define TOUCH_INT_PORT  GPIO_PORT_A
-
-/*====================
- * 触摸状态枚举
- *===================*/
-
-typedef enum {
-    TOUCH_STATE_IDLE = 0,
-    TOUCH_STATE_PRESSED,
-    TOUCH_STATE_RELEASED
-} TouchState_t;
 
 /*====================
  * 静态变量
@@ -201,6 +193,11 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
             data->state = LV_INDEV_STATE_PRESSED;
             current_touch_state = TOUCH_STATE_PRESSED;
             force_query_chsc = 1; // 保持强制查询模式
+
+            if (screensaver_handle_touch(current_touch_state)) {
+                data->state = LV_INDEV_STATE_RELEASED;
+                return;
+            }
             
             // 滑动检测：只在第一次按下时记录起始Y
             if (!swipe_recorded) {
@@ -242,6 +239,11 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
             data->state = LV_INDEV_STATE_RELEASED;
             current_touch_state = TOUCH_STATE_RELEASED;
             force_query_chsc = 0; // 退出强制查询，依赖INT触发
+
+            if (screensaver_handle_touch(current_touch_state)) {
+                data->state = LV_INDEV_STATE_RELEASED;
+                return;
+            }
             
             // 【EPD协同】通知EPD触摸释放（会触发待处理的刷新）
             epd_notify_touch_up();

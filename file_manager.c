@@ -29,6 +29,8 @@
 #include "epub_reader.h"
 #include "epub_viewer.h"
 
+extern void main_ui_create(void);
+
 /*====================
  *    全局变量
  *====================*/
@@ -45,7 +47,7 @@ static char selected_filepath[512] = {0};
  *    分页相关变量
  *====================*/
 
-#define FILES_PER_PAGE 10      /* 每页显示的文件数 */
+#define FILES_PER_PAGE 12      /* 每页显示的文件数，12条在240x415墨水屏上更易读也更易点按 */
 #define MAX_FILE_ENTRIES 500   /* 最大支持的文件条目数 */
 
 typedef struct {
@@ -77,6 +79,7 @@ static bool ttf_path_discovered = false;       /* 是否已完成最小TTF发现
 static char ttf_file_path[256] = {0};      /* 选中的TTF文件路径 */
 static uint8_t *s_ttf_data = NULL;             /* 缓存TTF文件数据（PSRAM） */
 static size_t s_ttf_data_size = 0;             /* TTF数据大小 */
+
 #endif
 
 /* EPUB阅读器相关 */
@@ -1212,14 +1215,17 @@ static void open_epub_viewer(const char *filepath)
 
 void file_manager_close(void)
 {
-    /* 先清空滑动回调，防止驱动层在对象销毁后访问 */
+    printf("[FM] Closing File Manager...\n");
+    
+    /* 清空滑动回调 */
     touch_clear_swipe_callback();
     
+    /* 删除所有FM相关对象 */
     if (viewer_textarea) { lv_obj_del(viewer_textarea); viewer_textarea = NULL; }
     if (viewer_screen) { lv_obj_del(viewer_screen); viewer_screen = NULL; }
     if (fm_list) { lv_obj_del(fm_list); fm_list = NULL; }
-    if (fm_screen) { lv_obj_del(fm_screen); fm_screen = NULL; }
     
+    /* 清理epub资源 */
     if (g_epub_viewer) {
         epub_viewer_destroy(g_epub_viewer);
         g_epub_viewer = NULL;
@@ -1234,6 +1240,19 @@ void file_manager_close(void)
     prev_page_btn = NULL;
     next_page_btn = NULL;
     deinit_pagination();
+    
+    /* 【关键修复】使用 lv_obj_clean 清空 fm_screen 内容，而不是删除它
+     * 避免删除屏幕后 lv_scr_act() 返回无效指针导致卡死
+     */
+    if (fm_screen) {
+        lv_obj_clean(fm_screen);  // 清空内容，不删除屏幕
+    }
+    
+    /* 重建首页 */
+    main_ui_create();
+    
+    /* 请求刷新 */
+    epd_mark_refresh_pending();
     
     printf("[FM] File Manager closed\n");
 }
@@ -1257,13 +1276,14 @@ void file_manager_init(void)
     epd_disable_all_animations_recursive(fm_screen);
     printf("[FM] fm_screen created: %p\n", fm_screen);
     
-    printf("[FM] Creating header...\n");
+    printf("[FM] Creating header (45px, title+path)...\n");
     lv_obj_t *header = lv_obj_create(fm_screen);
-    lv_obj_set_size(header, 240, 30);
+    lv_obj_set_size(header, 240, 45);
     lv_obj_align(header, LV_ALIGN_TOP_MID, 0, 0);
     lv_obj_set_style_bg_color(header, lv_color_white(), 0);
+    lv_obj_set_style_pad_all(header, 0, 0);
     epd_disable_animations(header);
-    printf("[FM] Header created\n");
+    printf("[FM] Header created (45px)\n");
     
     printf("[FM] Creating title label...\n");
     lv_obj_t *title = lv_label_create(header);
@@ -1273,28 +1293,29 @@ void file_manager_init(void)
     printf("[FM] Title font: %p\n", font);
     printf("[FM] Applying font to title...\n");
     lv_obj_set_style_text_font(title, font, 0);
-    lv_obj_center(title);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 2);
     printf("[FM] Title created and font applied\n");
     
-    path_label = lv_label_create(fm_screen);
+    path_label = lv_label_create(header);
     lv_label_set_text(path_label, "当前: /");
     lv_obj_set_style_text_font(path_label, get_reader_font(), 0);
-    lv_obj_align(path_label, LV_ALIGN_TOP_MID, 0, 35);
+    lv_obj_align(path_label, LV_ALIGN_TOP_MID, 0, 22);
     epd_disable_animations(path_label);
     
     lv_obj_t *close_btn = lv_btn_create(fm_screen);
-    lv_obj_set_size(close_btn, 50, 25);
-    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -5, 5);
+    lv_obj_set_size(close_btn, 60, 30);  // 增大按钮尺寸以提高点击准确率
+    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -2, 2);
     epd_disable_animations(close_btn);
     
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "关闭");
     lv_obj_set_style_text_font(close_label, get_reader_font(), 0);
+    lv_obj_center(close_label);  // 居中文字
     lv_obj_add_event_cb(close_btn, close_btn_cb, LV_EVENT_CLICKED, NULL);
     
     fm_list = lv_list_create(fm_screen);
-    lv_obj_set_size(fm_list, 215, 365);  /* 减小高度为底部留空间 */
-    lv_obj_align(fm_list, LV_ALIGN_TOP_LEFT, 20, 40);  /* 靠右对齐 */
+    lv_obj_set_size(fm_list, 215, 368);  /* header 45px, list从y=47到底部: 415-47=368 */
+    lv_obj_align(fm_list, LV_ALIGN_TOP_LEFT, 20, 47);  /* header 45px + 2px间距 */
     lv_obj_set_style_pad_row(fm_list, 2, 0);
     /* 关闭所有滚动相关标志 */
     lv_obj_clear_flag(fm_list, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);

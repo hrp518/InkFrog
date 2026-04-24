@@ -203,7 +203,9 @@
  ../../../../include/driver/cmsis/core_cmInstr.h \
  ../../../../include/driver/cmsis/core_cmFunc.h \
  ../../../../include/driver/cmsis/core_cmSimd.h \
- ../../../../include/kernel/os/os_common.h ../../../../include/compiler.h
+ ../../../../include/kernel/os/os_common.h ../../../../include/compiler.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/screensaver.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -614,3 +616,7 @@
 ../../../../include/kernel/os/os_common.h:
 
 ../../../../include/compiler.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/screensaver.h:

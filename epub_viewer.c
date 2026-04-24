@@ -143,7 +143,6 @@ static uint32_t calc_bytes_for_height(const char *text, uint32_t text_len,
                                       int target_height);
 static int heading_need_next_page(EpubViewer *viewer, int current_level,
                                   int page_y_offset, int actual_h);
-static void decode_probe_dump(const char *stage, const char *buf, int len);
 static int flush_render_block(EpubViewer *viewer, const char *block_start, int block_len,
                               lv_font_t *font, int line_height, int *y_offset);
 static int build_decoded_stream(EpubViewer *viewer);
@@ -698,7 +697,8 @@ static void filter_unsupported_chars_ex(char *str, bool preserve_markers) {
             continue;
         }
 
-        if (unicode == 0x0A || (unicode >= 0x20 && unicode <= 0x7E) ||
+        if (unicode == 0x0A || unicode == 0xE000 ||
+            (unicode >= 0x20 && unicode <= 0x7E) ||
             (unicode >= 0x4E00 && unicode <= 0x9FA5) ||
             (unicode >= 0x3000 && unicode <= 0x303F)) {
             for (int i = 0; i < char_len; i++) *write_ptr++ = read_ptr[i];
@@ -836,13 +836,12 @@ static int strip_html_tags_with_styles(const char *html, int html_len,
                 }
             } else if (*p != '\r' && *p != '\t') {
                 if (pending_para_indent && *p != ' ') {
-                    if (out_pos < out_size - 6) {
-                        output[out_pos++] = (char)0xE3;
-                        output[out_pos++] = (char)0x80;
-                        output[out_pos++] = (char)0x80;
-                        output[out_pos++] = (char)0xE3;
-                        output[out_pos++] = (char)0x80;
-                        output[out_pos++] = (char)0x80;
+                    /* 4个ASCII空格作为段落缩进（全字体兼容） */
+                    if (out_pos < out_size - 4) {
+                        output[out_pos++] = ' ';
+                        output[out_pos++] = ' ';
+                        output[out_pos++] = ' ';
+                        output[out_pos++] = ' ';
                     }
                     pending_para_indent = 0;
                 }
@@ -1103,57 +1102,8 @@ static int heading_need_next_page(EpubViewer *viewer, int current_level,
                                   int page_y_offset, int actual_h) {
     if (!viewer || current_level <= 0) return 0;
     if (page_y_offset <= 0) return 0;
-    int reserve_h = actual_h + (LH_BODY * 4);
-    return (page_y_offset + reserve_h >= CONTENT_HEIGHT);
-}
-
-static void decode_probe_dump(const char *stage, const char *buf, int len) {
-    if (!stage || !buf || len <= 0) return;
-
-    const unsigned char year_utf8[] = {0xE5, 0xB9, 0xB4};
-    int hit = -1;
-    const char *reason = NULL;
-
-    for (int i = 0; i + 1 < len; i++) {
-        if (buf[i] == 'V' && buf[i + 1] == 'U') {
-            hit = i;
-            reason = "VU";
-            break;
-        }
-    }
-    if (hit < 0) {
-        for (int i = 0; i + 2 < len; i++) {
-            if ((unsigned char)buf[i] == year_utf8[0] &&
-                (unsigned char)buf[i + 1] == year_utf8[1] &&
-                (unsigned char)buf[i + 2] == year_utf8[2]) {
-                hit = i;
-                reason = "YEAR_UTF8";
-                break;
-            }
-        }
-    }
-    if (hit < 0 && strstr(buf, "1995") != NULL) {
-        hit = (int)(strstr(buf, "1995") - buf);
-        reason = "1995";
-    }
-    if (hit < 0 && strstr(buf, "多") != NULL) {
-        hit = (int)(strstr(buf, "多") - buf);
-        reason = "多";
-    }
-    if (hit < 0) return;
-
-    int start = hit - 16;
-    int end = hit + 32;
-    if (start < 0) start = 0;
-    if (end > len) end = len;
-
-    VIEW_LOG("[DECODE_PROBE] stage=%s reason=%s hit=%d window='%.*s'\n",
-             stage, reason ? reason : "?", hit, end - start, buf + start);
-    VIEW_LOG("[DECODE_PROBE_HEX] stage=%s ", stage);
-    for (int i = start; i < end; i++) {
-        VIEW_LOG("%02X ", (unsigned char)buf[i]);
-    }
-    VIEW_LOG("\n");
+    int reserve_h = actual_h + (LH_BODY * 2);
+    return (page_y_offset + reserve_h > CONTENT_HEIGHT);
 }
 
 static int write_decoded_chunk(FIL *decoded_fp, const char *buf, uint32_t len,
@@ -1339,23 +1289,17 @@ static int build_decoded_stream(EpubViewer *viewer) {
 
         if (safe_end > 0) {
             viewer->stripped_buf[safe_end] = '\0';
-            decode_probe_dump("pre_strip", viewer->stripped_buf, (int)safe_end);
 
             int slen = strip_html_tags_with_styles(
                 viewer->stripped_buf, (int)safe_end,
                 viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
 
             if (slen > 0) {
-                decode_probe_dump("post_strip", viewer->decoded_buf, slen);
                 decode_html_entities(viewer->decoded_buf,
                                      viewer->reflowed_buf, EPUB_WORK_BUF_SIZE * 2);
-                decode_probe_dump("post_entity", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
                 sanitize_utf8(viewer->reflowed_buf);
-                decode_probe_dump("post_sanitize", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
                 fix_chinese_punctuation(viewer->reflowed_buf);
-                decode_probe_dump("post_punct", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
                 filter_unsupported_chars_ex(viewer->reflowed_buf, true);
-                decode_probe_dump("post_filter", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
 
                 uint32_t flen = strlen(viewer->reflowed_buf);
                 if (flen > 0) {
@@ -1382,28 +1326,21 @@ static int build_decoded_stream(EpubViewer *viewer) {
         if (carry_len > 0) {
             if (carry_len >= (EPUB_WORK_BUF_SIZE * 2 - 1)) carry_len = EPUB_WORK_BUF_SIZE * 2 - 1;
             memcpy(carry_buf, viewer->stripped_buf + safe_end, carry_len);
-            decode_probe_dump("carry_buf", carry_buf, (int)carry_len);
         }
         carry_buf[carry_len] = '\0';
     }
 
     if (carry_len > 0) {
         carry_buf[carry_len] = '\0';
-        decode_probe_dump("carry_tail_in", carry_buf, (int)carry_len);
         int slen = strip_html_tags_with_styles(
             carry_buf, (int)carry_len,
             viewer->decoded_buf, EPUB_WORK_BUF_SIZE * 2);
         if (slen > 0) {
-            decode_probe_dump("carry_post_strip", viewer->decoded_buf, slen);
             decode_html_entities(viewer->decoded_buf,
                                  viewer->reflowed_buf, EPUB_WORK_BUF_SIZE * 2);
-            decode_probe_dump("carry_post_entity", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
             sanitize_utf8(viewer->reflowed_buf);
-            decode_probe_dump("carry_post_sanitize", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
             fix_chinese_punctuation(viewer->reflowed_buf);
-            decode_probe_dump("carry_post_punct", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
             filter_unsupported_chars_ex(viewer->reflowed_buf, true);
-            decode_probe_dump("carry_post_filter", viewer->reflowed_buf, (int)strlen(viewer->reflowed_buf));
 
             uint32_t flen = strlen(viewer->reflowed_buf);
             if (flen > 0) {

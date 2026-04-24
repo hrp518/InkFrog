@@ -10,6 +10,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include "http_server.h"
+#include "screensaver.h"
+#include "epd.h"
 #include "fs/fatfs/ff.h"
 #include "common/framework/fs_ctrl.h"
 #include "kernel/os/os.h"
@@ -50,6 +52,9 @@ extern void heap_print_info(void);
 static OS_Thread_t g_http_thread;
 static volatile int g_http_running = 0;
 static int g_http_port = HTTP_SERVER_PORT;
+static int g_server_sock = -1;           /* 服务器socket，用于stop时shutdown */
+static char *g_http_buffer = NULL;       /* 接收缓冲区(PSRAM) */
+static char *g_http_response = NULL;     /* 响应缓冲区(PSRAM) */
 
 /* MIME类型表 */
 static const HTTP_MIME_Type g_mime_types[] = {
@@ -67,6 +72,178 @@ static const HTTP_MIME_Type g_mime_types[] = {
     {".h", "text/plain"},
     {NULL, "application/octet-stream"}
 };
+
+static int send_response(int sock, const char *status, const char *content_type,
+                        const char *body, int body_len);
+static int send_html_response(int sock, const char *html_body);
+
+static int parse_content_length(const char *req)
+{
+    const char *p = strstr(req, "Content-Length:");
+    if (!p) {
+        return -1;
+    }
+    p += strlen("Content-Length:");
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    return atoi(p);
+}
+
+static int generate_screensaver_html(char *html_buf, int buf_size)
+{
+    int len = 0;
+    len += snprintf(html_buf + len, buf_size - len,
+        "<!DOCTYPE html>\n"
+        "<html><head><meta charset=\"UTF-8\">\n"
+        "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n"
+        "<title>屏保编辑器</title>\n"
+        "<style>\n"
+        "body{font-family:Arial,sans-serif;margin:0;background:#eef2f7;color:#222;}\n"
+        ".wrap{max-width:1180px;margin:0 auto;padding:20px;}\n"
+        ".card{background:#fff;border-radius:12px;box-shadow:0 3px 12px rgba(0,0,0,.08);padding:16px;margin-bottom:16px;}\n"
+        ".row{display:flex;gap:16px;flex-wrap:wrap;}\n"
+        ".left{flex:1;min-width:320px;}\n"
+        ".right{width:340px;max-width:100%%;}\n"
+        ".toolbar label{display:block;font-size:13px;color:#555;margin-top:10px;margin-bottom:4px;}\n"
+        ".toolbar input,.toolbar select,.toolbar button{width:100%%;box-sizing:border-box;padding:10px;border:1px solid #ccd3db;border-radius:8px;}\n"
+        ".toolbar button{background:#2563eb;color:#fff;border:none;cursor:pointer;font-weight:bold;}\n"
+        ".toolbar button.secondary{background:#64748b;}\n"
+        ".toolbar button.success{background:#16a34a;}\n"
+        ".toolbar button:disabled{background:#94a3b8;cursor:not-allowed;}\n"
+        ".preview-box{display:flex;justify-content:center;align-items:center;overflow:auto;background:#dfe6ee;border-radius:12px;padding:12px;}\n"
+        "canvas{background:#fff;border:1px solid #cbd5e1;border-radius:8px;image-rendering:pixelated;max-width:100%%;}\n"
+        ".hint{font-size:12px;color:#64748b;line-height:1.6;}\n"
+        ".top-actions{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;}\n"
+        ".top-actions a{display:inline-block;padding:10px 14px;background:#475569;color:#fff;text-decoration:none;border-radius:8px;}\n"
+        ".status{font-size:13px;padding:10px;border-radius:8px;background:#f8fafc;color:#334155;white-space:pre-wrap;}\n"
+        ".small{font-size:12px;color:#6b7280;}\n"
+        "</style></head><body><div class=\"wrap\">\n"
+        "<div class=\"top-actions\"><a href=\"/\">返回文件管理</a><a href=\"/screensaver/status\" target=\"_blank\">查看状态 JSON</a></div>\n"
+        "<div class=\"row\">\n"
+        "<div class=\"left card\">\n"
+        "<h2>屏保图片编辑器</h2>\n"
+        "<div class=\"preview-box\"><canvas id=\"preview\" width=\"240\" height=\"415\"></canvas></div>\n"
+        "<p class=\"hint\">支持拖动平移、滚轮缩放。最终输出固定为 240x415、1bpp、%u 字节。白色像素写 1，黑色像素写 0，与当前 EPD 帧缓冲格式一致。</p>\n"
+        "</div>\n"
+        "<div class=\"right card toolbar\">\n"
+        "<label>选择图片</label><input type=\"file\" id=\"fileInput\" accept=\"image/*\">\n"
+        "<label>布局模式</label><select id=\"fitMode\"><option value=\"contain\">Contain 完整显示</option><option value=\"cover\">Cover 铺满裁切</option><option value=\"stretch\">Stretch 拉伸</option><option value=\"manual\">Manual 手动</option></select>\n"
+        "<label>缩放倍数</label><input type=\"range\" id=\"zoomRange\" min=\"0.1\" max=\"8\" step=\"0.01\" value=\"1\">\n"
+        "<label>X 偏移</label><input type=\"number\" id=\"offsetX\" value=\"0\" step=\"1\">\n"
+        "<label>Y 偏移</label><input type=\"number\" id=\"offsetY\" value=\"0\" step=\"1\">\n"
+        "<label>处理模式</label><select id=\"procMode\"><option value=\"dither\">Floyd-Steinberg 抖动</option><option value=\"level\">Level 阈值</option></select>\n"
+        "<label>阈值（Level模式）</label><input type=\"range\" id=\"threshold\" min=\"0\" max=\"255\" step=\"1\" value=\"128\">\n"
+        "<div class=\"row\">\n"
+        "<div style=\"flex:1\"><button type=\"button\" class=\"secondary\" id=\"btnContain\">一键完整显示</button></div>\n"
+        "<div style=\"flex:1\"><button type=\"button\" class=\"secondary\" id=\"btnCover\">一键铺满</button></div>\n"
+        "</div>\n"
+        "<div class=\"row\">\n"
+        "<div style=\"flex:1\"><button type=\"button\" class=\"secondary\" id=\"btnReset\">重置</button></div>\n"
+        "<div style=\"flex:1\"><button type=\"button\" class=\"success\" id=\"btnSave\">保存为屏保</button></div>\n"
+        "</div>\n"
+        "<label>设备状态</label><div id=\"status\" class=\"status\">正在读取状态...</div>\n"
+        "<p class=\"small\">说明：浏览器端完成缩放、位移、灰度/抖动与 1bpp 打包；设备端只负责接收并保存结果到 SD 卡。</p>\n"
+        "</div></div>\n"
+        "<script>\n"
+        "const W=240,H=415,EXPECTED=%u;\n"
+        "const canvas=document.getElementById('preview');const ctx=canvas.getContext('2d');\n"
+        "const work=document.createElement('canvas');work.width=W;work.height=H;const wctx=work.getContext('2d');\n"
+        "const fileInput=document.getElementById('fileInput');const fitMode=document.getElementById('fitMode');\n"
+        "const zoomRange=document.getElementById('zoomRange');const offsetX=document.getElementById('offsetX');const offsetY=document.getElementById('offsetY');\n"
+        "const procMode=document.getElementById('procMode');const threshold=document.getElementById('threshold');const statusEl=document.getElementById('status');\n"
+        "let img=null,dragging=false,lastX=0,lastY=0,state={scale:1,dx:0,dy:0};\n"
+        "function syncInputs(){zoomRange.value=state.scale;offsetX.value=Math.round(state.dx);offsetY.value=Math.round(state.dy);}\n"
+        "function setStatus(t){statusEl.textContent=t;}\n"
+        "function loadStatus(){fetch('/screensaver/status').then(r=>r.json()).then(j=>{setStatus(JSON.stringify(j,null,2));}).catch(e=>setStatus('读取状态失败: '+e));}\n"
+        "function grayOf(r,g,b){return Math.round(0.299*r+0.587*g+0.114*b);}\n"
+        "function applyLevel(imgData,th){const d=imgData.data;for(let i=0;i<d.length;i+=4){const g=grayOf(d[i],d[i+1],d[i+2]);const v=g>th?255:0;d[i]=d[i+1]=d[i+2]=v;d[i+3]=255;}return imgData;}\n"
+        "function applyDither(imgData){const d=imgData.data;const gs=new Float32Array(W*H);for(let y=0;y<H;y++){for(let x=0;x<W;x++){const i=(y*W+x)*4;gs[y*W+x]=grayOf(d[i],d[i+1],d[i+2]);}}for(let y=0;y<H;y++){for(let x=0;x<W;x++){const idx=y*W+x;const oldv=gs[idx];const newv=oldv>127?255:0;const err=oldv-newv;gs[idx]=newv;if(x+1<W)gs[idx+1]+=err*7/16;if(y+1<H){if(x>0)gs[idx+W-1]+=err*3/16;gs[idx+W]+=err*5/16;if(x+1<W)gs[idx+W+1]+=err*1/16;}}}for(let y=0;y<H;y++){for(let x=0;x<W;x++){const i=(y*W+x)*4;const v=gs[y*W+x]>127?255:0;d[i]=d[i+1]=d[i+2]=v;d[i+3]=255;}}return imgData;}\n"
+        "function pack1bpp(imgData){const d=imgData.data;const out=new Uint8Array(EXPECTED);for(let y=0;y<H;y++){for(let x=0;x<W;x++){const i=(y*W+x)*4;const white=d[i]>127?1:0;const bi=y*(W>>3)+(x>>3);out[bi]|=(white<<(7-(x&7)));}}return out;}\n"
+        "function fitContain(){if(!img)return;state.scale=Math.min(W/img.width,H/img.height);state.dx=(W-img.width*state.scale)/2;state.dy=(H-img.height*state.scale)/2;fitMode.value='contain';syncInputs();render();}\n"
+        "function fitCover(){if(!img)return;state.scale=Math.max(W/img.width,H/img.height);state.dx=(W-img.width*state.scale)/2;state.dy=(H-img.height*state.scale)/2;fitMode.value='cover';syncInputs();render();}\n"
+        "function fitStretch(){if(!img)return;state.scale=1;state.dx=0;state.dy=0;fitMode.value='stretch';syncInputs();render();}\n"
+        "function render(){ctx.fillStyle='#fff';ctx.fillRect(0,0,W,H);wctx.fillStyle='#fff';wctx.fillRect(0,0,W,H);if(!img){ctx.fillStyle='#888';ctx.font='16px Arial';ctx.fillText('请选择图片',75,200);return;}const mode=fitMode.value;wctx.save();if(mode==='stretch'){wctx.drawImage(img,0,0,W,H);}else{wctx.imageSmoothingEnabled=true;wctx.drawImage(img,state.dx,state.dy,img.width*state.scale,img.height*state.scale);}wctx.restore();let id=wctx.getImageData(0,0,W,H);if(procMode.value==='level'){id=applyLevel(id,parseInt(threshold.value,10));}else{id=applyDither(id);}wctx.putImageData(id,0,0);ctx.drawImage(work,0,0);}\n"
+        "fileInput.addEventListener('change',()=>{const f=fileInput.files[0];if(!f)return;const rd=new FileReader();rd.onload=e=>{const im=new Image();im.onload=()=>{img=im;fitContain();};im.src=e.target.result;};rd.readAsDataURL(f);});\n"
+        "fitMode.addEventListener('change',()=>{if(!img)return;if(fitMode.value==='contain')fitContain();else if(fitMode.value==='cover')fitCover();else if(fitMode.value==='stretch')fitStretch();else render();});\n"
+        "zoomRange.addEventListener('input',()=>{state.scale=parseFloat(zoomRange.value);fitMode.value='manual';render();});\n"
+        "offsetX.addEventListener('input',()=>{state.dx=parseFloat(offsetX.value)||0;fitMode.value='manual';render();});\n"
+        "offsetY.addEventListener('input',()=>{state.dy=parseFloat(offsetY.value)||0;fitMode.value='manual';render();});\n"
+        "procMode.addEventListener('change',render);threshold.addEventListener('input',render);\n"
+        "document.getElementById('btnContain').addEventListener('click',fitContain);document.getElementById('btnCover').addEventListener('click',fitCover);\n"
+        "document.getElementById('btnReset').addEventListener('click',()=>{if(!img)return;fitContain();threshold.value=128;procMode.value='dither';render();});\n"
+        "canvas.addEventListener('mousedown',e=>{dragging=true;lastX=e.offsetX;lastY=e.offsetY;fitMode.value='manual';});\n"
+        "window.addEventListener('mouseup',()=>dragging=false);\n"
+        "canvas.addEventListener('mousemove',e=>{if(!dragging||!img||fitMode.value==='stretch')return;state.dx+=e.offsetX-lastX;state.dy+=e.offsetY-lastY;lastX=e.offsetX;lastY=e.offsetY;syncInputs();render();});\n"
+        "canvas.addEventListener('wheel',e=>{if(!img||fitMode.value==='stretch')return;e.preventDefault();fitMode.value='manual';const old=state.scale;let next=old*(e.deltaY<0?1.05:0.95);if(next<0.1)next=0.1;if(next>8)next=8;const mx=e.offsetX,my=e.offsetY;state.dx=mx-(mx-state.dx)*(next/old);state.dy=my-(my-state.dy)*(next/old);state.scale=next;syncInputs();render();},{passive:false});\n"
+        "document.getElementById('btnSave').addEventListener('click',()=>{if(!img){alert('请先选择图片');return;}const btn=document.getElementById('btnSave');btn.disabled=true;btn.textContent='保存中...';const imgData=wctx.getImageData(0,0,W,H);const packed=pack1bpp(imgData);const xhr=new XMLHttpRequest();xhr.open('POST','/screensaver/upload',true);xhr.setRequestHeader('Content-Type','application/octet-stream');xhr.onload=()=>{btn.disabled=false;btn.textContent='保存为屏保';if(xhr.status===200){alert('保存成功');loadStatus();}else{alert('保存失败: '+xhr.status+' '+xhr.responseText);}};xhr.onerror=()=>{btn.disabled=false;btn.textContent='保存为屏保';alert('网络错误');};xhr.send(packed.buffer);});\n"
+        "syncInputs();render();loadStatus();\n"
+        "</script></div></body></html>\n",
+        (unsigned int)EPD_BUFFER_SIZE,
+        (unsigned int)EPD_BUFFER_SIZE);
+    return len;
+}
+
+static int handle_screensaver_upload_raw(int sock, const char *initial_data, int initial_len)
+{
+    char *body;
+    char *buf = NULL;
+    int body_len;
+    int content_len;
+    int received;
+    int ret;
+
+    body = strstr(initial_data, "\r\n\r\n");
+    if (!body) {
+        send_response(sock, "400 Bad Request", "text/plain", "Missing body", 12);
+        return -1;
+    }
+
+    body += 4;
+    body_len = initial_len - (body - initial_data);
+    content_len = parse_content_length(initial_data);
+    if (content_len != EPD_BUFFER_SIZE) {
+        HTTP_LOG("screensaver upload invalid length: %d", content_len);
+        send_response(sock, "400 Bad Request", "text/plain", "Invalid content length", 22);
+        return -1;
+    }
+
+    buf = (char *)_dma_malloc(EPD_BUFFER_SIZE, DMAHEAP_PSRAM);
+    if (!buf) {
+        send_response(sock, "500 Internal Server Error", "text/plain", "No memory", 9);
+        return -1;
+    }
+
+    received = 0;
+    if (body_len > 0) {
+        if (body_len > EPD_BUFFER_SIZE) {
+            body_len = EPD_BUFFER_SIZE;
+        }
+        memcpy(buf, body, body_len);
+        received = body_len;
+    }
+
+    while (received < EPD_BUFFER_SIZE) {
+        ret = recv(sock, buf + received, EPD_BUFFER_SIZE - received, 0);
+        if (ret <= 0) {
+            HTTP_LOG("screensaver upload recv interrupted: %d", ret);
+            _dma_free(buf, 0);
+            send_response(sock, "400 Bad Request", "text/plain", "Incomplete body", 15);
+            return -1;
+        }
+        received += ret;
+    }
+
+    ret = screensaver_save_raw_file((const uint8_t *)buf, EPD_BUFFER_SIZE);
+    _dma_free(buf, 0);
+    if (ret == 0) {
+        send_response(sock, "200 OK", "text/plain", "Screensaver saved", 17);
+        return 0;
+    }
+
+    send_response(sock, "500 Internal Server Error", "text/plain", "Save failed", 11);
+    return -1;
+}
 
 /*
  * 获取MIME类型
@@ -205,7 +382,8 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "<h1>📁 SD卡文件管理器</h1>\n"
         "<div class=\"info\">\n"
         "<strong>当前目录:</strong> %s<br>\n"
-        "<strong>说明:</strong> 点击文件夹名称进入目录。支持多文件上传，按顺序依次传输。\n"
+        "<strong>说明:</strong> 点击文件夹名称进入目录。支持多文件上传，按顺序依次传输。<br>\n"
+        "<a href=\"/screensaver\" style=\"display:inline-block;margin-top:8px;padding:8px 12px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;\">🖼️ 打开屏保编辑器</a>\n"
         "</div>\n", dir_path);
     
     /* 返回上级目录按钮 */
@@ -502,7 +680,7 @@ static int send_redirect_response(int sock, const char *location)
 
 /*
  * 发送文件内容 - 分块读取并发送，支持大文件
- * 使用 buffer[HTTP_BUF_SIZE] 全局缓冲区避免大块malloc
+ * 使用 g_http_buffer[HTTP_BUF_SIZE] 全局缓冲区避免大块malloc
  */
 static int send_file_content(int sock, const char *filepath)
 {
@@ -514,7 +692,7 @@ static int send_file_content(int sock, const char *filepath)
     /* 动态分配缓冲区，避免撑爆 4KB 的线程栈 */
     char *file_buf = (char *)_dma_malloc(HTTP_BUF_SIZE, DMAHEAP_PSRAM);
     if (!file_buf) {
-        HTTP_LOG("Failed to allocate PSRAM buffer for file send");
+        HTTP_LOG("Failed to allocate PSRAM g_http_buffer for file send");
         return -1;
     }
     
@@ -582,6 +760,23 @@ static int send_file_content(int sock, const char *filepath)
     return 0;
 }
 
+static char *find_binary_boundary(char *buf, int buf_len, const char *boundary, int boundary_len)
+{
+    int i;
+
+    if (!buf || !boundary || buf_len <= 0 || boundary_len <= 0 || buf_len < boundary_len) {
+        return NULL;
+    }
+
+    for (i = 0; i <= buf_len - boundary_len; i++) {
+        if (memcmp(buf + i, boundary, boundary_len) == 0) {
+            return buf + i;
+        }
+    }
+
+    return NULL;
+}
+
 /*
  * 处理文件上传 - 零malloc版本，支持PSRAM大缓冲区
  *
@@ -613,10 +808,10 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     #define BUFFER_SIZE (16 * 1024)  /* 16KB */
     char *recv_buffer = (char *)_dma_malloc(BUFFER_SIZE, DMAHEAP_PSRAM);
     if (!recv_buffer) {
-        HTTP_LOG("Failed to allocate PSRAM buffer for upload!");
-        return;
+        HTTP_LOG("Failed to allocate PSRAM g_http_buffer for upload!");
+        return -1;
     }
-    HTTP_LOG("Using PSRAM buffer for upload, size: %d bytes", BUFFER_SIZE);
+    HTTP_LOG("Using PSRAM g_http_buffer for upload, size: %d bytes", BUFFER_SIZE);
     
     HTTP_LOG("Processing streaming upload, path: %s, initial_len: %d", upload_path, initial_len);
     
@@ -677,11 +872,12 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
             int recv_len = recv(sock, recv_buffer + buf_used, BUFFER_SIZE - buf_used - 1, 0);
             if (recv_len <= 0) {
                 HTTP_LOG("recv returned %d while finding filename", recv_len);
+                _dma_free(recv_buffer, 0);
                 return -1;
             }
             buf_used += recv_len;
             recv_buffer[buf_used] = '\0';
-            OS_MSleep(10);  // 让lwIP释放pbuf内存
+            OS_MSleep(50);  // 让lwIP释放pbuf内存（增加延迟避免heap exhausted）
         }
     }
     
@@ -705,11 +901,12 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
             int recv_len = recv(sock, recv_buffer + buf_used, BUFFER_SIZE - buf_used - 1, 0);
             if (recv_len <= 0) {
                 HTTP_LOG("recv returned %d while finding header end", recv_len);
+                _dma_free(recv_buffer, 0);
                 return -1;
             }
             buf_used += recv_len;
             recv_buffer[buf_used] = '\0';
-            OS_MSleep(10);  // 让lwIP释放pbuf内存
+            OS_MSleep(50);  // 让lwIP释放pbuf内存（增加延迟避免heap exhausted）
         }
     }
     
@@ -724,6 +921,7 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     res = f_open(&fp, filepath, FA_WRITE | FA_CREATE_ALWAYS);
     if (res != FR_OK) {
         HTTP_LOG("f_open failed: %d", res);
+        _dma_free(recv_buffer, 0);
         return -1;
     }
     
@@ -744,9 +942,9 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     int keep_len = boundary_len + 4; // 稍微多保留几个字节，防止 boundary 和 \r\n 被切断
     
     while (1) {
-        /* 1. 先在现有的 buffer 中搜索 boundary */
+        /* 1. 先在现有的 g_http_buffer 中搜索 boundary */
         if (buf_used > 0) {
-            char *boundary_pos = strstr(recv_buffer, boundary);
+            char *boundary_pos = find_binary_boundary(recv_buffer, buf_used, boundary, boundary_len);
             if (boundary_pos) {
                 int data_len = boundary_pos - recv_buffer;
                 /* 去除 boundary 前面的 \r\n */
@@ -759,6 +957,7 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
                 }
                 HTTP_LOG("Upload complete! Total: %d bytes", total_written);
                 f_close(&fp);
+                _dma_free(recv_buffer, 0);
                 
                 /* 注意：成功后应当向浏览器返回 200 OK 响应 */
                 send_response(sock, "200 OK", "text/plain", "Upload OK", 9);
@@ -770,7 +969,9 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
         if (buf_used > keep_len) {
             int write_len = buf_used - keep_len;
             res = f_write(&fp, recv_buffer, write_len, &bw);
-            if (res != FR_OK) break;
+            if (res != FR_OK) {
+                break;
+            }
             total_written += bw;
             
             /* 把保留的数据移到缓冲区头部 */
@@ -782,24 +983,20 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
         /* 3. 接收更多数据 */
         int recv_len = recv(sock, recv_buffer + buf_used, BUFFER_SIZE - buf_used - 1, 0);
         if (recv_len <= 0) {
-            HTTP_LOG("recv returned %d, done", recv_len);
-            /* 如果连接断开，把最后剩余的数据也写进去 */
-            if (buf_used > 0) {
-                f_write(&fp, recv_buffer, buf_used, &bw);
-                total_written += bw;
-            }
+            HTTP_LOG("recv returned %d before boundary, incomplete upload", recv_len);
             break;
         }
         
         buf_used += recv_len;
         recv_buffer[buf_used] = '\0';
-        OS_MSleep(10);  // 让lwIP释放pbuf内存
+        OS_MSleep(50);  // 让lwIP释放pbuf内存（增加延迟避免heap exhausted）
     }
     
     f_close(&fp);
-    HTTP_LOG("Connection closed abruptly. Total: %d bytes", total_written);
-    
-    return 0;
+    _dma_free(recv_buffer, 0);
+    HTTP_LOG("Connection closed abruptly or write failed. Total: %d bytes", total_written);
+    send_response(sock, "400 Bad Request", "text/plain", "Incomplete upload", 17);
+    return -1;
 }
 
 /*
@@ -913,35 +1110,38 @@ static int parse_request(const char *req, char *method, char *path, char *versio
  */
  static void http_server_thread(void *arg)
  {
-     int server_sock, client_sock;
+     int client_sock;
      struct sockaddr_in server_addr, client_addr;
      socklen_t addr_len = sizeof(client_addr);
-     /* 强制从 PSRAM 申请内存，替代失效的静态段注解 */
-     char *buffer = (char *)_dma_malloc(HTTP_BUF_SIZE, DMAHEAP_PSRAM);
+     /* 使用全局PSRAM缓冲区，以便stop时可以释放 */
+     g_http_buffer = (char *)_dma_malloc(HTTP_BUF_SIZE, DMAHEAP_PSRAM);
      int recv_len;
      char method[32], path[256], version[16];
-     /* response 缓冲区 - 强制从 PSRAM 申请 HTTP_RESPONSE_SIZE */
-     char *response = (char *)_dma_malloc(HTTP_RESPONSE_SIZE, DMAHEAP_PSRAM);
+     /* g_http_response 缓冲区 - 使用全局指针 */
+     g_http_response = (char *)_dma_malloc(HTTP_RESPONSE_SIZE, DMAHEAP_PSRAM);
     
-     if (!buffer || !response) {
-         printf("[HTTP ERR] Failed to allocate PSRAM buffers! buffer=%p, response=%p\r\n", buffer, response);
-         if (buffer) _dma_free(buffer, 0);
-         if (response) _dma_free(response, 0);
+     if (!g_http_buffer || !g_http_response) {
+         printf("[HTTP ERR] Failed to allocate PSRAM buffers! g_http_buffer=%p, g_http_response=%p\r\n", g_http_buffer, g_http_response);
+         if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
+         if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
+         g_http_running = 0;
          return;
      }
     
     HTTP_LOG("Server starting on port %d...", g_http_port);
     
     /* 创建socket */
-    server_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_sock < 0) {
+    g_server_sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (g_server_sock < 0) {
         HTTP_LOG("Failed to create socket");
+        if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
+        if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
         return;
     }
     
     /* 设置地址重用 */
     int opt = 1;
-    setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(g_server_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     
     /* 绑定地址 */
     memset(&server_addr, 0, sizeof(server_addr));
@@ -949,23 +1149,29 @@ static int parse_request(const char *req, char *method, char *path, char *versio
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(g_http_port);
     
-    if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+    if (bind(g_server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         HTTP_LOG("Failed to bind socket");
-        closesocket(server_sock);
+        closesocket(g_server_sock);
+        g_server_sock = -1;
+        if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
+        if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
         return;
     }
     
     /* 监听 */
-    if (listen(server_sock, 5) < 0) {
+    if (listen(g_server_sock, 5) < 0) {
         HTTP_LOG("Failed to listen");
-        closesocket(server_sock);
+        closesocket(g_server_sock);
+        g_server_sock = -1;
+        if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
+        if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
         return;
     }
     
     HTTP_LOG("Server listening on port %d", g_http_port);
     
     while (g_http_running) {
-        client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
+        client_sock = accept(g_server_sock, (struct sockaddr *)&client_addr, &addr_len);
         if (client_sock < 0) {
             if (g_http_running) {
                 HTTP_LOG("Accept failed");
@@ -978,16 +1184,24 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                 ntohs(client_addr.sin_port));
         
         /* 接收请求 */
-        recv_len = recv(client_sock, buffer, HTTP_BUF_SIZE - 1, 0);
+        recv_len = recv(client_sock, g_http_buffer, HTTP_BUF_SIZE - 1, 0);
         
         if (recv_len > 0) {
-            buffer[recv_len] = '\0';
+            g_http_buffer[recv_len] = '\0';
             
             /* 解析请求 */
             char dir_path[HTTP_MAX_PATH] = "/";
             FRESULT res = FR_OK;
-            if (parse_request(buffer, method, path, version, dir_path) == 0) {
+            if (parse_request(g_http_buffer, method, path, version, dir_path) == 0) {
                 if (strcmp(method, "GET") == 0) {
+                    if (strcmp(path, "/screensaver") == 0) {
+                        (void)generate_screensaver_html(g_http_response, HTTP_RESPONSE_SIZE);
+                        send_html_response(client_sock, g_http_response);
+                    } else if (strcmp(path, "/screensaver/status") == 0) {
+                        char status_json[256];
+                        screensaver_get_status_json(status_json, sizeof(status_json));
+                        send_response(client_sock, "200 OK", "application/json", status_json, strlen(status_json));
+                    } else {
                     /* 检查是否是文件下载请求：path为"/"且dir_path不是"/"（说明dir_path包含文件路径） */
                     FILINFO fno;
                     res = f_stat(dir_path, &fno);
@@ -997,8 +1211,9 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                         send_file_content(client_sock, dir_path);
                     } else {
                         /* 是目录，生成HTML页面 */
-                        (void)generate_file_list_html(response, HTTP_RESPONSE_SIZE, dir_path);
-                        send_html_response(client_sock, response);
+                        (void)generate_file_list_html(g_http_response, HTTP_RESPONSE_SIZE, dir_path);
+                        send_html_response(client_sock, g_http_response);
+                    }
                     }
                 } else if (strcmp(method, "POST") == 0) {
                     /* 检查是否是删除请求 */
@@ -1012,42 +1227,44 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                             HTTP_LOG("Delete failed: %d", res);
                             send_response(client_sock, "500 Internal Server Error", "text/plain", "Delete failed", 12);
                         }
-                    } else if (strstr(buffer, "multipart/form-data")) {
+                    } else if (strcmp(path, "/screensaver/upload") == 0) {
+                        handle_screensaver_upload_raw(client_sock, g_http_buffer, recv_len);
+                    } else if (strstr(g_http_buffer, "multipart/form-data")) {
                         HTTP_LOG("=== DEBUG: Before header scan, recv_len=%d ===", recv_len);
-                        HTTP_LOG("=== DEBUG: First 50 bytes: %.50s ===", buffer);
+                        HTTP_LOG("=== DEBUG: First 50 bytes: %.50s ===", g_http_buffer);
                         
                         /* 确保接收完整的header（直到\r\n\r\n） */
-                        char *header_end = strstr(buffer, "\r\n\r\n");
+                        char *header_end = strstr(g_http_buffer, "\r\n\r\n");
                         if (!header_end) {
                             /* header不完整，需要继续接收 */
                             int total_received = recv_len;
                             HTTP_LOG("=== DEBUG: Header incomplete, trying to receive more... ===");
                             while (!header_end && total_received < HTTP_BUF_SIZE - 1) {
-                                int more = recv(client_sock, buffer + total_received, HTTP_BUF_SIZE - total_received - 1, 0);
+                                int more = recv(client_sock, g_http_buffer + total_received, HTTP_BUF_SIZE - total_received - 1, 0);
                                 if (more <= 0) {
                                     HTTP_LOG("=== DEBUG: recv returned %d, breaking ===", more);
                                     break;
                                 }
                                 total_received += more;
-                                buffer[total_received] = '\0';
+                                g_http_buffer[total_received] = '\0';
                                 HTTP_LOG("=== DEBUG: After recv, total_received=%d ===", total_received);
-                                header_end = strstr(buffer, "\r\n\r\n");
+                                header_end = strstr(g_http_buffer, "\r\n\r\n");
                                 if (header_end) {
-                                    HTTP_LOG("=== DEBUG: Found header_end at offset %d ===", header_end - buffer);
+                                    HTTP_LOG("=== DEBUG: Found header_end at offset %d ===", header_end - g_http_buffer);
                                     break;
                                 }
                             }
                             recv_len = total_received;
                         }
                         
-                        HTTP_LOG("=== DEBUG: After header scan, recv_len=%d, buffer len=%d ===", recv_len, (int)strlen(buffer));
+                        HTTP_LOG("=== DEBUG: After header scan, recv_len=%d, g_http_buffer len=%d ===", recv_len, (int)strlen(g_http_buffer));
                         
                         if (header_end) {
-                            int header_total_len = header_end + 4 - buffer;
+                            int header_total_len = header_end + 4 - g_http_buffer;
                             HTTP_LOG("=== DEBUG: header_end found, header_total_len=%d ===", header_total_len);
                             HTTP_LOG("=== DEBUG: Content-Length in header ===");
                             /* 获取boundary */
-                            const char *boundary_start = strstr(buffer, "boundary=");
+                            const char *boundary_start = strstr(g_http_buffer, "boundary=");
                             char boundary[64] = {0};
                             if (boundary_start) {
                                 boundary_start += 9;
@@ -1065,7 +1282,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                             
                             /* 提取上传路径 - 从multipart数据中的name="path"字段 */
                             char upload_path[HTTP_MAX_PATH] = UPLOAD_PATH;
-                            const char *path_start = strstr(buffer, "name=\"path\"");
+                            const char *path_start = strstr(g_http_buffer, "name=\"path\"");
                             if (path_start) {
                                 const char *value_start = strstr(path_start, "\r\n\r\n");
                                 if (value_start) {
@@ -1085,7 +1302,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                             
                             /* 处理文件上传 - 使用流式处理支持大文件 */
                             char uploaded_filename[128] = {0};
-                            int header_len = header_end + 4 - buffer;
+                            int header_len = header_end + 4 - g_http_buffer;
                             
                             /* 调试：打印header内容 - 扩大打印范围 */
                             HTTP_LOG("=== DEBUG: Header dump (len=%d) ===", header_len);
@@ -1097,10 +1314,10 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                             ascii_line[0] = '\0';
                             for (int i = 0; i < dump_len; i++) {
                                 char tmp[8];
-                                snprintf(tmp, sizeof(tmp), "%02X ", (unsigned char)buffer[i]);
+                                snprintf(tmp, sizeof(tmp), "%02X ", (unsigned char)g_http_buffer[i]);
                                 strcat(hex_line, tmp);
-                                if (buffer[i] >= 0x20 && buffer[i] < 0x7F) {
-                                    char a[2] = {(char)buffer[i], '\0'};
+                                if (g_http_buffer[i] >= 0x20 && g_http_buffer[i] < 0x7F) {
+                                    char a[2] = {(char)g_http_buffer[i], '\0'};
                                     strcat(ascii_line, a);
                                 } else {
                                     strcat(ascii_line, ".");
@@ -1124,24 +1341,24 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                             HTTP_LOG("=== End header dump ===");
                             
                             /* 特别检查Content-Type和filename */
-                            char *ct = strstr(buffer, "Content-Type:");
+                            char *ct = strstr(g_http_buffer, "Content-Type:");
                             if (ct) {
-                                HTTP_LOG("Content-Type found at offset %d", ct - buffer);
+                                HTTP_LOG("Content-Type found at offset %d", ct - g_http_buffer);
                             } else {
                                 HTTP_LOG("Content-Type NOT FOUND in header");
                             }
-                            char *fn = strstr(buffer, "filename=");
+                            char *fn = strstr(g_http_buffer, "filename=");
                             if (fn) {
-                                HTTP_LOG("filename found at offset %d", fn - buffer);
+                                HTTP_LOG("filename found at offset %d", fn - g_http_buffer);
                             } else {
                                 HTTP_LOG("filename NOT FOUND in header");
                             }
                             
-                            if (handle_file_upload_streaming(client_sock, boundary, buffer, header_len, uploaded_filename, upload_path) == 0) {
+                            if (handle_file_upload_streaming(client_sock, boundary, g_http_buffer, header_len, uploaded_filename, upload_path) == 0) {
                                 HTTP_LOG("File uploaded successfully: %s", uploaded_filename);
                                 /* 上传成功 - chunked响应已在streaming函数中发送，此处不重复发送 */
                             } else {
-                                snprintf(response, HTTP_RESPONSE_SIZE,
+                                snprintf(g_http_response, HTTP_RESPONSE_SIZE,
                                     "<!DOCTYPE html>"
                                     "<html>"
                                     "<head>"
@@ -1161,7 +1378,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                                     "</div>"
                                     "</body>"
                                     "</html>");
-                                send_html_response(client_sock, response);
+                                send_html_response(client_sock, g_http_response);
                             }
                         } else {
                             /* 无法获取完整header */
@@ -1171,9 +1388,9 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                         }
                     } else {
                         /* 简单POST处理 */
-                        snprintf(response, HTTP_RESPONSE_SIZE,
+                        snprintf(g_http_response, HTTP_RESPONSE_SIZE,
                             "<html><body><h1>POST Received</h1><a href=\"/\">Back</a></body></html>");
-                        send_html_response(client_sock, response);
+                        send_html_response(client_sock, g_http_response);
                     }
                 } else {
                     /* 不支持的方法 */
@@ -1190,7 +1407,14 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         closesocket(client_sock);
     }
     
-    closesocket(server_sock);
+    closesocket(g_server_sock);
+    g_server_sock = -1;
+    
+    /* 释放PSRAM缓冲区 */
+    if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
+    if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
+    g_http_running = 0;
+    
     HTTP_LOG("Server stopped");
 }
 
@@ -1230,13 +1454,12 @@ int http_server_start(void)
     printf("[HTTP] HTTP_RESPONSE_SIZE = %d bytes\r\n", HTTP_RESPONSE_SIZE);
     printf("[HTTP] HTTP_BUF_SIZE = %d bytes\r\n", HTTP_BUF_SIZE);
     printf("[HTTP] HTTP_MAX_PATH = %d bytes\r\n", HTTP_MAX_PATH);
-    printf("[HTTP] Thread stack size = 2048 bytes\r\n");
+    printf("[HTTP] Thread stack size = 8192 bytes\r\n");
     printf("[HTTP] g_http_thread.handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
-    
-    /* Fix: 增大线程栈从2048到4096，防止栈溢出导致随机崩溃 */
+    /* Fix: 增大线程栈到8192，避免 /screensaver/upload 路径触发栈溢出 */
     if (OS_ThreadCreate(&g_http_thread, "http_server",
                         http_server_thread, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
+                        OS_PRIORITY_NORMAL, 8192) != 0) {
         HTTP_LOG("Failed to create thread");
         g_http_running = 0;
         return -1;
@@ -1254,13 +1477,23 @@ void http_server_stop(void)
     if (!g_http_running) {
         return;
     }
-    
+
     HTTP_LOG("Stopping HTTP server...");
     g_http_running = 0;
     
+    /* 关闭server socket使accept返回，触发线程退出 */
+    if (g_server_sock >= 0) {
+        closesocket(g_server_sock);
+        g_server_sock = -1;
+    }
+
     /* 等待线程结束 */
     OS_ThreadDelete(&g_http_thread);
     
+    /* 确保PSRAM缓冲区被释放（防止线程异常退出时泄漏） */
+    if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
+    if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
+
     HTTP_LOG("HTTP server stopped");
 }
 

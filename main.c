@@ -32,6 +32,10 @@
 #include "heap_debug.h"
 #include "wlan_manager.h"
 #include "http_server.h"
+#include "screensaver.h"
+#include "coremark/coremark_runner.h"
+
+extern const lv_font_t lv_font_montserrat_12;
 
 /* SD卡测试函数声明 - 来自cmd_sd.c */
 extern int32_t mmc_test_init(uint32_t host_id, void *sdc_param, uint32_t scan);
@@ -48,8 +52,34 @@ extern struct mmc_card *mmc_scan_init(uint16_t sd_id, uint16_t sdc_id, void *car
 OS_Thread_t lvgl_thread;
 static OS_Thread_t disp_task_thread;
 
+/* HTTP对话框和SW1全局引用 */
+static lv_obj_t *g_http_dialog = NULL;
+static lv_obj_t *g_http_dialog_bg = NULL;
+static lv_obj_t *g_net_label = NULL;
+
+/* WiFi/HTTP 状态管理 */
+static uint8_t g_wifi_connected = 0;
+static uint8_t g_http_running = 0;
+static char g_ip_text[32] = "WiFi: OFF";
+static lv_obj_t *g_wifi_icon = NULL;  /* WiFi图标，与Home标题对齐 */
+static OS_Thread_t wifi_connect_thread;  /* WiFi连接后台任务线程 */
+
+/* Settings 页面引用 */
+static lv_obj_t *g_settings_scr = NULL;
+static lv_obj_t *g_settings_wifi_sw = NULL;
+static lv_obj_t *g_settings_http_btn = NULL;
+
+/* 全局样式 - 必须在文件作用域，因为 main_ui_create() 可被多次调用 */
+static lv_style_t style_no_anim;
+static lv_style_t style_sw;
+static lv_style_t style_tile;
+static lv_style_t style_tile_pressed;
+
 /* platform_init声明 */
 extern void platform_init(void);
+
+/* 前向声明 - 解决main_ui_create在定义前被调用的问题 */
+void main_ui_create(void);
 
 /*====================
  * SD卡测试函数
@@ -381,18 +411,298 @@ static void fatfs_filesystem_test(void)
  * - 完美避开了触摸IC高频中断的干扰
  *===================*/
 
-static void switch_event_handler(lv_event_t * e) {
+/* HTTP对话框停止按钮回调 */
+static void http_dialog_stop_cb(lv_event_t *e) {
+    printf("[HTTP_DIALOG] Stop button clicked\n");
+    http_server_stop();
+    g_http_running = 0;
+    
+    /* 关闭对话框 */
+    if (g_http_dialog_bg) {
+        lv_obj_del(g_http_dialog_bg);
+        g_http_dialog_bg = NULL;
+        g_http_dialog = NULL;
+    }
+    
+    epd_mark_refresh_pending();
+}
+
+/* 创建HTTP服务器信息对话框 */
+static void http_dialog_create(const char *ip_str) {
+    if (g_http_dialog_bg) return; /* 已存在 */
+    
+    /* 全屏遮罩 */
+    g_http_dialog_bg = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(g_http_dialog_bg);
+    lv_obj_set_size(g_http_dialog_bg, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(g_http_dialog_bg, 0, 0);
+    lv_obj_set_style_bg_color(g_http_dialog_bg, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_bg_opa(g_http_dialog_bg, LV_OPA_90, 0);
+    
+    /* 对话框容器 */
+    g_http_dialog = lv_obj_create(g_http_dialog_bg);
+    lv_obj_set_size(g_http_dialog, 200, 150);
+    lv_obj_align(g_http_dialog, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(g_http_dialog, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(g_http_dialog, 2, 0);
+    lv_obj_set_style_border_color(g_http_dialog, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(g_http_dialog, 8, 0);
+    lv_obj_clear_flag(g_http_dialog, LV_OBJ_FLAG_SCROLLABLE);
+    
+    /* 标题 */
+    lv_obj_t *dlg_title = lv_label_create(g_http_dialog);
+    lv_label_set_text(dlg_title, "HTTP Server");
+    lv_obj_set_style_text_font(dlg_title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dlg_title, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(dlg_title, LV_ALIGN_TOP_MID, 0, 10);
+    
+    /* IP地址 */
+    lv_obj_t *dlg_ip = lv_label_create(g_http_dialog);
+    char ip_text[64];
+    snprintf(ip_text, sizeof(ip_text), "http://%s", ip_str);
+    lv_label_set_text(dlg_ip, ip_text);
+    lv_obj_set_style_text_font(dlg_ip, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(dlg_ip, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(dlg_ip, LV_ALIGN_CENTER, 0, -10);
+    
+    /* 停止按钮 */
+    lv_obj_t *btn_stop = lv_btn_create(g_http_dialog);
+    lv_obj_set_size(btn_stop, 80, 35);
+    lv_obj_align(btn_stop, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_style_bg_color(btn_stop, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_border_width(btn_stop, 2, 0);
+    lv_obj_set_style_border_color(btn_stop, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(btn_stop, 4, 0);
+    lv_obj_set_style_transition(btn_stop, NULL, LV_PART_MAIN);
+    lv_obj_t *btn_stop_label = lv_label_create(btn_stop);
+    lv_label_set_text(btn_stop_label, "Stop");
+    lv_obj_set_style_text_font(btn_stop_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(btn_stop_label, lv_color_make(255, 255, 255), 0);
+    lv_obj_center(btn_stop_label);
+    lv_obj_add_event_cb(btn_stop, http_dialog_stop_cb, LV_EVENT_CLICKED, NULL);
+    
+    epd_mark_refresh_pending();
+}
+
+/* Settings WiFi开关事件处理 */
+static void settings_wifi_switch_event_handler(lv_event_t * e) {
     lv_event_code_t code = lv_event_get_code(e);
     lv_obj_t * sw = lv_event_get_target(e);
 
     if(code == LV_EVENT_VALUE_CHANGED) {
-        // 打印开关状态和触摸状态
-        TouchState_t touch_state = touch_get_state();
-        printf("[UI] Switch Toggled! State: %s, Touch: %s\n",
-                lv_obj_has_state(sw, LV_STATE_CHECKED) ? "ON" : "OFF",
-                touch_state == TOUCH_STATE_PRESSED ? "PRESSED" :
-                touch_state == TOUCH_STATE_RELEASED ? "RELEASED" : "IDLE");
+        bool is_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
+        printf("[Settings] WiFi Switch Toggled! State: %s\n", is_on ? "ON" : "OFF");
+        
+        if (is_on) {
+            /* 启动WiFi */
+            printf("[Settings] Connecting WiFi...\n");
+            int ret = wlan_manager_connect(WIFI_SSID, WIFI_PASSWD);
+            if (ret == 0) {
+                if (wlan_manager_wait_for_ip(30000) == 0) {
+                    WLAN_IPInfo_t ip_info;
+                    wlan_manager_get_ip_info(&ip_info);
+                    printf("[Settings] WiFi connected! IP: %s\n", ip_info.ip);
+                    
+                    g_wifi_connected = 1;
+                    snprintf(g_ip_text, sizeof(g_ip_text), "IP: %s", ip_info.ip);
+                    
+                    /* 更新首页标签 */
+                    if (g_net_label) {
+                        lv_label_set_text(g_net_label, g_ip_text);
+                    }
+                    
+                    /* 如果在 Settings 页面，显示 HTTP 按钮 */
+                    if (g_settings_scr && g_settings_http_btn) {
+                        lv_obj_clear_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
+                    }
+                } else {
+                    printf("[Settings] WiFi connect timeout!\n");
+                    lv_obj_clear_state(sw, LV_STATE_CHECKED);
+                    g_wifi_connected = 0;
+                }
+            } else {
+                printf("[Settings] WiFi connect failed!\n");
+                lv_obj_clear_state(sw, LV_STATE_CHECKED);
+                g_wifi_connected = 0;
+            }
+        } else {
+            /* 关闭WiFi */
+            printf("[Settings] Disconnecting WiFi...\n");
+            /* 先停止HTTP */
+            if (g_http_running) {
+                http_server_stop();
+                g_http_running = 0;
+                if (g_http_dialog_bg) {
+                    lv_obj_del(g_http_dialog_bg);
+                    g_http_dialog_bg = NULL;
+                    g_http_dialog = NULL;
+                }
+            }
+            wlan_manager_disconnect();
+            g_wifi_connected = 0;
+            snprintf(g_ip_text, sizeof(g_ip_text), "WiFi: OFF");
+            
+            /* 更新首页标签 */
+            if (g_net_label) {
+                lv_label_set_text(g_net_label, g_ip_text);
+            }
+            
+            /* 如果在 Settings 页面，隐藏 HTTP 按钮 */
+            if (g_settings_scr && g_settings_http_btn) {
+                lv_obj_add_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        epd_mark_refresh_pending();
     }
+}
+
+/* Settings HTTP Server按钮事件处理 */
+static void settings_http_btn_event_handler(lv_event_t * e) {
+    printf("[Settings] HTTP Server button clicked\n");
+    
+    if (!g_wifi_connected) {
+        printf("[Settings] WiFi not connected, cannot start HTTP\n");
+        return;
+    }
+    
+    if (g_http_running) {
+        printf("[Settings] HTTP already running\n");
+        return;
+    }
+    
+    /* 启动HTTP服务器（阻塞） */
+    http_server_init(HTTP_SERVER_PORT);
+    if (http_server_start() == 0) {
+        printf("[Settings] HTTP server started!\n");
+        g_http_running = 1;
+        
+        /* 提取 IP 地址显示 */
+        char ip_str[32];
+        WLAN_IPInfo_t ip_info;
+        wlan_manager_get_ip_info(&ip_info);
+        snprintf(ip_str, sizeof(ip_str), "%s", ip_info.ip);
+        
+        /* 弹出对话框 */
+        http_dialog_create(ip_str);
+    } else {
+        printf("[Settings] HTTP start failed!\n");
+    }
+}
+
+/* Settings 返回按钮事件处理 */
+static void settings_back_btn_event_handler(lv_event_t * e) {
+    printf("[Settings] Back to home\n");
+    
+    /* 使用 lv_obj_clean 清空内容，而不是 lv_obj_del 删除屏幕
+     * 避免删除当前活动屏幕后 lv_scr_act() 返回无效指针
+     */
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    
+    /* 清理 Settings 相关指针 */
+    g_settings_scr = NULL;
+    g_settings_wifi_sw = NULL;
+    g_settings_http_btn = NULL;
+    
+    /* 重建首页 */
+    main_ui_create();
+    
+    epd_mark_refresh_pending();
+}
+
+/* Settings 入口按钮事件处理 */
+static void settings_btn_event_handler(lv_event_t * e) {
+    printf("[Settings] Entering Settings page\n");
+    
+    /* 【EPD优化】先暂停刷新，防止刷出半成品UI */
+    epd_pause_refresh();
+    
+    lv_obj_t *scr = lv_scr_act();
+    
+    /* 清屏 */
+    lv_obj_clean(scr);
+    g_settings_scr = scr;
+    
+    /* 应用无动画样式 */
+    lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
+    lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
+    
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "Settings");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(title, 200, 30);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    
+    /* 返回按钮 - 放在标题下方，避免重叠 */
+    lv_obj_t *btn_back = lv_btn_create(scr);
+    lv_obj_set_size(btn_back, 60, 30);
+    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 10, 45);  /* Y=45，在标题下方 */
+    lv_obj_set_style_bg_color(btn_back, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(btn_back, 2, 0);
+    lv_obj_set_style_border_color(btn_back, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(btn_back, 4, 0);
+    lv_obj_set_style_transition(btn_back, NULL, LV_PART_MAIN);
+    lv_obj_t *btn_back_label = lv_label_create(btn_back);
+    lv_label_set_text(btn_back_label, "Back");
+    lv_obj_set_style_text_font(btn_back_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(btn_back_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_center(btn_back_label);
+    lv_obj_add_event_cb(btn_back, settings_back_btn_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    /* WiFi 开关行 - 调整位置到返回按钮下方 */
+    lv_obj_t *wifi_label = lv_label_create(scr);
+    lv_label_set_text(wifi_label, "WiFi");
+    lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(wifi_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_pos(wifi_label, 20, 90);  /* Y=90，在返回按钮下方 */
+    
+    g_settings_wifi_sw = lv_switch_create(scr);
+    lv_obj_set_size(g_settings_wifi_sw, 60, 30);
+    lv_obj_set_pos(g_settings_wifi_sw, 160, 85);  /* Y=85，与WiFi标签对齐 */
+    lv_obj_add_style(g_settings_wifi_sw, &style_sw, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_set_style_transition(g_settings_wifi_sw, NULL, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_add_event_cb(g_settings_wifi_sw, settings_wifi_switch_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
+    
+    /* 同步 WiFi 状态 */
+    if (g_wifi_connected) {
+        lv_obj_add_state(g_settings_wifi_sw, LV_STATE_CHECKED);
+    }
+    
+    /* HTTP Server 按钮（仅 WiFi 连接时显示）- 调整位置 */
+    g_settings_http_btn = lv_btn_create(scr);
+    lv_obj_set_size(g_settings_http_btn, 200, 45);
+    lv_obj_set_pos(g_settings_http_btn, 20, 130);  /* Y=130，在WiFi开关下方 */
+    lv_obj_set_style_bg_color(g_settings_http_btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(g_settings_http_btn, 2, 0);
+    lv_obj_set_style_border_color(g_settings_http_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(g_settings_http_btn, 8, 0);
+    lv_obj_set_style_transition(g_settings_http_btn, NULL, LV_PART_MAIN);
+    
+    lv_obj_t *http_label = lv_label_create(g_settings_http_btn);
+    lv_label_set_text(http_label, LV_SYMBOL_WIFI "  HTTP Server");
+    lv_obj_set_style_text_font(http_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(http_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_center(http_label);
+    
+    lv_obj_add_event_cb(g_settings_http_btn, settings_http_btn_event_handler, LV_EVENT_CLICKED, NULL);
+    
+    /* 根据 WiFi 状态决定是否显示 HTTP 按钮 */
+    if (!g_wifi_connected) {
+        lv_obj_add_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
+    }
+    
+    /* 【EPD优化】恢复刷新，触发一次完整刷新 */
+    epd_resume_refresh();
+    
+    printf("[UI] Settings page created\n");
+}
+
+/* CoreMark按钮事件处理函数 */
+static void coremark_btn_event_handler(lv_event_t * e) {
+    printf("[CoreMark] Button clicked, starting benchmark...\n");
+    coremark_runner_start();
 }
 
 /* 文件管理器按钮事件处理函数 */
@@ -409,6 +719,46 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
     
     // 【EPD优化】FM创建完成后恢复刷新，会自动触发一次完整刷新
     epd_resume_refresh();
+}
+
+static lv_obj_t *create_home_tile(lv_obj_t *parent,
+                                  lv_coord_t x,
+                                  lv_coord_t y,
+                                  lv_coord_t w,
+                                  lv_coord_t h,
+                                  const char *symbol,
+                                  const char *title,
+                                  lv_event_cb_t event_cb)
+{
+    lv_obj_t *tile = lv_btn_create(parent);
+    lv_obj_set_size(tile, w, h);
+    lv_obj_set_pos(tile, x, y);
+    lv_obj_add_style(tile, &style_tile, LV_PART_MAIN | LV_STATE_DEFAULT);
+    lv_obj_add_style(tile, &style_tile_pressed, LV_PART_MAIN | LV_STATE_PRESSED);
+    lv_obj_set_style_transition(tile, NULL, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_transition(tile, NULL, LV_PART_SCROLLBAR | LV_STATE_ANY);
+    lv_obj_clear_flag(tile, LV_OBJ_FLAG_SCROLLABLE);
+
+    if (event_cb) {
+        lv_obj_add_event_cb(tile, event_cb, LV_EVENT_CLICKED, NULL);
+    }
+
+    lv_obj_t *icon = lv_label_create(tile);
+    lv_label_set_text(icon, symbol);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(icon, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
+
+    lv_obj_t *label = lv_label_create(tile);
+    lv_label_set_text(label, title);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_width(label, w - 12);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    return tile;
 }
 
 static void lvgl_task(void *arg) {
@@ -434,6 +784,8 @@ static void disp_task(void *arg) {
     printf("[Display] Task started\r\n");
     
     while (1) {
+        screensaver_task();
+
         /* 处理待刷新的显示 - 检查状态 */
         lv_port_disp_task();
         
@@ -443,6 +795,160 @@ static void disp_task(void *arg) {
         /* 休眠 */
         OS_MSleep(DISP_TASK_PERIOD);
     }
+}
+
+/*====================
+ * WiFi后台连接任务
+ *===================*/
+static void wifi_connect_task(void *arg) {
+    printf("[WiFi_TASK] ========================================\n");
+    printf("[WiFi_TASK] Background WiFi connect task STARTED\n");
+    printf("[WiFi_TASK] SSID: %s, PASSWORD: %s\n", WIFI_SSID, WIFI_PASSWD);
+    printf("[WiFi_TASK] ========================================\n");
+    
+    OS_MSleep(1000);  /* 等待UI完全初始化和EPD刷新完成 */
+    
+    printf("[WiFi_TASK] Now connecting to WiFi...\n");
+    int ret = wlan_manager_connect(WIFI_SSID, WIFI_PASSWD);
+    printf("[WiFi_TASK] wlan_manager_connect returned: %d\n", ret);
+    
+    if (ret == 0) {
+        printf("[WiFi_TASK] Waiting for IP address (timeout 30s)...\n");
+        int wait_ret = wlan_manager_wait_for_ip(30000);
+        printf("[WiFi_TASK] wlan_manager_wait_for_ip returned: %d\n", wait_ret);
+        
+        if (wait_ret == 0) {
+            WLAN_IPInfo_t ip_info;
+            wlan_manager_get_ip_info(&ip_info);
+            printf("[WiFi_TASK] WiFi connected! IP: %s\n", ip_info.ip);
+            
+            g_wifi_connected = 1;
+            snprintf(g_ip_text, sizeof(g_ip_text), "IP: %s", ip_info.ip);
+            
+            /* 更新WiFi图标 - 显示 */
+            if (g_wifi_icon) {
+                lv_label_set_text(g_wifi_icon, LV_SYMBOL_WIFI);
+                printf("[WiFi_TASK] WiFi icon updated to show\n");
+            } else {
+                printf("[WiFi_TASK] WARNING: g_wifi_icon is NULL!\n");
+            }
+            
+            /* 更新首页网络标签 */
+            if (g_net_label) {
+                lv_label_set_text(g_net_label, g_ip_text);
+                printf("[WiFi_TASK] Network label updated\n");
+            }
+            
+            epd_mark_refresh_pending();
+            printf("[WiFi_TASK] EPD refresh marked\n");
+        } else {
+            printf("[WiFi_TASK] WiFi connect TIMEOUT!\n");
+            g_wifi_connected = 0;
+        }
+    } else {
+        printf("[WiFi_TASK] WiFi connect FAILED with error: %d\n", ret);
+        g_wifi_connected = 0;
+    }
+    
+    printf("[WiFi_TASK] Background WiFi connect task FINISHED\n");
+    printf("[WiFi_TASK] ========================================\n");
+    OS_ThreadDelete(&wifi_connect_thread);
+}
+
+/*====================
+ * 主界面创建函数（可被 CoreMark 返回按钮调用重建）
+ *===================*/
+void main_ui_create(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+
+    /* 清屏 */
+    lv_obj_clean(scr);
+
+    /* 初始化全局样式（仅首次） */
+    static int styles_inited = 0;
+    if (!styles_inited) {
+        lv_style_init(&style_no_anim);
+        lv_style_set_anim_time(&style_no_anim, 0);
+        lv_style_set_border_width(&style_no_anim, 0);
+
+        lv_style_init(&style_sw);
+        lv_style_set_border_width(&style_sw, 2);
+        lv_style_set_border_color(&style_sw, lv_color_make(0, 0, 0));
+        lv_style_set_radius(&style_sw, LV_RADIUS_CIRCLE);
+
+        lv_style_init(&style_tile);
+        lv_style_set_radius(&style_tile, 8);
+        lv_style_set_bg_color(&style_tile, lv_color_make(255, 255, 255));
+        lv_style_set_bg_opa(&style_tile, LV_OPA_COVER);
+        lv_style_set_border_width(&style_tile, 2);
+        lv_style_set_border_color(&style_tile, lv_color_make(0, 0, 0));
+        lv_style_set_shadow_width(&style_tile, 0);
+        lv_style_set_outline_width(&style_tile, 0);
+        lv_style_set_pad_all(&style_tile, 0);
+
+        lv_style_init(&style_tile_pressed);
+        lv_style_set_radius(&style_tile_pressed, 8);
+        lv_style_set_bg_color(&style_tile_pressed, lv_color_make(230, 230, 230));
+        lv_style_set_bg_opa(&style_tile_pressed, LV_OPA_COVER);
+        lv_style_set_border_width(&style_tile_pressed, 2);
+        lv_style_set_border_color(&style_tile_pressed, lv_color_make(0, 0, 0));
+        lv_style_set_shadow_width(&style_tile_pressed, 0);
+        lv_style_set_outline_width(&style_tile_pressed, 0);
+
+        styles_inited = 1;
+    }
+
+    lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
+    lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
+
+    /* 标题 */
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "Home");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(title, 200, 30);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    /* WiFi图标 - 与Home标题对齐，初始隐藏 */
+    g_wifi_icon = lv_label_create(scr);
+    lv_label_set_text(g_wifi_icon, "");  /* 初始为空，连接成功后显示WiFi符号 */
+    lv_obj_set_style_text_font(g_wifi_icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_wifi_icon, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(g_wifi_icon, LV_ALIGN_TOP_RIGHT, -10, 10);  /* 与Home标题同一行，右侧对齐 */
+    if (g_wifi_connected) {
+        lv_label_set_text(g_wifi_icon, LV_SYMBOL_WIFI);
+    }
+
+    /* 第一行按钮: Files 和 Settings */
+    create_home_tile(scr, 10, 52, 106, 84,
+                     LV_SYMBOL_DIRECTORY,
+                     "Files",
+                     file_manager_btn_event_handler);
+
+    create_home_tile(scr, 124, 52, 106, 84,
+                     LV_SYMBOL_SETTINGS,
+                     "Settings",
+                     settings_btn_event_handler);
+
+    /* 第二行按钮: CoreMark */
+    create_home_tile(scr, 10, 144, 220, 60,
+                     LV_SYMBOL_CHARGE,
+                     "CoreMark",
+                     coremark_btn_event_handler);
+
+    /* 网络状态标签 */
+    g_net_label = lv_label_create(scr);
+    lv_label_set_text(g_net_label, g_ip_text);
+    lv_obj_set_style_text_font(g_net_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_net_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(g_net_label, 120, 20);
+    lv_obj_align(g_net_label, LV_ALIGN_TOP_RIGHT, -10, 34);
+
+    printf("[UI] Main UI created\n");
+    
+    /* 主界面创建完成后，请求刷新EPD */
+    epd_mark_refresh_pending();
 }
 
 /*====================
@@ -543,213 +1049,17 @@ int main(void)
         printf("[NET ERROR] WLAN init failed!\r\n");
     } else {
         printf("[NET] WLAN initialized\r\n");
-        
-        /* 连接WIFI - 使用定义的SSID和密码 */
-        printf("[NET] Connecting to WiFi: %s\r\n", WIFI_SSID);
-        if (wlan_manager_connect(WIFI_SSID, WIFI_PASSWD) == 0) {
-            /* 等待连接成功获取IP - 30秒超时 */
-            if (wlan_manager_wait_for_ip(30000) == 0) {
-                WLAN_IPInfo_t ip_info;
-                wlan_manager_get_ip_info(&ip_info);
-                printf("[NET] WiFi connected! IP: %s\r\n", ip_info.ip);
-                
-                /* 启动HTTP服务器 */
-                printf("[NET] Starting HTTP server on port %d...\r\n", HTTP_SERVER_PORT);
-                http_server_init(HTTP_SERVER_PORT);
-                if (http_server_start() == 0) {
-                    printf("[NET] HTTP server started!\r\n");
-                    printf("[NET] Access http://%s to manage files\r\n", ip_info.ip);
-                } else {
-                    printf("[NET ERROR] HTTP server start failed!\r\n");
-                }
-            } else {
-                printf("[NET ERROR] Failed to get IP address!\r\n");
-            }
-        } else {
-            printf("[NET ERROR] WiFi connection failed!\r\n");
-        }
+        /* WiFi连接将在后台任务中进行，不阻塞UI启动 */
     }
     printf("\r\n");
     
-    /* 创建演示UI - 控件测试 */
-    
-    /* 优化三：全局关闭LVGL动画 - 消除墨水屏"狂闪" */
-    /*
-     * 通过重写 LVGL 的全局样式，将所有状态切换（按下、聚焦、检查等）的过渡时间强制设为 0
-     * 这样即使触摸 IC 反复触发状态切换，也不会有任何视觉上的位移动画
-     */
-    static lv_style_t style_no_anim;
-    lv_style_init(&style_no_anim);
-    
-    /* 核心：将动画时间参数设为 0 */
-    lv_style_set_anim_time(&style_no_anim, 0);         // 禁用组件内部动画
-    // 【EPD优化】所有按钮按下时无边框变化
-    lv_style_set_border_width(&style_no_anim, 0);
-    
-    lv_obj_t *scr = lv_scr_act();
-    printf("[MAIN] scr=%p\n");
-    
-    /* 针对所有对象（Part Main）在所有状态下应用此样式 */
-    lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
-    lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);  // 白色背景
-    printf("[MAIN] scr styled\n");
-    
-    // 标题
-    printf("[MAIN] Creating title label...\n");
-    lv_obj_t *title = lv_label_create(scr);
-    printf("[MAIN] title=%p created\n", (void*)title);
-    lv_label_set_text(title, "LVGL EPD Controls");
-    lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(title, 200, 30);
-    printf("[MAIN] title set_size(200,30) called\n");
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
-    
-    // 检查title coords
-    lv_area_t title_coords;
-    lv_obj_get_coords(title, &title_coords);
-    printf("[MAIN] title coords: (%d,%d)-(%d,%d), w=%d, h=%d\n",
-           title_coords.x1, title_coords.y1, title_coords.x2, title_coords.y2,
-           title_coords.x2 - title_coords.x1 + 1, title_coords.y2 - title_coords.y1 + 1);
-    
-    // 开关1 - 带标签
-    printf("[MAIN] Creating sw1_label...\n");
-    lv_obj_t *sw1_label = lv_label_create(scr);
-    lv_label_set_text(sw1_label, "Switch 1:");
-    lv_obj_set_style_text_color(sw1_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(sw1_label, 80, 20);
-    lv_obj_align(sw1_label, LV_ALIGN_LEFT_MID, 20, -80);
-    
-    printf("[MAIN] Creating sw1...\n");
-    lv_obj_t *sw1 = lv_switch_create(scr);
-    printf("[MAIN] sw1=%p created\n", (void*)sw1);
-    lv_obj_set_size(sw1, 50, 25);
-    printf("[MAIN] sw1 set_size(50,25) called\n");
-    lv_obj_align(sw1, LV_ALIGN_LEFT_MID, 120, -80);
-    
-    // 检查sw1 coords
-    lv_area_t sw1_coords;
-    lv_obj_get_coords(sw1, &sw1_coords);
-    printf("[MAIN] sw1 coords: (%d,%d)-(%d,%d), w=%d, h=%d\n",
-           sw1_coords.x1, sw1_coords.y1, sw1_coords.x2, sw1_coords.y2,
-           sw1_coords.x2 - sw1_coords.x1 + 1, sw1_coords.y2 - sw1_coords.y1 + 1);
-    lv_obj_add_state(sw1, LV_STATE_CHECKED);  // 默认开启
-    // 开关: 设置边框使开关可见
-    static lv_style_t style_sw;
-    lv_style_init(&style_sw);
-    lv_style_set_border_width(&style_sw, 2);
-    lv_style_set_border_color(&style_sw, lv_color_make(0, 0, 0));  // 黑色边框
-    lv_style_set_radius(&style_sw, LV_RADIUS_CIRCLE);
-    lv_obj_add_style(sw1, &style_sw, LV_PART_MAIN);  // 给主体加边框
-    
-    // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
-   lv_obj_set_style_transition(sw1, NULL, LV_PART_MAIN | LV_STATE_ANY);
-    lv_obj_set_style_transition(sw1, NULL, LV_PART_INDICATOR | LV_STATE_ANY);
-    lv_obj_set_style_transition(sw1, NULL, LV_PART_KNOB | LV_STATE_ANY);
-    
-    // 为sw1添加事件处理
-    lv_obj_add_event_cb(sw1, switch_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
-    
-    // 开关2 - 带标签
-    lv_obj_t *sw2_label = lv_label_create(scr);
-    lv_label_set_text(sw2_label, "Switch 2:");
-    lv_obj_set_style_text_color(sw2_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(sw2_label, 80, 20);
-    lv_obj_align(sw2_label, LV_ALIGN_LEFT_MID, 20, -30);
-    
-    lv_obj_t *sw2 = lv_switch_create(scr);
-    lv_obj_set_size(sw2, 50, 25);
-    lv_obj_align(sw2, LV_ALIGN_LEFT_MID, 120, -30);
-    // sw2 默认关闭状态，不需要特殊设置
-    
-    // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
-    // 对开关的所有 Part 彻底禁用过渡动画
-    lv_obj_set_style_transition(sw2, NULL, LV_PART_MAIN | LV_STATE_ANY);
-    lv_obj_set_style_transition(sw2, NULL, LV_PART_INDICATOR | LV_STATE_ANY);
-    lv_obj_set_style_transition(sw2, NULL, LV_PART_KNOB | LV_STATE_ANY);
-    
-    // 为sw2添加事件处理
-    lv_obj_add_event_cb(sw2, switch_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
-    
-    // 滑块 - 带标签和数值显示
-    lv_obj_t *slider_label = lv_label_create(scr);
-    lv_label_set_text(slider_label, "Slider:");
-    lv_obj_set_style_text_color(slider_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(slider_label, 80, 20);
-    lv_obj_align(slider_label, LV_ALIGN_LEFT_MID, 20, 20);
-    
-    lv_obj_t *slider = lv_slider_create(scr);
-    lv_obj_set_size(slider, 150, 30);
-    lv_obj_align(slider, LV_ALIGN_LEFT_MID, 120, 20);
-    lv_slider_set_range(slider, 0, 100);
-    lv_slider_set_value(slider, 50, LV_ANIM_OFF);
-    
-    // 【真正的精准打击】：必须明确指定 INDICATOR、KNOB 和 MAIN
-    lv_obj_set_style_transition(slider, NULL, LV_PART_INDICATOR);
-    lv_obj_set_style_transition(slider, NULL, LV_PART_KNOB);
-    lv_obj_set_style_transition(slider, NULL, LV_PART_MAIN);
-    
-    // 滑块数值标签
-    lv_obj_t *slider_value = lv_label_create(scr);
-    lv_label_set_text_fmt(slider_value, "%d%%", 50);
-    lv_obj_set_style_text_color(slider_value, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(slider_value, 50, 20);
-    lv_obj_align(slider_value, LV_ALIGN_LEFT_MID, 280, 20);
-    lv_obj_set_style_text_color(slider_value, lv_color_make(0, 0, 0), 0);
-    lv_obj_align(slider_value, LV_ALIGN_LEFT_MID, 280, 20);
-    
-    // 按钮1
-    lv_obj_t *btn1 = lv_btn_create(scr);
-    lv_obj_set_size(btn1, 80, 40);
-    lv_obj_align(btn1, LV_ALIGN_LEFT_MID, 20, 80);
-    lv_obj_t *btn1_label = lv_label_create(btn1);
-    lv_label_set_text(btn1_label, "Button 1");
-    lv_obj_set_style_text_color(btn1_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(btn1_label, 70, 30);
-    
-    // 【真正的精准打击】：按钮也有过渡，关闭它
-    lv_obj_set_style_transition(btn1, NULL, LV_PART_MAIN);
-    lv_obj_set_style_transition(btn1, NULL, LV_PART_SCROLLBAR);
-    
-    // 按钮2
-    lv_obj_t *btn2 = lv_btn_create(scr);
-    lv_obj_set_size(btn2, 80, 40);
-    lv_obj_align(btn2, LV_ALIGN_LEFT_MID, 120, 80);
-    lv_obj_t *btn2_label = lv_label_create(btn2);
-    lv_label_set_text(btn2_label, "Button 2");
-    lv_obj_set_style_text_color(btn2_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(btn2_label, 70, 30);
-    
-    // 【真正的精准打击】：按钮也有过渡，关闭它
-    lv_obj_set_style_transition(btn2, NULL, LV_PART_MAIN);
-    lv_obj_set_style_transition(btn2, NULL, LV_PART_SCROLLBAR);
-    
-    // 文件管理器按钮
-    lv_obj_t *btn_fm = lv_btn_create(scr);
-    lv_obj_set_size(btn_fm, 120, 40);
-    lv_obj_align(btn_fm, LV_ALIGN_LEFT_MID, 20, 130);
-    lv_obj_set_style_transition(btn_fm, NULL, LV_PART_MAIN);
-    lv_obj_set_style_transition(btn_fm, NULL, LV_PART_SCROLLBAR);
-    lv_obj_t *btn_fm_label = lv_label_create(btn_fm);
-    lv_label_set_text(btn_fm_label, "File Manager");
-    lv_obj_set_style_text_color(btn_fm_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(btn_fm_label, 110, 30);
-    lv_obj_add_event_cb(btn_fm, file_manager_btn_event_handler, LV_EVENT_CLICKED, NULL);
-    
-    // 网络状态标签
-    lv_obj_t *net_label = lv_label_create(scr);
-    if (http_server_is_running()) {
-        lv_label_set_text(net_label, "WiFi: ON");
-    } else {
-        lv_label_set_text(net_label, "WiFi: OFF");
-    }
-    lv_obj_set_style_text_color(net_label, lv_color_make(0, 128, 0), 0);
-    lv_obj_set_size(net_label, 100, 20);
-    lv_obj_align(net_label, LV_ALIGN_TOP_RIGHT, -10, 10);
+    /* 创建主界面UI - 先显示UI，WiFi后台连接 */
+    main_ui_create();
+    screensaver_init();
     
     printf("\r\n[OK] LVGL system initialized!\r\n");
-    printf("[INFO] Controls: 2 switches, 1 slider, 3 buttons\r\n");
-    printf("[INFO] Network: %s\r\n\r\n",
-           http_server_is_running() ? "enabled" : "disabled");
+    printf("[INFO] Controls: Files and Settings tiles\r\n");
+    printf("[INFO] WiFi connecting in background...\r\n\r\n");
 
     /* UI创建完毕，启动后台任务 */
     printf("[Display] create disp_task stack=%d\r\n", 8192);
@@ -761,8 +1071,15 @@ int main(void)
         printf("[ERROR] Failed to create disp_task\r\n");
     }
     if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 32768) != 0) {
+                        OS_PRIORITY_NORMAL, 20480) != 0) {
         printf("[ERROR] Failed to create lvgl_task\r\n");
+    }
+
+    /* 启动WiFi后台连接任务 */
+    printf("[WiFi] Starting background WiFi connect task\r\n");
+    if (OS_ThreadCreate(&wifi_connect_thread, "wifi_task", wifi_connect_task, NULL,
+                        OS_PRIORITY_NORMAL, 4096) != 0) {
+        printf("[ERROR] Failed to create wifi_connect_task\r\n");
     }
 
     // 初始化完成，恢复EPD刷新

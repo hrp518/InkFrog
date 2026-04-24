@@ -196,6 +196,7 @@
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/widgets/list/../../layouts/flex/lv_flex.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/widgets/msgbox/lv_msgbox.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/heap_debug.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lv_port_disp.h \
  ../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h \
  ../../../../include/fs/fatfs/ff.h ../../../../include/fs/fatfs/integer.h \
@@ -604,6 +605,8 @@
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/widgets/msgbox/lv_msgbox.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/lvgl/src/extra/widgets/msgbox/../../../lvgl.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/heap_debug.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/lv_port_disp.h:
 

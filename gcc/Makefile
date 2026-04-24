@@ -36,10 +36,13 @@ endif
 # ----------------------------------------------------------------------------
 INCLUDE_PATHS += -I$(PRJ_ROOT_PATH)
 INCLUDE_PATHS += -I$(PRJ_ROOT_PATH)/lvgl/src
+INCLUDE_PATHS += -I$(PRJ_ROOT_PATH)/coremark
 
 DIRS_IGNORE := $(PRJ_ROOT_PATH)/gcc%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/image%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/example%
+DIRS_IGNORE += $(PRJ_ROOT_PATH)/lvgl/demos%
+DIRS_IGNORE += $(PRJ_ROOT_PATH)/lvgl/examples%
 DIRS_IGNORE += $(ROOT_PATH)/project/common/board/%
 DIRS_IGNORE += $(PRJ_BOARD)
 

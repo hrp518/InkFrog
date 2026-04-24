@@ -4,6 +4,9 @@
  ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h \
  ../../../../include/libc/stdio.h \
  ../../../../project/demo/LVGL_withSDandNetwork/http_server.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/screensaver.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h \
+ ../../../../project/demo/LVGL_withSDandNetwork/epd.h \
  ../../../../include/fs/fatfs/ff.h ../../../../include/fs/fatfs/integer.h \
  ../../../../include/fs/fatfs/ffconf.h ../../../../include/kernel/os/os.h \
  ../../../../include/kernel/os/os_time.h \
@@ -42,6 +45,12 @@
 ../../../../include/libc/stdio.h:
 
 ../../../../project/demo/LVGL_withSDandNetwork/http_server.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/screensaver.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h:
+
+../../../../project/demo/LVGL_withSDandNetwork/epd.h:
 
 ../../../../include/fs/fatfs/ff.h:
 
