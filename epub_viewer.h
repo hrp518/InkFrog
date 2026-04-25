@@ -52,6 +52,9 @@ typedef enum {
 /* 章节加载完成回调 */
 typedef void (*epub_chapter_loaded_cb)(int chapter_index, int total_chapters);
 
+/* 关闭回调 - 用于返回文件管理器 */
+typedef void (*epub_close_callback_t)(void);
+
 /*====================
  *   EpubViewer句柄
  *====================*/
@@ -142,6 +145,13 @@ int epub_viewer_get_total_pages(EpubViewer *viewer);
  * @param cb 回调函数
  */
 void epub_viewer_set_chapter_loaded_cb(EpubViewer *viewer, epub_chapter_loaded_cb cb);
+
+/**
+ * @brief 设置关闭回调
+ * @param viewer 视图句柄
+ * @param cb 关闭回调函数（返回文件管理器时调用）
+ */
+void epub_viewer_set_close_cb(EpubViewer *viewer, epub_close_callback_t cb);
 
 /*====================
  *   HTML简化处理函数

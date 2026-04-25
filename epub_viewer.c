@@ -95,6 +95,7 @@ struct EpubViewer {
 
     int current_chapter;
     epub_chapter_loaded_cb chapter_cb;
+    epub_close_callback_t close_cb;  /* 关闭回调 */
 };
 
 /*====================
@@ -932,15 +933,15 @@ static void decode_html_entities(const char *input, char *output, int out_size) 
 
 static void free_page_index(EpubViewer *viewer) {
     if (viewer->page_char_offsets) {
-        _dma_free(viewer->page_char_offsets, 0);
+        _dma_free(viewer->page_char_offsets, DMAHEAP_PSRAM);
         viewer->page_char_offsets = NULL;
     }
     if (viewer->page_start_styles) {
-        _dma_free(viewer->page_start_styles, 0);
+        _dma_free(viewer->page_start_styles, DMAHEAP_PSRAM);
         viewer->page_start_styles = NULL;
     }
     if (viewer->chapter_decoded_cache) {
-        _dma_free(viewer->chapter_decoded_cache, 0);
+        _dma_free(viewer->chapter_decoded_cache, DMAHEAP_PSRAM);
         viewer->chapter_decoded_cache = NULL;
     }
     if (viewer->paginate_timer) {
@@ -2114,6 +2115,7 @@ void epub_viewer_show(EpubViewer *viewer) {
 
 void epub_viewer_close(EpubViewer *viewer) {
     if (!viewer) return;
+    printf("[VIEWER] Closing viewer...\n");
     if (viewer->screen) {
         lv_obj_del_async(viewer->screen);
         viewer->screen = NULL;
@@ -2125,18 +2127,23 @@ void epub_viewer_close(EpubViewer *viewer) {
     viewer->content_container = NULL;
     viewer->title_label = NULL;
     viewer->page_label = NULL;
+    
+    if (viewer->close_cb) {
+        printf("[VIEWER] Calling close callback...\n");
+        viewer->close_cb();
+    }
 }
 
 void epub_viewer_destroy(EpubViewer *viewer) {
     if (viewer) {
         epub_viewer_close(viewer);
         free_page_index(viewer);
-        if (viewer->html_buf) _dma_free(viewer->html_buf, 0);
-        if (viewer->stripped_buf) _dma_free(viewer->stripped_buf, 0);
-        if (viewer->decoded_buf) _dma_free(viewer->decoded_buf, 0);
-        if (viewer->reflowed_buf) _dma_free(viewer->reflowed_buf, 0);
-        if (viewer->page_text_buf) _dma_free(viewer->page_text_buf, 0);
-        _dma_free(viewer, 0);
+        if (viewer->html_buf) _dma_free(viewer->html_buf, DMAHEAP_PSRAM);
+        if (viewer->stripped_buf) _dma_free(viewer->stripped_buf, DMAHEAP_PSRAM);
+        if (viewer->decoded_buf) _dma_free(viewer->decoded_buf, DMAHEAP_PSRAM);
+        if (viewer->reflowed_buf) _dma_free(viewer->reflowed_buf, DMAHEAP_PSRAM);
+        if (viewer->page_text_buf) _dma_free(viewer->page_text_buf, DMAHEAP_PSRAM);
+        _dma_free(viewer, DMAHEAP_PSRAM);
     }
 }
 
@@ -2268,6 +2275,12 @@ int epub_viewer_get_total_pages(EpubViewer *viewer) { return viewer ? viewer->to
 
 void epub_viewer_set_chapter_loaded_cb(EpubViewer *viewer, epub_chapter_loaded_cb cb) {
     if (viewer) viewer->chapter_cb = cb;
+}
+
+void epub_viewer_set_close_cb(EpubViewer *viewer, epub_close_callback_t cb) {
+    if (viewer) {
+        viewer->close_cb = cb;
+    }
 }
 
 /*====================

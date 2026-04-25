@@ -1017,6 +1017,12 @@ int main(void)
     /* 执行FatFs文件系统测试（FatFs内部会初始化SD卡） */
     fatfs_filesystem_test();
     
+    /* 初始化EPUB专用PSRAM缓冲区 */
+    extern void epub_buffer_init(void);
+    printf("[EPUB] Initializing EPUB buffer...\r\n");
+    epub_buffer_init();
+    printf("[EPUB] EPUB buffer initialized\r\n");
+    
     /* 初始化LVGL - lv_port_disp_init()会初始化EPD */
     printf("[MAIN] Step 1: Calling lv_init()...\r\n");
     printf("[MAIN] Calling lv_init()...\r\n");

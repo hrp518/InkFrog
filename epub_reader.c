@@ -17,17 +17,154 @@
 #include "third_party/miniz/miniz.h"
 #include <sys/dma_heap.h>
 
-/* PSRAM 内存劫持：强制 miniz 使用 PSRAM 分配器，避免 SRAM OOM */
-static void* miniz_psram_alloc(void *opaque, size_t items, size_t size) {
-    return _dma_malloc(items * size, DMAHEAP_PSRAM);
+/* ============================================================
+ * EPUB专用PSRAM静态缓冲区
+ * 使用预分配的静态缓冲区，避免动态分配失败和内存碎片
+ * ============================================================ */
+
+/* 分配块头 - 放在每个分配块前面，用于追踪大小 */
+typedef struct __attribute__((packed)) {
+    uint32_t magic;      /* 魔数 0xA55EPUB */
+    uint32_t size;       /* 分配总大小（含头） */
+} alloc_header_t;
+
+#define ALLOC_MAGIC 0xA55E5B5B
+#define EPUB_DECOMP_BUF_SIZE  (128 * 1024)  /* 128KB解压缓冲区 */
+
+static uint8_t *epub_decomp_buffer = NULL;   /* 静态PSRAM缓冲区 */
+static size_t epub_alloc_used = 0;            /* 当前使用量 */
+static bool epub_buffer_initialized = false;  /* 初始化标志 */
+
+/* 初始化EPUB缓冲区（在系统启动时调用一次） */
+void epub_buffer_init(void) {
+    if (epub_buffer_initialized) {
+        printf("[EPUB] Buffer already initialized\n");
+        return;
+    }
+
+    epub_decomp_buffer = (uint8_t *)_dma_malloc(EPUB_DECOMP_BUF_SIZE, DMAHEAP_PSRAM);
+    if (!epub_decomp_buffer) {
+        printf("[EPUB ERR] Failed to allocate PSRAM buffer!\n");
+        return;
+    }
+
+    epub_alloc_used = 0;
+    epub_buffer_initialized = true;
+
+    printf("[EPUB] Buffer allocated at %p, size=%u\n",
+           epub_decomp_buffer, EPUB_DECOMP_BUF_SIZE);
 }
 
-static void miniz_psram_free(void *opaque, void *address) {
-    if (address) _dma_free(address, 0);
+/* 重置缓冲区使用量（在每次章节提取前调用） */
+void epub_buffer_reset(void) {
+    if (!epub_buffer_initialized) {
+        return;
+    }
+
+    printf("[EPUB] Buffer reset, was using %u/%u bytes\n",
+           (unsigned)epub_alloc_used, EPUB_DECOMP_BUF_SIZE);
+
+    epub_alloc_used = 0;
 }
 
-static void* miniz_psram_realloc(void *opaque, void *address, size_t items, size_t size) {
-    return _dma_realloc(address, items * size, DMAHEAP_PSRAM);
+/* 基于静态缓冲区的miniz分配器 */
+static void* miniz_epub_alloc(void *opaque, size_t items, size_t size) {
+    if (!epub_buffer_initialized) {
+        printf("[EPUB ERR] Buffer not initialized!\n");
+        return NULL;
+    }
+
+    size_t total = items * size + sizeof(alloc_header_t);
+    if (epub_alloc_used + total > EPUB_DECOMP_BUF_SIZE) {
+        printf("[EPUB ERR] Static buffer exhausted! used=%u, req=%u, total=%u\n",
+               (unsigned)epub_alloc_used, (unsigned)total, EPUB_DECOMP_BUF_SIZE);
+        return NULL;
+    }
+
+    alloc_header_t *header = (alloc_header_t *)(epub_decomp_buffer + epub_alloc_used);
+    header->magic = ALLOC_MAGIC;
+    header->size = (uint32_t)total;
+
+    void *ptr = (uint8_t *)header + sizeof(alloc_header_t);
+    epub_alloc_used += total;
+
+    printf("[EPUB] alloc: %u bytes at %p (used=%u/%u)\n",
+           (unsigned)(items * size), ptr, (unsigned)epub_alloc_used, EPUB_DECOMP_BUF_SIZE);
+
+    return ptr;
+}
+
+static void miniz_epub_free(void *opaque, void *address) {
+    if (!address) return;
+    printf("[EPUB] free: %p (marked, will reset)\n", address);
+}
+
+static void* miniz_epub_realloc(void *opaque, void *address, size_t items, size_t size) {
+    if (!epub_buffer_initialized) {
+        printf("[EPUB ERR] Buffer not initialized!\n");
+        return NULL;
+    }
+
+    /* 处理空指针情况（等同于malloc） */
+    if (address == NULL) {
+        return miniz_epub_alloc(opaque, items, size);
+    }
+
+    /* 处理大小为0情况（等同于free） */
+    if (items == 0 || size == 0) {
+        miniz_epub_free(opaque, address);
+        return NULL;
+    }
+
+    size_t new_data_size = items * size;
+    size_t new_total = new_data_size + sizeof(alloc_header_t);
+
+    /* 找到原来的分配头 */
+    alloc_header_t *old_header = (alloc_header_t *)((uint8_t *)address - sizeof(alloc_header_t));
+
+    /* 验证魔数 */
+    if (old_header->magic != ALLOC_MAGIC) {
+        printf("[EPUB ERR] Invalid allocation header magic at %p!\n", address);
+        /* 尝试直接分配新块 */
+        return miniz_epub_alloc(opaque, items, size);
+    }
+
+    size_t old_total = old_header->size;
+    size_t old_data_size = old_total - sizeof(alloc_header_t);
+
+    /* 如果新大小小于等于旧大小，直接返回原地址 */
+    if (new_total <= old_total) {
+        printf("[EPUB] realloc: %p unchanged (new %u <= old %u)\n",
+               address, (unsigned)new_data_size, (unsigned)old_data_size);
+        return address;
+    }
+
+    /* 需要扩大：分配新空间并复制旧数据 */
+    if (epub_alloc_used + new_total > EPUB_DECOMP_BUF_SIZE) {
+        printf("[EPUB ERR] Cannot realloc: buffer exhausted! used=%u, req=%u\n",
+               (unsigned)epub_alloc_used, (unsigned)new_total);
+        return NULL;
+    }
+
+    /* 分配新块 */
+    alloc_header_t *new_header = (alloc_header_t *)(epub_decomp_buffer + epub_alloc_used);
+    new_header->magic = ALLOC_MAGIC;
+    new_header->size = (uint32_t)new_total;
+
+    void *new_ptr = (uint8_t *)new_header + sizeof(alloc_header_t);
+    epub_alloc_used += new_total;
+
+    /* 复制旧数据到新位置（关键！） */
+    size_t copy_size = (old_data_size < new_data_size) ? old_data_size : new_data_size;
+    memcpy(new_ptr, address, copy_size);
+
+    printf("[EPUB] realloc: %p -> %p (%u bytes, copied %u)\n",
+           address, new_ptr, (unsigned)new_data_size, (unsigned)copy_size);
+
+    /* 标记旧块为已迁移 */
+    old_header->magic = 0;
+
+    return new_ptr;
 }
 
 #define EPUB_DEBUG 1
@@ -408,10 +545,11 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
     reader->zip_archive.m_pIO_opaque = &reader->archive_fp;
     reader->zip_archive.m_pRead = miniz_fatfs_read_cb;
     
-    /* 【PSRAM 内存劫持】：强制 miniz 使用 PSRAM 分配器，避免 61KB comp_size 缓冲区申请导致 SRAM OOM */
-    reader->zip_archive.m_pAlloc = miniz_psram_alloc;
-    reader->zip_archive.m_pFree = miniz_psram_free;
-    reader->zip_archive.m_pRealloc = miniz_psram_realloc;
+    /* 【静态PSRAM缓冲区】：使用预分配的128KB缓冲区，避免动态分配失败 */
+    epub_buffer_reset();  /* 重置缓冲区使用量 */
+    reader->zip_archive.m_pAlloc = miniz_epub_alloc;
+    reader->zip_archive.m_pFree = miniz_epub_free;
+    reader->zip_archive.m_pRealloc = miniz_epub_realloc;
     
     if (!mz_zip_reader_init(&reader->zip_archive, f_size(&reader->archive_fp), 0)) {
         f_close(&reader->archive_fp);
@@ -560,13 +698,14 @@ void epub_reader_close(EpubReader *reader) {
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         reader->loaded = false;
+        epub_buffer_reset();  /* 重置静态缓冲区，供下次使用 */
     }
 }
 
 void epub_reader_destroy(EpubReader *reader) {
     if (!reader) return;
     epub_reader_close(reader);
-    _dma_free(reader, 0);
+    _dma_free(reader, DMAHEAP_PSRAM);  /* 修复flag参数 */
 }
 
 const char* epub_reader_get_title(EpubReader *reader) { return reader ? reader->book.title : ""; }

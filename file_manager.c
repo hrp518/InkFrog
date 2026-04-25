@@ -118,6 +118,7 @@ static int find_smallest_ttf_font(void);
 static int read_ttf_file_to_psram(void);
 static int ensure_ttf_path_discovered(void);
 static int ensure_reader_font_loaded(void);
+void file_manager_show(void);
 
 /*====================
  *   触摸滑动相关变量（已迁移到lv_port_indev.c驱动层）
@@ -1203,6 +1204,9 @@ static void open_epub_viewer(const char *filepath)
         return;
     }
     
+    /* 设置EPUB关闭回调，返回文件管理器 */
+    epub_viewer_set_close_cb(g_epub_viewer, file_manager_show);
+    
     epub_viewer_show(g_epub_viewer);
     epub_viewer_goto_chapter(g_epub_viewer, 0);
     
@@ -1255,6 +1259,31 @@ void file_manager_close(void)
     epd_mark_refresh_pending();
     
     printf("[FM] File Manager closed\n");
+}
+
+/*====================
+ *   显示文件管理器（从EPUB返回时调用）
+ *====================*/
+
+void file_manager_show(void)
+{
+    printf("[FM] Showing File Manager (return from EPUB)...\n");
+    
+    if (!fm_screen) {
+        printf("[FM] fm_screen is NULL, cannot show\n");
+        return;
+    }
+    
+    /* 重新加载文件管理器屏幕 */
+    lv_disp_load_scr(fm_screen);
+    
+    /* 刷新文件列表 */
+    refresh_file_list(current_path);
+    
+    /* 标记需要刷新 */
+    epd_mark_refresh_pending();
+    
+    printf("[FM] File Manager shown\n");
 }
 
 /*====================
