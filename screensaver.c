@@ -93,15 +93,21 @@ static int screensaver_enter(void)
 
 static void screensaver_exit(void)
 {
-    lv_disp_t *disp = lv_disp_get_default();
-
     printf("[SS] exiting screensaver\n");
+
+    lv_obj_t *scr = lv_scr_act();
+    if (scr) {
+        lv_obj_clean(scr);
+    }
+
     vTaskSuspend(lvgl_thread.handle);
     EPD_3IN52_Init();
     EPD_3IN52_Init_DU();
-    main_ui_create();
     vTaskResume(lvgl_thread.handle);
 
+    main_ui_create();
+
+    lv_disp_t *disp = lv_disp_get_default();
     if (disp) {
         lv_disp_enable_invalidation(disp, true);
         lv_disp_trig_activity(disp);

@@ -678,6 +678,13 @@ static void display_current_page(void)
     
     printf("[FM_PROF] clean_list_start\n");
     lv_obj_clean(fm_list);
+    /* 确保样式一致 - lv_obj_clean可能重置样式 */
+    lv_obj_set_style_pad_row(fm_list, 2, 0);
+    /* 重置列表按钮的默认padding，避免EPUB viewer修改的影响 */
+    lv_obj_set_style_pad_top(fm_list, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(fm_list, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(fm_list, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(fm_list, 0, LV_PART_MAIN);
     printf("[FM_PROF] clean_list_done add_items_start\n");
     
      for (int i = start_idx; i < end_idx; i++) {
@@ -687,13 +694,15 @@ static void display_current_page(void)
          if (entry->is_dir == 0xFF) {
          lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, entry->name);
          epd_disable_all_animations_recursive(btn);
+         /* 只设置必要的边框样式，确保一致性 */
          lv_obj_set_style_border_width(btn, 1, LV_STATE_PRESSED);
          lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUSED);
          lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUS_KEY);
          lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUSED);
          lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUS_KEY);
+         /* FM列表强制使用内置字体，避免TTF字体导致高度变化 */
          lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-         if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
+         if (lbl) lv_obj_set_style_text_font(lbl, &lv_font_misans_16, 0);
          lv_obj_add_event_cb(btn, back_btn_cb, LV_EVENT_CLICKED, NULL);
          continue;
          }
@@ -705,13 +714,15 @@ static void display_current_page(void)
          
          lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, item_text);
         epd_disable_all_animations_recursive(btn);
+        /* 只设置必要的边框样式，确保一致性 */
         lv_obj_set_style_border_width(btn, 1, LV_STATE_PRESSED);
         lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUSED);
         lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUS_KEY);
         lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUSED);
         lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUS_KEY);
+        /* FM列表强制使用内置字体，避免TTF字体导致高度变化 */
         lv_obj_t *lbl = lv_obj_get_child(btn, 0);
-        if (lbl) lv_obj_set_style_text_font(lbl, get_reader_font(), 0);
+        if (lbl) lv_obj_set_style_text_font(lbl, &lv_font_misans_16, 0);
         
         char *path_copy = malloc(strlen(entry->full_path) + 1);
         if (path_copy) {
@@ -728,6 +739,33 @@ static void display_current_page(void)
     
     printf("[FM_PROF] items_added update_indicator_start\n");
     update_page_indicator();
+    
+    /* 强制布局计算后再获取坐标 */
+    lv_obj_update_layout(fm_list);
+    
+    /* 调试信息：打印第一个和最后一个文件元素的位置和数量 */
+    uint32_t child_cnt = lv_obj_get_child_cnt(fm_list);
+    printf("[FM_DBG] Total children in fm_list: %d\n", child_cnt);
+    if (child_cnt > 0) {
+        lv_obj_t *first_child = lv_obj_get_child(fm_list, 0);
+        if (first_child) {
+            lv_area_t coords;
+            lv_obj_get_coords(first_child, &coords);
+            printf("[FM_DBG] First item: x1=%d y1=%d x2=%d y2=%d (w=%d h=%d)\n", 
+                   coords.x1, coords.y1, coords.x2, coords.y2,
+                   coords.x2 - coords.x1 + 1, coords.y2 - coords.y1 + 1);
+        }
+        
+        lv_obj_t *last_child = lv_obj_get_child(fm_list, child_cnt - 1);
+        if (last_child) {
+            lv_area_t coords;
+            lv_obj_get_coords(last_child, &coords);
+            printf("[FM_DBG] Last item: x1=%d y1=%d x2=%d y2=%d (w=%d h=%d)\n", 
+                   coords.x1, coords.y1, coords.x2, coords.y2,
+                   coords.x2 - coords.x1 + 1, coords.y2 - coords.y1 + 1);
+        }
+    }
+    
     printf("[FM_PROF] display_page_done\n");
 }
 
@@ -848,6 +886,13 @@ static void refresh_file_list(const char *dir_path)
     printf("[FM_PROF] entries_loaded\n");
     
     current_page = 0;
+    
+    /* 从EPUB返回时重置列表样式，确保高度一致 */
+    if (fm_list) {
+        lv_obj_set_style_pad_row(fm_list, 2, 0);
+        /* 移除可能导致布局异常的额外padding设置 */
+    }
+    
     display_current_page();
     printf("[FM_PROF] page_displayed\n");
 }
@@ -1274,14 +1319,31 @@ void file_manager_show(void)
         return;
     }
     
+    /* 【重要修复】从EPUB返回时清理全局变量，避免在file_manager_close时再次调用epub相关函数 */
+    if (g_epub_viewer) {
+        printf("[FM] Cleaning up EPUB viewer (return from EPUB)\n");
+        g_epub_viewer = NULL;  /* 清理全局变量，避免重复处理 */
+    }
+    if (g_epub_reader) {
+        printf("[FM] Cleaning up EPUB reader (return from EPUB)\n");
+        g_epub_reader = NULL;  /* 清理全局变量，避免重复处理 */
+    }
+    
     /* 重新加载文件管理器屏幕 */
     lv_disp_load_scr(fm_screen);
     
-    /* 刷新文件列表 */
+    /* 强制重新计算布局和刷新文件列表 - 确保显示一致性 */
     refresh_file_list(current_path);
     
-    /* 标记需要刷新 */
-    epd_mark_refresh_pending();
+    /* 强制重新布局 - 解决显示行数不一致问题 */
+    lv_obj_update_layout(fm_screen);
+    if (fm_list) {
+        lv_obj_update_layout(fm_list);
+    }
+    
+    /* 不手动调用epd_mark_refresh_pending()，让LVGL完成渲染后由flush_cb自动触发刷新 */
+    /* 强制触发LVGL渲染，确保新界面被渲染到帧缓冲区 */
+    lv_refr_now(NULL);
     
     printf("[FM] File Manager shown\n");
 }

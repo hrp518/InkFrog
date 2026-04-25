@@ -2024,7 +2024,12 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_size(back_btn, 50, 30);
     lv_obj_align(back_btn, LV_ALIGN_LEFT_MID, 5, 0);
     lv_obj_set_style_bg_color(back_btn, lv_color_white(), 0);
-    lv_obj_set_style_border_width(back_btn, 1, 0);
+    /* 与FM按钮一致，只在特定状态设置边框，普通状态下不设置边框避免黑框 */
+    lv_obj_set_style_border_width(back_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(back_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(back_btn, 1, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(back_btn, 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(back_btn, 0, LV_STATE_FOCUS_KEY);
     lv_obj_set_user_data(back_btn, viewer);
     lv_obj_add_event_cb(back_btn, close_viewer_cb, LV_EVENT_CLICKED, viewer);
     epd_disable_all_animations_recursive(back_btn);
@@ -2116,6 +2121,14 @@ void epub_viewer_show(EpubViewer *viewer) {
 void epub_viewer_close(EpubViewer *viewer) {
     if (!viewer) return;
     printf("[VIEWER] Closing viewer...\n");
+    
+    /* 停止分页定时器，避免退出后继续计算 */
+    if (viewer->paginate_timer) {
+        lv_timer_del(viewer->paginate_timer);
+        viewer->paginate_timer = NULL;
+        printf("[VIEWER] Paginate timer stopped\n");
+    }
+    
     if (viewer->screen) {
         lv_obj_del_async(viewer->screen);
         viewer->screen = NULL;
@@ -2234,8 +2247,15 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
     lv_obj_t *close_btn = lv_btn_create(viewer->toc_list);
     lv_obj_set_size(close_btn, 50, 30);
     lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -10, 5);
+    /* 与FM按钮一致，只在特定状态设置边框，普通状态下不设置边框避免黑框 */
+    lv_obj_set_style_border_width(close_btn, 1, LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(close_btn, 1, LV_STATE_FOCUSED);
+    lv_obj_set_style_border_width(close_btn, 1, LV_STATE_FOCUS_KEY);
+    lv_obj_set_style_outline_width(close_btn, 0, LV_STATE_FOCUSED);
+    lv_obj_set_style_outline_width(close_btn, 0, LV_STATE_FOCUS_KEY);
     lv_obj_set_user_data(close_btn, viewer);
     lv_obj_add_event_cb(close_btn, toc_btn_close_cb, LV_EVENT_CLICKED, viewer);
+    epd_disable_all_animations_recursive(close_btn);
 
     lv_obj_t *close_label = lv_label_create(close_btn);
     lv_label_set_text(close_label, "关闭");
