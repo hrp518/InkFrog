@@ -1,7 +1,7 @@
-../../../../project/demo/LVGL_withSDandNetwork/command.o: \
- ../../../../project/demo/LVGL_withSDandNetwork/command.c \
+../../../../project/demo/FontExp/command.o: \
+ ../../../../project/demo/FontExp/command.c \
  ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h \
+ ../../../../project/demo/FontExp/prj_config.h \
  ../../../../project/common/cmd/cmd_util.h \
  ../../../../include/sys/param.h \
  ../../../../project/common/cmd/cmd_defs.h \
@@ -85,7 +85,7 @@
 
 ../../../../project/common/prj_conf_opt.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/prj_config.h:
+../../../../project/demo/FontExp/prj_config.h:
 
 ../../../../project/common/cmd/cmd_util.h:
 

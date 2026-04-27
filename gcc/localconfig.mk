@@ -24,4 +24,4 @@ export __CONFIG_PSRAM_ALL_CACHEABLE := y
 export __CONFIG_DMAHEAP_PSRAM_SIZE := 384
 
 # LVGL source path for include
-export PRJ_EXTRA_INCLUDE := -I../../demo/LVGL_withSDandNetwork/lvgl/src -I../../demo/LVGL_withSDandNetwork/third_party/miniz
+export PRJ_EXTRA_INCLUDE := -I../../demo/FontExp/lvgl/src -I../../demo/FontExp/third_party/miniz

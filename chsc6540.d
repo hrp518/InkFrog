@@ -1,7 +1,7 @@
-../../../../project/demo/LVGL_withSDandNetwork/chsc6540.o: \
- ../../../../project/demo/LVGL_withSDandNetwork/chsc6540.c \
+../../../../project/demo/FontExp/chsc6540.o: \
+ ../../../../project/demo/FontExp/chsc6540.c \
  ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h \
+ ../../../../project/demo/FontExp/prj_config.h \
  ../../../../include/libc/stdio.h \
  ../../../../include/driver/chip/hal_gpio.h \
  ../../../../include/driver/chip/hal_def.h \
@@ -19,11 +19,11 @@
  ../../../../include/kernel/os/os_semaphore.h \
  ../../../../include/kernel/os/os_mutex.h \
  ../../../../include/kernel/os/os_timer.h \
- ../../../../project/demo/LVGL_withSDandNetwork/chsc6540.h
+ ../../../../project/demo/FontExp/chsc6540.h
 
 ../../../../project/common/prj_conf_opt.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/prj_config.h:
+../../../../project/demo/FontExp/prj_config.h:
 
 ../../../../include/libc/stdio.h:
 
@@ -61,4 +61,4 @@
 
 ../../../../include/kernel/os/os_timer.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/chsc6540.h:
+../../../../project/demo/FontExp/chsc6540.h:

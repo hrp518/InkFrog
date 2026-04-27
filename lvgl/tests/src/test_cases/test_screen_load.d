@@ -1,8 +1,8 @@
-../../../../project/demo/LVGL_withSDandNetwork/lvgl/tests/src/test_cases/test_screen_load.o: \
- ../../../../project/demo/LVGL_withSDandNetwork/lvgl/tests/src/test_cases/test_screen_load.c \
+../../../../project/demo/FontExp/lvgl/tests/src/test_cases/test_screen_load.o: \
+ ../../../../project/demo/FontExp/lvgl/tests/src/test_cases/test_screen_load.c \
  ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h
+ ../../../../project/demo/FontExp/prj_config.h
 
 ../../../../project/common/prj_conf_opt.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/prj_config.h:
+../../../../project/demo/FontExp/prj_config.h:

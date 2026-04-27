@@ -34,6 +34,7 @@
 #include "http_server.h"
 #include "screensaver.h"
 #include "coremark/coremark_runner.h"
+#include "font_priority_loader.h"
 
 extern const lv_font_t lv_font_montserrat_12;
 

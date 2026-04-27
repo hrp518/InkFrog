@@ -1,7 +1,7 @@
-../../../../project/demo/LVGL_withSDandNetwork/heap_debug.o: \
- ../../../../project/demo/LVGL_withSDandNetwork/heap_debug.c \
+../../../../project/demo/FontExp/heap_debug.o: \
+ ../../../../project/demo/FontExp/heap_debug.c \
  ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h \
+ ../../../../project/demo/FontExp/prj_config.h \
  ../../../../include/libc/stdio.h ../../../../include/sys/dma_heap.h \
  ../../../../include/types.h \
  ../../../../include/driver/chip/psram/psram.h \
@@ -17,7 +17,7 @@
 
 ../../../../project/common/prj_conf_opt.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/prj_config.h:
+../../../../project/demo/FontExp/prj_config.h:
 
 ../../../../include/libc/stdio.h:
 

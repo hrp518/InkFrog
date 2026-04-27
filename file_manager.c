@@ -28,6 +28,7 @@
 /* EPUB阅读器支持 */
 #include "epub_reader.h"
 #include "epub_viewer.h"
+#include "font_priority_loader.h"
 
 extern void main_ui_create(void);
 
@@ -74,11 +75,9 @@ static lv_font_t *custom_ttf_font = NULL;     /* 动态加载的TTF字体 */
 static lv_font_t *custom_ttf_font_h1 = NULL;  /* TTF H1 标题字体 (22px) */
 static lv_font_t *custom_ttf_font_h2 = NULL;  /* TTF H2 标题字体 (20px) */
 static lv_font_t *custom_ttf_font_h3 = NULL;  /* TTF H3 标题字体 (18px) */
-static bool ttf_load_attempted = false;        /* 是否已尝试加载TTF */
-static bool ttf_path_discovered = false;       /* 是否已完成最小TTF发现 */
-static char ttf_file_path[256] = {0};      /* 选中的TTF文件路径 */
-static uint8_t *s_ttf_data = NULL;             /* 缓存TTF文件数据（PSRAM） */
-static size_t s_ttf_data_size = 0;             /* TTF数据大小 */
+static bool ttf_load_attempted = false;
+static bool ttf_path_discovered = false;
+static char ttf_file_path[256] = {0};
 
 #endif
 
@@ -115,7 +114,6 @@ static void next_page_cb(lv_event_t *e);
 static void open_epub_viewer(const char *filepath);
 static void async_open_epub_wrapper(void *arg);
 static int find_smallest_ttf_font(void);
-static int read_ttf_file_to_psram(void);
 static int ensure_ttf_path_discovered(void);
 static int ensure_reader_font_loaded(void);
 void file_manager_show(void);
@@ -1187,17 +1185,17 @@ static int ensure_reader_font_loaded(void)
     ttf_load_attempted = true;
     printf("[FONT] Attempting deferred TTF font load...\n");
     if (ensure_ttf_path_discovered() == 0) {
-        print_memory_stats_internal("before_read_ttf_to_psram");
-        if (read_ttf_file_to_psram() == 0) {
-            print_memory_stats_internal("after_read_ttf_to_psram");
-            printf("[FONT] Loading TTF from PSRAM (size: %u bytes)\n", (unsigned int)s_ttf_data_size);
-            custom_ttf_font = lv_tiny_ttf_create_data_ex(s_ttf_data, s_ttf_data_size, 16, 32768);
-            printf("[FONT] lv_tiny_ttf_create_data_ex returned: %p\n", custom_ttf_font);
-            print_memory_stats_internal("after_create_ttf_font");
-            if (custom_ttf_font != NULL) {
-                custom_ttf_font->fallback = &lv_font_misans_16;
-                return 0;
-            }
+        print_memory_stats_internal("before_create_file_font");
+        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, 16);
+        printf("[FONT] lv_tiny_ttf_create_file_ex returned: %p\n", custom_ttf_font);
+        print_memory_stats_internal("after_create_file_font");
+        if (custom_ttf_font != NULL) {
+            custom_ttf_font->fallback = &lv_font_misans_16;
+            font_priority_loader_init();
+            font_priority_loader_set_font(custom_ttf_font);
+            int loaded = font_priority_loader_preload();
+            printf("[FONT] Level1 preload completed: %d chars\n", loaded);
+            return 0;
         }
     }
     printf("[FONT] Deferred TTF load failed, using built-in fallback\n");
@@ -1509,61 +1507,6 @@ static int find_smallest_ttf_font(void)
  * 
  * @return 成功返回0，失败返回-1
  */
-static int read_ttf_file_to_psram(void)
-{
-    FIL fil;
-    FRESULT res;
-    UINT bytes_read;
-    
-    printf("[FONT] Reading TTF file to PSRAM: %s\n", ttf_file_path);
-    
-    /* 打开TTF文件 */
-    res = f_open(&fil, ttf_file_path, FA_READ);
-    if (res != FR_OK) {
-        printf("[FONT] Failed to open TTF file, error: %d\n", res);
-        return -1;
-    }
-    
-    /* 获取文件大小 */
-    FSIZE_t file_size = f_size(&fil);
-    printf("[FONT] TTF file size: %lu bytes\n", (unsigned long)file_size);
-    
-    /* 在PSRAM中分配内存 */
-    s_ttf_data = (uint8_t *)psram_malloc((size_t)file_size);
-    if (s_ttf_data == NULL) {
-        printf("[FONT] Failed to allocate PSRAM memory for TTF data\n");
-        f_close(&fil);
-        return -1;
-    }
-    
-    /* 读取整个文件到内存 */
-    printf("[FONT] Reading TTF file into memory...\n");
-    res = f_read(&fil, s_ttf_data, (UINT)file_size, &bytes_read);
-    if (res != FR_OK || bytes_read != (UINT)file_size) {
-        printf("[FONT] Failed to read TTF file, error: %d, read: %u/%lu\n", 
-               res, bytes_read, (unsigned long)file_size);
-        free(s_ttf_data);
-        s_ttf_data = NULL;
-        f_close(&fil);
-        return -1;
-    }
-    
-    s_ttf_data_size = (size_t)file_size;
-    printf("[FONT] TTF file successfully read to PSRAM: %u bytes\n", (unsigned int)s_ttf_data_size);
-    
-    f_close(&fil);
-    return 0;
-}
-
-/**
- * @brief 获取字体（支持从SD卡自动加载TTF字体）
- * 
- * 该函数会自动扫描SD卡Font目录下的.ttf文件，
- * 并使用最小的文件作为字体。如果没有找到TTF文件，
- * 则使用编译内置的lv_font_misans_16作为回退。
- * 
- * @return 字体指针
- */
 lv_font_t *get_reader_font(void)
 {
     if (custom_ttf_font != NULL) {
@@ -1584,10 +1527,10 @@ lv_font_t *get_reader_font(void)
 /* 为指定字号创建新的字体对象（复用同一TTF数据） */
 static lv_font_t *create_ttf_font_at_size(lv_coord_t font_size)
 {
-    if (s_ttf_data == NULL || s_ttf_data_size == 0) {
+    if (ttf_file_path[0] == '\0') {
         return NULL;
     }
-    lv_font_t *font = lv_tiny_ttf_create_data_ex(s_ttf_data, s_ttf_data_size, font_size, 65536);
+    lv_font_t *font = lv_tiny_ttf_create_file_ex(ttf_file_path, font_size);
     if (font != NULL) {
         font->fallback = &lv_font_misans_16;
     }
@@ -1609,12 +1552,11 @@ lv_font_t *get_reader_font_h1(void)
     if (custom_ttf_font_h1 != NULL) {
         return custom_ttf_font_h1;
     }
-    /* 确保TTF已加载 */
-    if (s_ttf_data == NULL && !ttf_load_attempted) {
-        get_reader_font();  // 触发TTF加载
+    if (ttf_file_path[0] == '\0' && !ttf_load_attempted) {
+        get_reader_font();
     }
-    if (s_ttf_data == NULL) {
-        return &lv_font_misans_16;  // 无TTF，回退
+    if (ttf_file_path[0] == '\0') {
+        return &lv_font_misans_16;
     }
     custom_ttf_font_h1 = create_ttf_font_at_size(22);
     if (custom_ttf_font_h1 == NULL) {
@@ -1623,16 +1565,15 @@ lv_font_t *get_reader_font_h1(void)
     return custom_ttf_font_h1;
 }
 
-/* H2 标题字体 (20px) */
 lv_font_t *get_reader_font_h2(void)
 {
     if (custom_ttf_font_h2 != NULL) {
         return custom_ttf_font_h2;
     }
-    if (s_ttf_data == NULL && !ttf_load_attempted) {
+    if (ttf_file_path[0] == '\0' && !ttf_load_attempted) {
         get_reader_font();
     }
-    if (s_ttf_data == NULL) {
+    if (ttf_file_path[0] == '\0') {
         return &lv_font_misans_16;
     }
     custom_ttf_font_h2 = create_ttf_font_at_size(20);
@@ -1642,16 +1583,15 @@ lv_font_t *get_reader_font_h2(void)
     return custom_ttf_font_h2;
 }
 
-/* H3 标题字体 (18px) */
 lv_font_t *get_reader_font_h3(void)
 {
     if (custom_ttf_font_h3 != NULL) {
         return custom_ttf_font_h3;
     }
-    if (s_ttf_data == NULL && !ttf_load_attempted) {
+    if (ttf_file_path[0] == '\0' && !ttf_load_attempted) {
         get_reader_font();
     }
-    if (s_ttf_data == NULL) {
+    if (ttf_file_path[0] == '\0') {
         return &lv_font_misans_16;
     }
     custom_ttf_font_h3 = create_ttf_font_at_size(18);

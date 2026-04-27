@@ -1454,12 +1454,12 @@ int http_server_start(void)
     printf("[HTTP] HTTP_RESPONSE_SIZE = %d bytes\r\n", HTTP_RESPONSE_SIZE);
     printf("[HTTP] HTTP_BUF_SIZE = %d bytes\r\n", HTTP_BUF_SIZE);
     printf("[HTTP] HTTP_MAX_PATH = %d bytes\r\n", HTTP_MAX_PATH);
-    printf("[HTTP] Thread stack size = 8192 bytes\r\n");
+    printf("[HTTP] Thread stack size = 6144 bytes\r\n");
     printf("[HTTP] g_http_thread.handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
-    /* Fix: 增大线程栈到8192，避免 /screensaver/upload 路径触发栈溢出 */
+    /* Fix: 增大线程栈到6144，为避免栈溢出同时节省SRAM空间 */
     if (OS_ThreadCreate(&g_http_thread, "http_server",
                         http_server_thread, NULL,
-                        OS_PRIORITY_NORMAL, 8192) != 0) {
+                        OS_PRIORITY_NORMAL, 6144) != 0) {
         HTTP_LOG("Failed to create thread");
         g_http_running = 0;
         return -1;

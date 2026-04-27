@@ -95,26 +95,44 @@ static void screensaver_exit(void)
 {
     printf("[SS] exiting screensaver\n");
 
-    lv_obj_t *scr = lv_scr_act();
+    /* 在挂起LVGL线程之前，先获取当前屏幕对象 */
+    lv_disp_t *disp = lv_disp_get_default();
+    lv_obj_t *scr = NULL;
+    if (disp) {
+        scr = lv_scr_act();
+    }
+
+    /* 恢复LVGL显示能力，但暂时不启用失效，因为我们要先唤醒EPD */
+    if (disp) {
+        lv_disp_enable_invalidation(disp, true);
+    }
+
+    /* 现在挂起LVGL线程进行EPD操作 */
+    vTaskSuspend(lvgl_thread.handle);
+    
+    printf("[SS] Waking EPD from deep sleep...\n");
+    EPD_3IN52_Init();
+    printf("[SS] EPD full init done, now init DU mode...\n");
+    EPD_3IN52_Init_DU();
+    printf("[SS] EPD DU init done\n");
+    
+    vTaskResume(lvgl_thread.handle);
+
+    /* 清理屏幕和创建新UI在LVGL线程运行时进行 */
     if (scr) {
         lv_obj_clean(scr);
     }
 
-    vTaskSuspend(lvgl_thread.handle);
-    EPD_3IN52_Init();
-    EPD_3IN52_Init_DU();
-    vTaskResume(lvgl_thread.handle);
-
     main_ui_create();
 
-    lv_disp_t *disp = lv_disp_get_default();
     if (disp) {
-        lv_disp_enable_invalidation(disp, true);
         lv_disp_trig_activity(disp);
     }
 
     epd_resume_refresh();
-    epd_mark_refresh_pending();
+    
+    printf("[SS] Marking content dirty for full screen refresh after screensaver exit\n");
+    epd_set_content_dirty();
 
     g_ss.active = 0;
     g_ss.swallow_until_release = 1;

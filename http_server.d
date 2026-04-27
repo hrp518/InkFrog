@@ -1,13 +1,13 @@
-../../../../project/demo/LVGL_withSDandNetwork/http_server.o: \
- ../../../../project/demo/LVGL_withSDandNetwork/http_server.c \
+../../../../project/demo/FontExp/http_server.o: \
+ ../../../../project/demo/FontExp/http_server.c \
  ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h \
+ ../../../../project/demo/FontExp/prj_config.h \
  ../../../../include/libc/stdio.h \
- ../../../../project/demo/LVGL_withSDandNetwork/http_server.h \
- ../../../../project/demo/LVGL_withSDandNetwork/screensaver.h \
- ../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h \
- ../../../../project/demo/LVGL_withSDandNetwork/epd.h \
- ../../../../include/fs/fatfs/ff.h ../../../../include/fs/fatfs/integer.h \
+ ../../../../project/demo/FontExp/http_server.h \
+ ../../../../project/demo/FontExp/screensaver.h \
+ ../../../../project/demo/FontExp/lv_port_indev.h \
+ ../../../../project/demo/FontExp/epd.h ../../../../include/fs/fatfs/ff.h \
+ ../../../../include/fs/fatfs/integer.h \
  ../../../../include/fs/fatfs/ffconf.h ../../../../include/kernel/os/os.h \
  ../../../../include/kernel/os/os_time.h \
  ../../../../include/kernel/os/os_common.h ../../../../include/compiler.h \
@@ -40,17 +40,17 @@
 
 ../../../../project/common/prj_conf_opt.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/prj_config.h:
+../../../../project/demo/FontExp/prj_config.h:
 
 ../../../../include/libc/stdio.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/http_server.h:
+../../../../project/demo/FontExp/http_server.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/screensaver.h:
+../../../../project/demo/FontExp/screensaver.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/lv_port_indev.h:
+../../../../project/demo/FontExp/lv_port_indev.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/epd.h:
+../../../../project/demo/FontExp/epd.h:
 
 ../../../../include/fs/fatfs/ff.h:
 

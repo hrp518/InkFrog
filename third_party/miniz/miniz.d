@@ -1,14 +1,14 @@
-../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.o: \
- ../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.c \
+../../../../project/demo/FontExp/third_party/miniz/miniz.o: \
+ ../../../../project/demo/FontExp/third_party/miniz/miniz.c \
  ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/LVGL_withSDandNetwork/prj_config.h \
- ../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.h \
+ ../../../../project/demo/FontExp/prj_config.h \
+ ../../../../project/demo/FontExp/third_party/miniz/miniz.h \
  ../../../../include/libc/stdio.h
 
 ../../../../project/common/prj_conf_opt.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/prj_config.h:
+../../../../project/demo/FontExp/prj_config.h:
 
-../../../../project/demo/LVGL_withSDandNetwork/third_party/miniz/miniz.h:
+../../../../project/demo/FontExp/third_party/miniz/miniz.h:
 
 ../../../../include/libc/stdio.h:
