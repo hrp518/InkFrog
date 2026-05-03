@@ -301,3 +301,7 @@ C:/XR872/bin/bash.exe -lc "cd /home/Administrator/xradio-skylark-sdk-master/proj
 
 ### 问题描述
 SD卡初始化时报
+
+---
+
+## 2026/5/1 21:00 - TTF渲染修复+Decode乱码修复+非CJK字符支持

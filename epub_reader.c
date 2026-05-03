@@ -1,14 +1,5 @@
-/**
- * @file epub_reader.c
- * @brief EPUB文件解析器实现 - 支持超大章节的流式解析方案
- * 
- * 核心改进：
- * - 使用"以磁盘换内存"策略，支持无限大小章节（>256KB甚至数MB）
- * - 利用mz_zip_reader_extract_to_callback流式解压，直接写入SD卡临时文件
- * - 避免将整个章节加载到内存，彻底解决OOM问题
- */
-
 #include "epub_reader.h"
+#include "epub_xhtml_parser.h"
 #include "fs/fatfs/ff.h"
 #include <stdio.h>
 #include <string.h>
@@ -16,156 +7,9 @@
 #include <ctype.h>
 #include "third_party/miniz/miniz.h"
 #include <sys/dma_heap.h>
-
-/* ============================================================
- * EPUB专用PSRAM静态缓冲区
- * 使用预分配的静态缓冲区，避免动态分配失败和内存碎片
- * ============================================================ */
-
-/* 分配块头 - 放在每个分配块前面，用于追踪大小 */
-typedef struct __attribute__((packed)) {
-    uint32_t magic;      /* 魔数 0xA55EPUB */
-    uint32_t size;       /* 分配总大小（含头） */
-} alloc_header_t;
-
-#define ALLOC_MAGIC 0xA55E5B5B
-#define EPUB_DECOMP_BUF_SIZE  (128 * 1024)  /* 128KB解压缓冲区 */
-
-static uint8_t *epub_decomp_buffer = NULL;   /* 静态PSRAM缓冲区 */
-static size_t epub_alloc_used = 0;            /* 当前使用量 */
-static bool epub_buffer_initialized = false;  /* 初始化标志 */
-
-/* 初始化EPUB缓冲区（在系统启动时调用一次） */
-void epub_buffer_init(void) {
-    if (epub_buffer_initialized) {
-        printf("[EPUB] Buffer already initialized\n");
-        return;
-    }
-
-    epub_decomp_buffer = (uint8_t *)_dma_malloc(EPUB_DECOMP_BUF_SIZE, DMAHEAP_PSRAM);
-    if (!epub_decomp_buffer) {
-        printf("[EPUB ERR] Failed to allocate PSRAM buffer!\n");
-        return;
-    }
-
-    epub_alloc_used = 0;
-    epub_buffer_initialized = true;
-
-    printf("[EPUB] Buffer allocated at %p, size=%u\n",
-           epub_decomp_buffer, EPUB_DECOMP_BUF_SIZE);
-}
-
-/* 重置缓冲区使用量（在每次章节提取前调用） */
-void epub_buffer_reset(void) {
-    if (!epub_buffer_initialized) {
-        return;
-    }
-
-    printf("[EPUB] Buffer reset, was using %u/%u bytes\n",
-           (unsigned)epub_alloc_used, EPUB_DECOMP_BUF_SIZE);
-
-    epub_alloc_used = 0;
-}
-
-/* 基于静态缓冲区的miniz分配器 */
-static void* miniz_epub_alloc(void *opaque, size_t items, size_t size) {
-    if (!epub_buffer_initialized) {
-        printf("[EPUB ERR] Buffer not initialized!\n");
-        return NULL;
-    }
-
-    size_t total = items * size + sizeof(alloc_header_t);
-    if (epub_alloc_used + total > EPUB_DECOMP_BUF_SIZE) {
-        printf("[EPUB ERR] Static buffer exhausted! used=%u, req=%u, total=%u\n",
-               (unsigned)epub_alloc_used, (unsigned)total, EPUB_DECOMP_BUF_SIZE);
-        return NULL;
-    }
-
-    alloc_header_t *header = (alloc_header_t *)(epub_decomp_buffer + epub_alloc_used);
-    header->magic = ALLOC_MAGIC;
-    header->size = (uint32_t)total;
-
-    void *ptr = (uint8_t *)header + sizeof(alloc_header_t);
-    epub_alloc_used += total;
-
-    printf("[EPUB] alloc: %u bytes at %p (used=%u/%u)\n",
-           (unsigned)(items * size), ptr, (unsigned)epub_alloc_used, EPUB_DECOMP_BUF_SIZE);
-
-    return ptr;
-}
-
-static void miniz_epub_free(void *opaque, void *address) {
-    if (!address) return;
-    printf("[EPUB] free: %p (marked, will reset)\n", address);
-}
-
-static void* miniz_epub_realloc(void *opaque, void *address, size_t items, size_t size) {
-    if (!epub_buffer_initialized) {
-        printf("[EPUB ERR] Buffer not initialized!\n");
-        return NULL;
-    }
-
-    /* 处理空指针情况（等同于malloc） */
-    if (address == NULL) {
-        return miniz_epub_alloc(opaque, items, size);
-    }
-
-    /* 处理大小为0情况（等同于free） */
-    if (items == 0 || size == 0) {
-        miniz_epub_free(opaque, address);
-        return NULL;
-    }
-
-    size_t new_data_size = items * size;
-    size_t new_total = new_data_size + sizeof(alloc_header_t);
-
-    /* 找到原来的分配头 */
-    alloc_header_t *old_header = (alloc_header_t *)((uint8_t *)address - sizeof(alloc_header_t));
-
-    /* 验证魔数 */
-    if (old_header->magic != ALLOC_MAGIC) {
-        printf("[EPUB ERR] Invalid allocation header magic at %p!\n", address);
-        /* 尝试直接分配新块 */
-        return miniz_epub_alloc(opaque, items, size);
-    }
-
-    size_t old_total = old_header->size;
-    size_t old_data_size = old_total - sizeof(alloc_header_t);
-
-    /* 如果新大小小于等于旧大小，直接返回原地址 */
-    if (new_total <= old_total) {
-        printf("[EPUB] realloc: %p unchanged (new %u <= old %u)\n",
-               address, (unsigned)new_data_size, (unsigned)old_data_size);
-        return address;
-    }
-
-    /* 需要扩大：分配新空间并复制旧数据 */
-    if (epub_alloc_used + new_total > EPUB_DECOMP_BUF_SIZE) {
-        printf("[EPUB ERR] Cannot realloc: buffer exhausted! used=%u, req=%u\n",
-               (unsigned)epub_alloc_used, (unsigned)new_total);
-        return NULL;
-    }
-
-    /* 分配新块 */
-    alloc_header_t *new_header = (alloc_header_t *)(epub_decomp_buffer + epub_alloc_used);
-    new_header->magic = ALLOC_MAGIC;
-    new_header->size = (uint32_t)new_total;
-
-    void *new_ptr = (uint8_t *)new_header + sizeof(alloc_header_t);
-    epub_alloc_used += new_total;
-
-    /* 复制旧数据到新位置（关键！） */
-    size_t copy_size = (old_data_size < new_data_size) ? old_data_size : new_data_size;
-    memcpy(new_ptr, address, copy_size);
-
-    printf("[EPUB] realloc: %p -> %p (%u bytes, copied %u)\n",
-           address, new_ptr, (unsigned)new_data_size, (unsigned)copy_size);
-
-    /* 标记旧块为已迁移 */
-    old_header->magic = 0;
-
-    return new_ptr;
-}
+#include "driver/chip/hal_dcache.h"
+#include "driver/chip/psram/psram.h"
+#include "compiler.h"
 
 #define EPUB_DEBUG 1
 #if EPUB_DEBUG
@@ -176,354 +20,416 @@ static void* miniz_epub_realloc(void *opaque, void *address, size_t items, size_
 #define EPUB_ERR(fmt, ...)
 #endif
 
-/* 流式解析配置 */
-#define EPUB_TEMP_FILE_PATH    "0:/epub_temp.html"  /* 章节临时文件路径 */
-#define EPUB_CHUNK_SIZE        4096                 /* 每次读取的HTML块大小 */
+#define MZ_ZIP_LOCAL_DIR_HEADER_SIZE  30
+#define MZ_ZIP_LOCAL_DIR_HEADER_SIG   0x04034b50
+#define MZ_ZIP_LDH_FILENAME_LEN_OFS   26
+#define MZ_ZIP_LDH_EXTRA_LEN_OFS      28
 
-/*====================
- * 辅助工具与容错函数
- *====================*/
+#define MAX_RAW_ENTRIES 64
 
 typedef struct {
-    const char *xml;
-    int        pos;
-    int        len;
-} XmlParser;
+    char name[256];
+    mz_uint64 local_header_ofs;
+    mz_uint32 uncomp_size;
+    mz_uint32 comp_size;
+    mz_uint16 comp_method;
+} RawZipEntry;
 
-static void xml_init(XmlParser *p, const char *xml, int len) {
-    p->xml = xml;
-    p->pos = 0;
-    p->len = len;
+static __psram_bss RawZipEntry s_raw_entries[MAX_RAW_ENTRIES];
+static int s_raw_count = 0;
+static bool s_raw_built = false;
+
+static void raw_scan_build_index(mz_zip_archive *zip) {
+    if (s_raw_built) return;
+    memset(s_raw_entries, 0, sizeof(s_raw_entries));
+    s_raw_count = 0;
+
+    mz_uint8 header[MZ_ZIP_LOCAL_DIR_HEADER_SIZE];
+    mz_uint64 pos = 0;
+    mz_uint64 archive_size = zip->m_archive_size;
+
+    while (s_raw_count < MAX_RAW_ENTRIES && pos + 30 <= archive_size) {
+        if (zip->m_pRead(zip->m_pIO_opaque, pos, header, MZ_ZIP_LOCAL_DIR_HEADER_SIZE) != MZ_ZIP_LOCAL_DIR_HEADER_SIZE)
+            break;
+
+        if (MZ_READ_LE32(header) != MZ_ZIP_LOCAL_DIR_HEADER_SIG) {
+            pos++;
+            continue;
+        }
+
+        mz_uint16 fn_len = MZ_READ_LE16(header + MZ_ZIP_LDH_FILENAME_LEN_OFS);
+        mz_uint16 extra_len = MZ_READ_LE16(header + MZ_ZIP_LDH_EXTRA_LEN_OFS);
+
+        RawZipEntry *e = &s_raw_entries[s_raw_count];
+        e->local_header_ofs = pos;
+        e->comp_method = MZ_READ_LE16(header + 8);
+        e->comp_size = MZ_READ_LE32(header + 18);
+        e->uncomp_size = MZ_READ_LE32(header + 22);
+
+        if (fn_len > 0 && fn_len < 256) {
+            if (zip->m_pRead(zip->m_pIO_opaque, pos + 30, e->name, fn_len) == fn_len) {
+                e->name[fn_len] = '\0';
+            }
+        }
+        if (e->name[0] == '\0')
+            snprintf(e->name, sizeof(e->name), "__unnamed_%d", s_raw_count);
+
+        s_raw_count++;
+
+        mz_uint32 skip = fn_len + extra_len + e->comp_size;
+        pos += 30 + skip;
+    }
+
+    s_raw_built = true;
+    EPUB_LOG("raw_scan: found %d entries\n", s_raw_count);
 }
 
-static bool xml_find_element(XmlParser *p, const char *element, char *content, int content_size) {
-    char open_tag[64], close_tag[64];
-    snprintf(open_tag, sizeof(open_tag), "<%s", element);
-    snprintf(close_tag, sizeof(close_tag), "</%s>", element);
-    
-    char *start = strstr(p->xml + p->pos, open_tag);
-    if (!start || start > p->xml + p->len) return false;
-    
-    char *tag_end = strchr(start, '>');
-    if (!tag_end) return false;
-    tag_end++;
-    
-    char *end = strstr(tag_end, close_tag);
-    if (!end) return false;
-    
-    int len = end - tag_end;
-    if (len >= content_size) len = content_size - 1;
-    strncpy(content, tag_end, len);
-    content[len] = '\0';
-    
-    p->pos = end - p->xml + strlen(close_tag);
-    return true;
-}
-
-/* 净化URL：处理 %20 解码，并剔除 # 锚点 */
-static void decode_and_clean_href(char *dst, const char *src) {
-    while (*src) {
-        if (*src == '#' || *src == '?') {
-            break; 
-        } else if (*src == '%' && src[1] && src[2]) {
-            char hex[3] = {src[1], src[2], 0};
-            *dst++ = (char)strtol(hex, NULL, 16);
-            src += 3;
-        } else {
-            *dst++ = *src++;
+static int raw_scan_locate_file(mz_zip_archive *zip, const char *target) {
+    raw_scan_build_index(zip);
+    for (int i = 0; i < s_raw_count; i++) {
+        if (strcasecmp(s_raw_entries[i].name, target) == 0) {
+            EPUB_LOG("raw_scan: found '%s' at raw index %d (offset 0x%x)\n",
+                      target, i, (unsigned)(s_raw_entries[i].local_header_ofs));
+            return i;
         }
     }
-    *dst = '\0';
-}
-
-/* 定位ZIP内的文件，优先使用mz_zip_reader_locate_file */
-static int fuzzy_locate_file(mz_zip_archive *zip, const char *target, bool verbose) {
-    /* 首先尝试miniz内置的查找函数，它支持大小写不敏感匹配 */
-    int idx = mz_zip_reader_locate_file(zip, target, NULL, 0);
-    if (idx >= 0) {
-        EPUB_LOG("mz_zip_reader_locate_file found '%s' at index %d\n", target, idx);
-        return idx;
-    }
-    
-    if (verbose) {
-        /* 打印调试信息 */
-        mz_uint num_files = mz_zip_reader_get_num_files(zip);
-        EPUB_LOG("mz_zip_reader_locate_file('%s') returned -1, scanning %u files in ZIP:\n",
-                 target, (unsigned)num_files);
-        
-        /* 遍历检查每个文件名 */
-        for (mz_uint i = 0; i < num_files && i < 30; i++) {
-            char filename_buf[256] = {0};
-            mz_zip_reader_get_filename(zip, i, filename_buf, sizeof(filename_buf));
-            EPUB_LOG("  [%u]: '%s'\n", i, filename_buf);
-        }
-    }
-    
     return -1;
 }
 
-/*====================
- * DMA 跳板缓冲机制
- * 解决 SPI DMA 无法直接读写 PSRAM 的硬件限制
- *====================*/
+typedef struct {
+    uint8_t *dst;       
+    size_t remaining;   
+} InflateCtx;
 
-/**
- * @brief miniz 从 ZIP 读取数据的回调
- * @param pOpaque 指向打开的 FIL 文件指针
- * @param file_ofs 当前读取位置（字节偏移）
- * @param pBuf miniz 提供的缓冲区（可能在 PSRAM）
- * @param n 要读取的字节数
- * @return 实际读取的字节数，0 表示失败
- *
- * 使用 512 字节栈数组作为跳板，零碎片、零分配失败：
- * SD卡(DMA) -> SRAM bounce_buf -> memcpy -> PSRAM pBuf
- */
+static size_t inflate_write_cb(const void *pBuf, size_t len, void *pUser) {
+    InflateCtx *ctx = (InflateCtx *)pUser;
+    size_t copy = (len < ctx->remaining) ? len : ctx->remaining;
+    memcpy(ctx->dst, pBuf, copy);
+    ctx->dst += copy;
+    ctx->remaining -= copy;
+    return copy;
+}
+
+static bool extract_raw_deflate_psram(const uint8_t *comp_buf, size_t comp_size,
+                                       void *buf, mz_uint buf_size, mz_uint *out_size) {
+    uint32_t buf_addr = (uint32_t)(uintptr_t)buf;
+    bool is_psram = (buf_addr >= PSRAM_START_ADDR && buf_addr + buf_size <= PSRAM_END_ADDR + 1);
+
+    EPUB_LOG("[INFLATE] comp=%p(%u) out=%p(%u) out_range=0x%x-0x%x is_psram=%d\n",
+             comp_buf, comp_size, buf, buf_size,
+             buf_addr, buf_addr + buf_size - 1, is_psram);
+
+    /* Use tinfl_decompress_mem_to_callback: allocates internal 32KB SRAM dict buffer
+     * for LZ77 sliding window. Callback copies decompressed chunks to final output.
+     * This avoids PSRAM write-through cache coherency issue: all dict read/write
+     * happens in SRAM, output is write-only from CPU perspective. */
+    InflateCtx ctx;
+    ctx.dst = (uint8_t *)buf;
+    ctx.remaining = buf_size;
+
+    size_t in_consumed = comp_size;
+    int ret = tinfl_decompress_mem_to_callback(
+        comp_buf, &in_consumed,
+        inflate_write_cb, &ctx,
+        0);
+
+    if (ret) {
+        *out_size = (mz_uint)(buf_size - ctx.remaining);
+
+        if (is_psram) {
+            HAL_Dcache_Clean(buf_addr, *out_size);
+        }
+
+        {
+            mz_uint32 crc = mz_crc32(0, (const mz_uint8 *)buf, *out_size);
+            EPUB_LOG("[INFLATE] OK: comp=%u -> uncomp=%u crc32=0x%08x\n",
+                     comp_size, *out_size, crc);
+            EPUB_LOG("[INFLATE] out[0..47]: ");
+            for (int i = 0; i < 48 && i < (int)*out_size; i++)
+                printf("%02x ", ((uint8_t *)buf)[i]);
+            printf("\n");
+        }
+        return true;
+    }
+
+    EPUB_ERR("[INFLATE] FAILED: ret=%d (comp=%u buf=%u consumed=%u)\n",
+             ret, comp_size, buf_size, (unsigned)(comp_size - in_consumed));
+    return false;
+}
+
+static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *buf, mz_uint buf_size, mz_uint *out_size) {
+    if (raw_idx < 0 || raw_idx >= s_raw_count) return false;
+    RawZipEntry *e = &s_raw_entries[raw_idx];
+
+    mz_uint8 header[MZ_ZIP_LOCAL_DIR_HEADER_SIZE];
+    if (zip->m_pRead(zip->m_pIO_opaque, e->local_header_ofs, header, MZ_ZIP_LOCAL_DIR_HEADER_SIZE) != MZ_ZIP_LOCAL_DIR_HEADER_SIZE)
+        return false;
+    if (MZ_READ_LE32(header) != MZ_ZIP_LOCAL_DIR_HEADER_SIG) return false;
+
+    mz_uint16 fn_len = MZ_READ_LE16(header + MZ_ZIP_LDH_FILENAME_LEN_OFS);
+    mz_uint16 extra_len = MZ_READ_LE16(header + MZ_ZIP_LDH_EXTRA_LEN_OFS);
+    mz_uint16 comp_method = MZ_READ_LE16(header + 8);
+    mz_uint32 comp_size = MZ_READ_LE32(header + 18);
+    mz_uint32 uncomp_size = MZ_READ_LE32(header + 22);
+
+    mz_uint data_ofs = (mz_uint)(e->local_header_ofs + 30 + fn_len + extra_len);
+
+    if (uncomp_size == 0) uncomp_size = e->uncomp_size;
+    if (comp_size == 0) comp_size = e->comp_size;
+
+    EPUB_LOG("extract_at_raw[%d]: ofs=0x%x fn_len=%u extra=%u data_ofs=0x%x comp=%u uncomp=%u\n",
+              raw_idx, (unsigned)e->local_header_ofs, (unsigned)fn_len, (unsigned)extra_len,
+              (unsigned)data_ofs, (unsigned)comp_size, (unsigned)uncomp_size);
+
+    if (uncomp_size > buf_size) {
+        EPUB_ERR("extract_at_raw: buffer too small (%u > %u)\n", (unsigned)uncomp_size, (unsigned)buf_size);
+        return false;
+    }
+
+    uint8_t *comp_buf = (uint8_t *)_dma_malloc((size_t)comp_size, DMAHEAP_PSRAM);
+    if (!comp_buf) return false;
+
+    if (zip->m_pRead(zip->m_pIO_opaque, data_ofs, comp_buf, comp_size) != comp_size) {
+        _dma_free(comp_buf, DMAHEAP_PSRAM);
+        return false;
+    }
+    HAL_Dcache_Flush((uint32_t)comp_buf, comp_size);
+
+    /* DEBUG: verify compressed data CRC */
+    {
+        mz_uint32 crc = mz_crc32(0, comp_buf, (size_t)comp_size);
+        EPUB_LOG("comp_buf[%d] crc32=0x%08x\n", raw_idx, (unsigned)crc);
+    }
+
+    bool ok = false;
+    if (comp_method == 0) {
+        memcpy(buf, comp_buf, uncomp_size);
+        *out_size = uncomp_size;
+        ok = true;
+    } else if (comp_method == 8) {
+        ok = extract_raw_deflate_psram(comp_buf, (size_t)comp_size, buf, buf_size, out_size);
+    } else {
+        EPUB_ERR("extract_at_raw: unsupported compression method %u\n", (unsigned)comp_method);
+    }
+
+    _dma_free(comp_buf, DMAHEAP_PSRAM);
+    return ok;
+}
+
 static size_t miniz_fatfs_read_cb(void *pOpaque, mz_uint64 file_ofs, void *pBuf, size_t n) {
     FIL *fp = (FIL *)pOpaque;
-    if (!fp) {
-        EPUB_ERR("miniz_fatfs_read_cb: fp is NULL!\n");
-        return 0;
-    }
-    if (f_lseek(fp, (FSIZE_t)file_ofs) != FR_OK) {
-        EPUB_ERR("miniz_fatfs_read_cb: f_lseek failed at ofs %llu\n",
-                 (unsigned long long)file_ofs);
-        return 0;
-    }
-    
-    size_t bytes_read = 0;
-    char bounce_buf[512]; /* 512字节栈跳板，零碎片，DMA绝对安全 */
-    
-    while (n > 0) {
-        size_t to_read = (n > sizeof(bounce_buf)) ? sizeof(bounce_buf) : n;
-        UINT br = 0;
-        FRESULT res = f_read(fp, bounce_buf, (UINT)to_read, &br);
-        if (res != FR_OK) {
-            EPUB_ERR("miniz_fatfs_read_cb: f_read failed, res=%d, to_read=%u\n",
-                     res, (unsigned)to_read);
-            break;
-        }
-        if (br == 0) {
-            EPUB_ERR("miniz_fatfs_read_cb: br=0 at ofs %llu, n=%u, read %u so far\n",
-                     (unsigned long long)file_ofs, (unsigned)n, (unsigned)bytes_read);
-            break;
-        }
-        
-        memcpy((uint8_t*)pBuf + bytes_read, bounce_buf, br);
-        bytes_read += br;
-        n -= br;
-    }
-    
-    if (bytes_read > 0) {
-        EPUB_LOG("miniz_fatfs_read_cb: read %u bytes at ofs %llu\n",
-                 (unsigned)bytes_read, (unsigned long long)file_ofs);
-    }
-    
-    return bytes_read;
+    if (!fp) return 0;
+    if (f_lseek(fp, (FSIZE_t)file_ofs) != FR_OK) return 0;
+    UINT br = 0;
+    if (f_read(fp, pBuf, (UINT)n, &br) != FR_OK) return 0;
+    return br;
 }
 
-/**
- * @brief miniz 流式解压写入 FatFs 的回调
- * @param pOpaque 指向打开的 FIL 文件指针
- * @param file_ofs 当前写入位置（字节偏移）
- * @param pBuf 解压数据缓冲区（可能在 PSRAM）
- * @param n 本次回调要写入的数据大小
- * @return 实际写入的字节数，0 表示失败
- *
- * 使用 512 字节栈数组作为跳板：
- * PSRAM pBuf -> memcpy -> SRAM bounce_buf -> SD卡(DMA)
- */
-static size_t miniz_extract_to_fatfs_cb(void *pOpaque, mz_uint64 file_ofs, const void *pBuf, size_t n) {
-    FIL *fp = (FIL *)pOpaque;
-    if (!fp) {
-        EPUB_ERR("miniz_extract_to_fatfs_cb: fp is NULL!\n");
-        return 0;
-    }
-    
-    size_t bytes_written = 0;
-    char bounce_buf[512]; /* 512字节栈跳板 */
-    
-    while (n > 0) {
-        size_t to_write = (n > sizeof(bounce_buf)) ? sizeof(bounce_buf) : n;
-        
-        memcpy(bounce_buf, (const uint8_t*)pBuf + bytes_written, to_write);
-        
-        UINT bw = 0;
-        FRESULT res = f_write(fp, bounce_buf, (UINT)to_write, &bw);
-        if (res != FR_OK) {
-            EPUB_ERR("miniz_extract_to_fatfs_cb: f_write failed, res=%d, to_write=%u, bw=%u\n",
-                     res, (unsigned)to_write, (unsigned)bw);
-            break;
-        }
-        if (bw == 0) {
-            EPUB_ERR("miniz_extract_to_fatfs_cb: bw=0, wrote %u bytes so far\n", (unsigned)bytes_written);
-            break;
-        }
-        
-        bytes_written += bw;
-        n -= bw;
-    }
-    
-    if (bytes_written > 0 && n == 0) {
-        EPUB_LOG("miniz_extract_to_fatfs_cb: wrote %u bytes at ofs %llu\n",
-                 (unsigned)bytes_written, (unsigned long long)file_ofs);
-    }
-    
-    return bytes_written;
+static void *miniz_psram_alloc(void *opaque, size_t items, size_t size) {
+    (void)opaque;
+    return _dma_malloc(items * size, DMAHEAP_PSRAM);
 }
 
-/**
- * @brief 将章节流式解压到SD卡临时文件
- * @param reader EPUB阅读器
- * @param chapter_index 章节索引
- * @param temp_file_path 临时文件路径
- * @return 解压后字节数（>0成功），-1失败
- *
- * 核心思想：利用mz_zip_reader_extract_to_callback边解压边写入SD卡，
- * 内存占用只有几KB（回调缓冲区），彻底解决大章节OOM问题。
- */
-int epub_reader_extract_chapter_to_file(EpubReader *reader, int chapter_index, const char *temp_file_path) {
-    if (!reader || !reader->loaded) return -1;
-    if (chapter_index < 0 || chapter_index >= reader->spine_count) return -1;
-    
-    EPUB_LOG("Extracting chapter %d to temp file: %s\n", chapter_index, temp_file_path);
-    
-    /* 定位ZIP内的文件 */
-    int file_index = fuzzy_locate_file(&reader->zip_archive, reader->spine[chapter_index].href, true);
-    if (file_index < 0) {
-        EPUB_ERR("Failed to locate chapter file: %s\n", reader->spine[chapter_index].href);
-        return -1;
+static void miniz_psram_free(void *opaque, void *address) {
+    (void)opaque;
+    if (address) _dma_free(address, DMAHEAP_PSRAM);
+}
+
+static void *miniz_psram_realloc(void *opaque, void *address, size_t items, size_t size) {
+    (void)opaque;
+    void *newp = _dma_malloc(items * size, DMAHEAP_PSRAM);
+    if (newp && address) {
+        memcpy(newp, address, items * size);
+        _dma_free(address, DMAHEAP_PSRAM);
     }
-    
-    /* 获取文件信息 */
-    mz_zip_archive_file_stat stat;
-    if (!mz_zip_reader_file_stat(&reader->zip_archive, file_index, &stat)) {
-        EPUB_ERR("Failed to get file stat\n");
-        return -1;
+    return newp;
+}
+
+static int fuzzy_locate_file(mz_zip_archive *zip, const char *target, bool verbose) {
+    int raw_idx = raw_scan_locate_file(zip, target);
+    if (raw_idx >= 0) {
+        EPUB_LOG("Located '%s' via raw scan at raw_idx %d\n", target, raw_idx);
+        return -2 - raw_idx;
     }
-    
-    EPUB_LOG("Chapter file: comp_size=%u, uncomp_size=%u\n",
-             (unsigned)stat.m_comp_size, (unsigned)stat.m_uncomp_size);
-    
-    /* 打开临时文件进行写入 */
-    FIL temp_fp;
-    FRESULT res = f_open(&temp_fp, temp_file_path, FA_WRITE | FA_CREATE_ALWAYS);
-    if (res != FR_OK) {
-        EPUB_ERR("Failed to create temp file: %d\n", res);
-        return -1;
+
+    if (verbose) {
+        EPUB_LOG("Failed to locate '%s' in ZIP\n", target);
     }
-    
-    /* 流式解压，不再消耗大块内存
-     * mz_zip_reader_extract_to_callback会多次调用miniz_extract_to_fatfs_cb，
-     * 每次只传递一小块数据（通常4KB-32KB），内存占用恒定 */
-    mz_bool result = mz_zip_reader_extract_to_callback(
-        &reader->zip_archive,
-        file_index,
-        miniz_extract_to_fatfs_cb,
-        &temp_fp,
-        0  /* flags */
-    );
-    
-    /* 【关键修复点】：在关闭文件前，利用 FatFs 的 f_size 探针获取我们实际写入了多少字节 */
-    FSIZE_t extracted_size = f_size(&temp_fp);
-    f_close(&temp_fp);
-    
-    if (!result) {
-        /* 容错防御机制：如果 miniz 报错，但实际解压出的文件大小和预期完全一致，
-         * 说明仅仅是 ZIP 头部的 CRC 校验和不匹配（很多 EPUB 都会这样）。直接忽略该错误放行。 */
-        if (extracted_size > 0 && extracted_size == stat.m_uncomp_size) {
-            EPUB_LOG("Warning: CRC mismatch ignored. File size perfectly matches expected %u bytes.\n",
-                     (unsigned)extracted_size);
-        } else {
-            EPUB_ERR("mz_zip_reader_extract_to_callback failed (size %u != expected %u)\n",
-                     (unsigned)extracted_size, (unsigned)stat.m_uncomp_size);
-            /* 只有大小真的对不上时，才认为解压失败，删除不完整的文件 */
-            f_unlink(temp_file_path);
-            return -1;
-        }
-    }
-    
-    EPUB_LOG("Chapter %d extracted to temp file successfully (%u bytes)\n", chapter_index, (unsigned)extracted_size);
-    return (int)extracted_size;
+    return -1;
 }
 
 static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t *out_size) {
-    EPUB_LOG("Extracting from ZIP: %s\n", filename);
-    
-    /* 使用 verbose 模式打印错误信息 */
     int file_index = fuzzy_locate_file(&reader->zip_archive, filename, true);
-    if (file_index < 0) {
+    if (file_index == -1) {
         EPUB_ERR("Failed to locate file in ZIP: %s\n", filename);
         return NULL;
     }
-    
-    mz_zip_archive_file_stat stat;
-    if (!mz_zip_reader_file_stat(&reader->zip_archive, file_index, &stat)) {
-        EPUB_ERR("Failed to get file stat for: %s\n", filename);
-        return NULL;
-    }
-    
-    EPUB_LOG("File info: comp_size=%u, uncomp_size=%u, is_encrypted=%d\n",
-             (unsigned)stat.m_comp_size, (unsigned)stat.m_uncomp_size, stat.m_is_encrypted);
-    
-    /* 检查文件是否加密或不支持的压缩格式 */
-    if (stat.m_is_encrypted) {
-        EPUB_ERR("File is encrypted, not supported: %s\n", filename);
-        return NULL;
-    }
-    
-    /* 使用 MZ_ZIP_FLAG_CASE_SENSITIVE 避免模糊匹配问题 */
-    mz_uint flags = MZ_ZIP_FLAG_CASE_SENSITIVE;
-    
-    /* 分配解压缓冲区 - 使用 PSRAM（CPU解压不走DMA，放PSRAM安全且省SRAM） */
-    char *buf = (char *)_dma_malloc(stat.m_uncomp_size + 1, DMAHEAP_PSRAM);
+
+    int raw_idx = -file_index - 2;
+    RawZipEntry *e = &s_raw_entries[raw_idx];
+    char *buf = (char *)malloc(e->uncomp_size + 1);
     if (!buf) {
-        EPUB_ERR("Memory allocation failed for extracting: %s (need %u bytes)\n",
-                 filename, (unsigned)(stat.m_uncomp_size + 1));
+        EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
+                 filename, (unsigned)(e->uncomp_size + 1));
         return NULL;
     }
-    memset(buf, 0, stat.m_uncomp_size + 1);
-    
-    EPUB_LOG("Calling mz_zip_reader_extract_to_mem...\n");
-    
-    /* 使用MZ_ZIP_FLAG_DO_NOT_SCAN_CENTRAL_HEADER避免扫描问题 */
-    if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, buf, stat.m_uncomp_size, flags)) {
-        EPUB_ERR("mz_zip_reader_extract_to_mem failed for: %s\n", filename);
-        _dma_free(buf, 0);
-        return NULL;
+    memset(buf, 0, e->uncomp_size + 1);
+    mz_uint extracted_size = 0;
+    if (extract_file_at_raw_offset(&reader->zip_archive, raw_idx, buf, e->uncomp_size, &extracted_size)) {
+        buf[extracted_size] = '\0';
+        *out_size = extracted_size;
+        EPUB_LOG("Extracted '%s' via raw scan (%u bytes)\n", filename, (unsigned)extracted_size);
+        return buf;
     }
-    
-    buf[stat.m_uncomp_size] = '\0';
-    *out_size = stat.m_uncomp_size;
-    
-    EPUB_LOG("Successfully extracted %u bytes from %s\n", (unsigned)*out_size, filename);
-    return buf;
+    EPUB_ERR("Raw extraction failed for: %s\n", filename);
+    free(buf);
+    return NULL;
 }
 
-static bool parse_container_xml(const char *xml_data, int xml_size, char *content_opf_path) {
-    XmlParser parser;
-    xml_init(&parser, xml_data, xml_size);
-    char *start = strstr(parser.xml, "rootfile");
-    if (!start) return false;
-    char *path_start = strstr(start, "full-path=\"");
-    if (!path_start) return false;
-    
-    path_start += 11;
-    char *path_end = strchr(path_start, '"');
-    if (!path_end) return false;
-    
-    int path_len = path_end - path_start;
-    if (path_len >= 256) path_len = 255;
-    strncpy(content_opf_path, path_start, path_len);
-    content_opf_path[path_len] = '\0';
-    return true;
+struct container_parse_ctx {
+    char *opf_path;
+    int opf_path_size;
+    bool found;
+};
+
+static void container_start_cb(const char *name, const char **atts, void *user_data) {
+    struct container_parse_ctx *ctx = (struct container_parse_ctx *)user_data;
+    if (ctx->found) return;
+    if (strcmp(name, "rootfile") == 0) {
+        for (int i = 0; atts && atts[i]; i += 2) {
+            if (strcmp(atts[i], "full-path") == 0) {
+                strncpy(ctx->opf_path, atts[i + 1], ctx->opf_path_size - 1);
+                ctx->opf_path[ctx->opf_path_size - 1] = '\0';
+                ctx->found = true;
+                break;
+            }
+        }
+    }
 }
 
-/*====================
- * 公共API
- *====================*/
+static bool parse_container_xml_with_expat(const char *data, int size, char *opf_path, int opf_path_size) {
+    XhtmlParser *parser = xhtml_parser_create();
+    if (!parser) return false;
+
+    struct container_parse_ctx ctx;
+    ctx.opf_path = opf_path;
+    ctx.opf_path_size = opf_path_size;
+    ctx.found = false;
+
+    xhtml_parser_set_callbacks(parser, container_start_cb, NULL, NULL, &ctx);
+    bool ok = xhtml_parser_parse(parser, data, size);
+    xhtml_parser_destroy(parser);
+    return ok && ctx.found;
+}
+
+struct opf_parse_ctx {
+    char *title;
+    int title_size;
+    bool in_title;
+    bool title_done;
+
+    char base_path[256];
+
+    EpubSpineItem *spine;
+    int *spine_count;
+    int max_spine;
+
+    mz_zip_archive *zip;
+    bool verbose;
+};
+
+static void opf_start_cb(const char *name, const char **atts, void *user_data) {
+    struct opf_parse_ctx *ctx = (struct opf_parse_ctx *)user_data;
+
+    if (strcmp(name, "dc:title") == 0 || strcmp(name, "title") == 0) {
+        if (!ctx->title_done) {
+            ctx->in_title = true;
+        }
+        return;
+    }
+
+    if (strcmp(name, "item") == 0) {
+        char href[256] = {0};
+        char media_type[64] = {0};
+        for (int i = 0; atts && atts[i]; i += 2) {
+            if (strcmp(atts[i], "href") == 0) {
+                strncpy(href, atts[i + 1], sizeof(href) - 1);
+            } else if (strcmp(atts[i], "media-type") == 0) {
+                strncpy(media_type, atts[i + 1], sizeof(media_type) - 1);
+            }
+        }
+        if (href[0] && (strstr(media_type, "xhtml+xml") || strstr(media_type, "text/html"))) {
+            if (strstr(href, ".ncx") || strstr(href, "nav.xhtml") ||
+                strstr(href, "/cover.") || strstr(href, "title_page") ||
+                strstr(href, "titlepage") || strstr(href, ".css")) {
+                return;
+            }
+            if (*ctx->spine_count >= ctx->max_spine) return;
+            char full_href[256];
+            if (ctx->base_path[0]) {
+                snprintf(full_href, sizeof(full_href), "%s/%s", ctx->base_path, href);
+            } else {
+                strncpy(full_href, href, sizeof(full_href) - 1);
+            }
+            int idx = fuzzy_locate_file(ctx->zip, full_href, false);
+            if (idx != -1) {
+                strncpy(ctx->spine[*ctx->spine_count].href, full_href,
+                        sizeof(ctx->spine[0].href) - 1);
+                strcpy(ctx->spine[*ctx->spine_count].id, "ch");
+                (*ctx->spine_count)++;
+                EPUB_LOG("Added chapter: %s\n", full_href);
+            } else {
+                if (ctx->verbose)
+                    EPUB_ERR("Skipping missing file: %s\n", full_href);
+            }
+        }
+        return;
+    }
+}
+
+static void opf_end_cb(const char *name, void *user_data) {
+    struct opf_parse_ctx *ctx = (struct opf_parse_ctx *)user_data;
+    if (strcmp(name, "dc:title") == 0 || strcmp(name, "title") == 0) {
+        ctx->in_title = false;
+        ctx->title_done = true;
+    }
+}
+
+static void opf_char_cb(const char *data, int len, void *user_data) {
+    struct opf_parse_ctx *ctx = (struct opf_parse_ctx *)user_data;
+    if (ctx->in_title && !ctx->title_done) {
+        int copy_len = len;
+        if (copy_len > ctx->title_size - 1) copy_len = ctx->title_size - 1;
+        strncpy(ctx->title, data, copy_len);
+        ctx->title[copy_len] = '\0';
+    }
+}
+
+static bool parse_opf_with_expat(const char *data, int size, EpubReader *reader) {
+    XhtmlParser *parser = xhtml_parser_create();
+    if (!parser) return false;
+
+    struct opf_parse_ctx ctx;
+    ctx.title = reader->book.title;
+    ctx.title_size = sizeof(reader->book.title);
+    ctx.in_title = false;
+    ctx.title_done = false;
+    strncpy(ctx.base_path, reader->book.base_path, sizeof(ctx.base_path) - 1);
+    ctx.spine = reader->spine;
+    ctx.spine_count = &reader->spine_count;
+    ctx.max_spine = EPUB_MAX_SPINE_COUNT;
+    ctx.zip = &reader->zip_archive;
+    ctx.verbose = true;
+
+    reader->spine_count = 0;
+
+    xhtml_parser_set_callbacks(parser, opf_start_cb, opf_end_cb, opf_char_cb, &ctx);
+    bool ok = xhtml_parser_parse(parser, data, size);
+    xhtml_parser_destroy(parser);
+    return ok;
+}
 
 EpubReader* epub_reader_create(void) {
-    /* 强行把阅读器结构体塞进PSRAM，拯救SRAM */
     EpubReader *reader = (EpubReader*)_dma_malloc(sizeof(EpubReader), DMAHEAP_PSRAM);
     if (!reader) {
         EPUB_ERR("Failed to allocate EpubReader!\n");
@@ -535,121 +441,78 @@ EpubReader* epub_reader_create(void) {
 }
 
 bool epub_reader_open(EpubReader *reader, const char *filepath) {
+    s_raw_built = false;
     EPUB_LOG("Opening EPUB: %s\n", filepath);
     if (!reader || !filepath) return false;
-    
+
     strncpy(reader->book.file_path, filepath, sizeof(reader->book.file_path) - 1);
-    if (f_open(&reader->archive_fp, filepath, FA_OPEN_EXISTING | FA_READ) != FR_OK) return false;
-    
+    if (f_open(&reader->archive_fp, filepath, FA_OPEN_EXISTING | FA_READ) != FR_OK) {
+        EPUB_ERR("Failed to open file\n");
+        return false;
+    }
+
     memset(&reader->zip_archive, 0, sizeof(reader->zip_archive));
     reader->zip_archive.m_pIO_opaque = &reader->archive_fp;
     reader->zip_archive.m_pRead = miniz_fatfs_read_cb;
-    
-    /* 【静态PSRAM缓冲区】：使用预分配的128KB缓冲区，避免动态分配失败 */
-    epub_buffer_reset();  /* 重置缓冲区使用量 */
-    reader->zip_archive.m_pAlloc = miniz_epub_alloc;
-    reader->zip_archive.m_pFree = miniz_epub_free;
-    reader->zip_archive.m_pRealloc = miniz_epub_realloc;
-    
+    reader->zip_archive.m_pAlloc = miniz_psram_alloc;
+    reader->zip_archive.m_pFree = miniz_psram_free;
+    reader->zip_archive.m_pRealloc = miniz_psram_realloc;
+
     if (!mz_zip_reader_init(&reader->zip_archive, f_size(&reader->archive_fp), 0)) {
+        EPUB_ERR("mz_zip_reader_init failed\n");
         f_close(&reader->archive_fp);
         return false;
     }
-    
+
     size_t container_size;
     char *container_data = read_file_from_zip(reader, "META-INF/container.xml", &container_size);
     if (!container_data) {
+        EPUB_ERR("Failed to read container.xml\n");
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         return false;
     }
-    
-    char content_opf_path[256];
-    if (!parse_container_xml(container_data, container_size, content_opf_path)) {
-        free(container_data);
+
+    char content_opf_path[256] = {0};
+    if (!parse_container_xml_with_expat(container_data, container_size,
+                                         content_opf_path, sizeof(content_opf_path))) {
+        EPUB_ERR("Failed to parse container.xml\n");
+        _dma_free(container_data, DMAHEAP_PSRAM);
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         return false;
     }
-    free(container_data);
-    
+    _dma_free(container_data, DMAHEAP_PSRAM);
+    EPUB_LOG("container.xml parsed, OPF path: %s\n", content_opf_path);
+
     strncpy(reader->book.base_path, content_opf_path, sizeof(reader->book.base_path) - 1);
     char *lastSlash = strrchr(reader->book.base_path, '/');
     if (lastSlash) *lastSlash = '\0';
     else reader->book.base_path[0] = '\0';
-    
+
     size_t opf_size;
     char *opf_data = read_file_from_zip(reader, content_opf_path, &opf_size);
     if (!opf_data) {
+        EPUB_ERR("Failed to read OPF: %s\n", content_opf_path);
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         return false;
     }
-    
-    XmlParser parser;
-    xml_init(&parser, opf_data, opf_size);
-    char content[256];
-    if (xml_find_element(&parser, "dc:title", content, sizeof(content))) {
-        strncpy(reader->book.title, content, sizeof(reader->book.title) - 1);
+
+    if (!parse_opf_with_expat(opf_data, opf_size, reader)) {
+        EPUB_ERR("Failed to parse OPF\n");
+        _dma_free(opf_data, DMAHEAP_PSRAM);
+        mz_zip_reader_end(&reader->zip_archive);
+        f_close(&reader->archive_fp);
+        return false;
     }
-    
-    reader->spine_count = 0;
-    char *manifest_start = strstr(opf_data, "<manifest");
-    if (manifest_start) {
-        char *item_start = manifest_start;
-        while (reader->spine_count < EPUB_MAX_SPINE_COUNT) {
-            char *item_pos = strstr(item_start, "<item");
-            if (!item_pos) break;
-            
-            char href_raw[256] = {0};
-            char *href_start = strstr(item_pos, "href=\"");
-            if (href_start) {
-                href_start += 6;
-                char *href_end = strchr(href_start, '"');
-                if (href_end && href_end - href_start < sizeof(href_raw)) {
-                    strncpy(href_raw, href_start, href_end - href_start);
-                }
-            }
-            
-            char href[256] = {0};
-            decode_and_clean_href(href, href_raw);
-            
-            if ((strstr(item_pos, "application/xhtml+xml") || strstr(item_pos, "text/html"))
-                && !strstr(href, ".ncx")
-                && !strstr(href, "nav.xhtml")
-                && !strstr(href, "/cover.")
-                && !strstr(href, "title_page")
-                && !strstr(href, "titlepage")
-                && !strstr(href, ".css")) {
-                
-                char full_href[256];
-                if (reader->book.base_path[0] != '\0') {
-                    snprintf(full_href, sizeof(full_href), "%s/%s", reader->book.base_path, href);
-                } else {
-                    strncpy(full_href, href, sizeof(full_href) - 1);
-                }
-                
-                /* 【核心防御】：预先验活！如果文件在ZIP里压根不存在，直接丢弃，不进章节列表！ */
-                /* verbose 设置为 false，丢弃时不要刷屏报错 */
-                if (fuzzy_locate_file(&reader->zip_archive, full_href, false) >= 0) {
-                    strncpy(reader->spine[reader->spine_count].href, full_href, sizeof(reader->spine[reader->spine_count].href) - 1);
-                    strcpy(reader->spine[reader->spine_count].id, "ch");
-                    reader->spine_count++;
-                    EPUB_LOG("Added chapter: %s\n", full_href);
-                } else {
-                    EPUB_ERR("Skipping missing file declared in OPF: %s\n", full_href);
-                }
-            }
-            item_start = item_pos + 4;
-        }
-    }
-    
+    _dma_free(opf_data, DMAHEAP_PSRAM);
+
     if (reader->spine_count == 0) {
         reader->spine_count = 1;
         strcpy(reader->spine[0].href, content_opf_path);
     }
 
-    /* ===== 解析 toc.ncx 生成目录 ===== */
     char toc_path[256];
     snprintf(toc_path, sizeof(toc_path), "%s/toc.ncx",
              reader->book.base_path[0] ? reader->book.base_path : "EPUB");
@@ -682,10 +545,8 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
             scan = np_start + 8;
         }
         EPUB_LOG("Parsed %d TOC entries from toc.ncx\n", reader->toc_count);
-        free(toc_data);
+        _dma_free(toc_data, DMAHEAP_PSRAM);
     }
-
-    free(opf_data);
 
     reader->loaded = true;
     EPUB_LOG("EPUB opened successfully: %s\n", reader->book.title);
@@ -698,14 +559,15 @@ void epub_reader_close(EpubReader *reader) {
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         reader->loaded = false;
-        epub_buffer_reset();  /* 重置静态缓冲区，供下次使用 */
     }
+    s_raw_built = false;
+    s_raw_count = 0;
 }
 
 void epub_reader_destroy(EpubReader *reader) {
     if (!reader) return;
     epub_reader_close(reader);
-    _dma_free(reader, DMAHEAP_PSRAM);  /* 修复flag参数 */
+    _dma_free(reader, DMAHEAP_PSRAM);
 }
 
 const char* epub_reader_get_title(EpubReader *reader) { return reader ? reader->book.title : ""; }
@@ -718,51 +580,91 @@ EpubTocEntry* epub_reader_get_toc(EpubReader *reader, int index) {
 
 int epub_reader_read_chapter(EpubReader *reader, int chapter_index, char *buffer, int buffer_size) {
     EPUB_LOG("read_chapter called: index=%d, buffer_size=%d\n", chapter_index, buffer_size);
-    
-    if (!reader || !reader->loaded || !buffer || buffer_size <= 0) {
-        EPUB_ERR("read_chapter: invalid parameters\n");
-        return -1;
-    }
-    
-    if (chapter_index < 0 || chapter_index >= reader->spine_count) {
-        EPUB_ERR("read_chapter: chapter_index %d out of range (0-%d)\n",
-                 chapter_index, reader->spine_count - 1);
-        return -1;
-    }
-    
-    EPUB_LOG("Reading chapter %d: %s\n", chapter_index, reader->spine[chapter_index].href);
-    
+    if (!reader || !reader->loaded || !buffer || buffer_size <= 0) return -1;
+    if (chapter_index < 0 || chapter_index >= reader->spine_count) return -1;
+
     int file_index = fuzzy_locate_file(&reader->zip_archive, reader->spine[chapter_index].href, true);
-    if (file_index < 0) {
+    if (file_index == -1) {
         EPUB_ERR("Failed to locate chapter file: %s\n", reader->spine[chapter_index].href);
         return -1;
     }
-    
+
+    if (file_index < -1) {
+        int raw_idx = -file_index - 2;
+        mz_uint read_size = s_raw_entries[raw_idx].uncomp_size;
+        if (read_size >= (mz_uint)buffer_size) read_size = (mz_uint)(buffer_size - 1);
+        mz_uint extracted = 0;
+        if (!extract_file_at_raw_offset(&reader->zip_archive, raw_idx, buffer, read_size, &extracted))
+            return -1;
+        buffer[extracted] = '\0';
+        EPUB_LOG("read_chapter: extracted %u bytes (raw)\n", (unsigned)extracted);
+        return (int)extracted;
+    }
+
     mz_zip_archive_file_stat stat;
     if (!mz_zip_reader_file_stat(&reader->zip_archive, file_index, &stat)) {
         EPUB_ERR("Failed to get file stat\n");
         return -1;
     }
-    
-    EPUB_LOG("Chapter file: comp_size=%u, uncomp_size=%u, buffer_size=%d\n",
-             (unsigned)stat.m_comp_size, (unsigned)stat.m_uncomp_size, buffer_size);
-    
-    /* 有多大buffer就读取多少内容，截断多余部分 */
-    mz_uint read_size = (mz_uint)(buffer_size - 1);  /* 留一个字节给\0 */
-    if (read_size > stat.m_uncomp_size) {
-        read_size = stat.m_uncomp_size;
-    }
-    
+
+    mz_uint read_size = (mz_uint)(buffer_size - 1);
+    if (read_size > stat.m_uncomp_size) read_size = stat.m_uncomp_size;
+
     if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, buffer, read_size, 0)) {
         EPUB_ERR("Failed to extract chapter to buffer\n");
         return -1;
     }
-    
+
     buffer[read_size] = '\0';
-    EPUB_LOG("read_chapter: extracted %u bytes to buffer (requested %d)\n",
-             (unsigned)read_size, buffer_size);
-    
+    EPUB_LOG("read_chapter: extracted %u bytes\n", (unsigned)read_size);
     return (int)read_size;
+}
+
+int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *out_buf, int buf_size) {
+    EPUB_LOG("read_chapter_full: index=%d, buf_size=%d\n", chapter_index, buf_size);
+    if (!reader || !reader->loaded || !out_buf || buf_size <= 0) return -1;
+    if (chapter_index < 0 || chapter_index >= reader->spine_count) return -1;
+
+    int file_index = fuzzy_locate_file(&reader->zip_archive, reader->spine[chapter_index].href, false);
+    if (file_index == -1) {
+        EPUB_ERR("Failed to locate: %s\n", reader->spine[chapter_index].href);
+        return -1;
+    }
+
+    if (file_index < -1) {
+        int raw_idx = -file_index - 2;
+        mz_uint uncomp_size = s_raw_entries[raw_idx].uncomp_size;
+        if ((int)uncomp_size > buf_size) {
+            EPUB_ERR("Chapter too large: %u > %d bytes (raw)\n", (unsigned)uncomp_size, buf_size);
+            return -2;
+        }
+        mz_uint extracted = 0;
+        if (!extract_file_at_raw_offset(&reader->zip_archive, raw_idx, out_buf, uncomp_size, &extracted))
+            return -1;
+        out_buf[extracted] = '\0';
+        EPUB_LOG("Full chapter extracted: %u bytes (raw)\n", (unsigned)extracted);
+        return (int)extracted;
+    }
+
+    mz_zip_archive_file_stat stat;
+    if (!mz_zip_reader_file_stat(&reader->zip_archive, file_index, &stat)) {
+        EPUB_ERR("Failed to get file stat\n");
+        return -1;
+    }
+
+    if ((int)stat.m_uncomp_size > buf_size) {
+        EPUB_ERR("Chapter too large: %u > %d bytes\n", (unsigned)stat.m_uncomp_size, buf_size);
+        return -2;
+    }
+
+    if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, out_buf, stat.m_uncomp_size, 0)) {
+        EPUB_ERR("Failed to extract chapter\n");
+        return -1;
+    }
+
+    out_buf[stat.m_uncomp_size] = '\0';
+    EPUB_LOG("Full chapter extracted: %u bytes\n", (unsigned)stat.m_uncomp_size);
+    return (int)stat.m_uncomp_size;
 }
 
 int epub_reader_jump_to_toc(EpubReader *reader, int toc_index) {

@@ -1,6 +1,7 @@
 ../../../../project/demo/FontExp/command.o
 ../../../../project/demo/FontExp/wlan_manager.o
 ../../../../project/demo/FontExp/lv_font_misans_16.o
+../../../../project/demo/FontExp/lv_port_indev.o
 ../../../../project/demo/FontExp/font_priority_loader.o
 ../../../../project/demo/FontExp/main.o
 ../../../../project/demo/FontExp/chsc6540.o
@@ -10,9 +11,9 @@
 ../../../../project/demo/FontExp/screensaver.o
 ../../../../project/demo/FontExp/http_server.o
 ../../../../project/demo/FontExp/heap_debug.o
+../../../../project/demo/FontExp/epub_xhtml_parser.o
 ../../../../project/demo/FontExp/level1_data.o
 ../../../../project/demo/FontExp/epub_viewer.o
-../../../../project/demo/FontExp/lv_port_indev.o
 ../../../../project/demo/FontExp/mem_guard.o
 ../../../../project/demo/FontExp/file_manager.o
 ../../../../project/demo/FontExp/coremark/core_matrix.o
@@ -248,6 +249,9 @@
 ../../../../project/demo/FontExp/lvgl/tests/src/test_fonts/font_1.o
 ../../../../project/demo/FontExp/lvgl/tests/unity/unity.o
 ../../../../project/demo/FontExp/lvgl/tests/unity/unity_support.o
+../../../../project/demo/FontExp/third_party/expat/xmlrole.o
+../../../../project/demo/FontExp/third_party/expat/xmlparse.o
+../../../../project/demo/FontExp/third_party/expat/xmltok.o
 ../../../../project/demo/FontExp/third_party/miniz/miniz.o
 ../../../../project/common/apps/recorder_app.o
 ../../../../project/common/apps/player_app.o

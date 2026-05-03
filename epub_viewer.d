@@ -15,6 +15,7 @@
  ../../../../include/kernel/os/os_timer.h \
  ../../../../project/demo/FontExp/third_party/miniz/miniz.h \
  ../../../../include/libc/stdio.h \
+ ../../../../project/demo/FontExp/epub_xhtml_parser.h \
  ../../../../project/demo/FontExp/file_manager.h \
  ../../../../project/demo/FontExp/lvgl/lvgl.h \
  ../../../../project/demo/FontExp/lvgl/src/misc/lv_log.h \
@@ -246,6 +247,8 @@
 ../../../../project/demo/FontExp/third_party/miniz/miniz.h:
 
 ../../../../include/libc/stdio.h:
+
+../../../../project/demo/FontExp/epub_xhtml_parser.h:
 
 ../../../../project/demo/FontExp/file_manager.h:
 

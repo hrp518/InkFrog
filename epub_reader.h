@@ -74,12 +74,9 @@ typedef struct {
     EpubTocEntry toc[EPUB_MAX_TOC_COUNT];
     int toc_count;
     bool loaded;
-    char *chapter_buffer;
-    int chapter_buffer_size;
     
-    /* === 核心修改部分 === */
-    FIL archive_fp;              /* FatFs 文件指针：保持EPUB文件在SD卡上处于打开状态 */
-    mz_zip_archive zip_archive;  /* miniz ZIP读取器上下文 */
+    FIL archive_fp;
+    mz_zip_archive zip_archive;
 } EpubReader;
 
 /*====================
@@ -97,12 +94,7 @@ EpubTocEntry* epub_reader_get_toc(EpubReader *reader, int index);
 int epub_reader_read_chapter(EpubReader *reader, int chapter_index, char *buffer, int buffer_size);
 int epub_reader_jump_to_toc(EpubReader *reader, int toc_index);
 
-/* 流式解析支持 - 将章节解压到SD卡临时文件，返回解压后字节数（>0成功，-1失败） */
-int epub_reader_extract_chapter_to_file(EpubReader *reader, int chapter_index, const char *temp_file_path);
-
-/* EPUB缓冲区管理 - 静态分配模式 */
-void epub_buffer_init(void);
-void epub_buffer_reset(void);
+int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *out_buf, int buf_size);
 
 #ifdef __cplusplus
 }

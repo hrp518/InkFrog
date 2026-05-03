@@ -21,7 +21,7 @@ export __CONFIG_PSRAM_CHIP_OPI32 := y
 export __CONFIG_PSRAM_ALL_CACHEABLE := y
 
 # PSRAM DMA Heap size (KB) - 扩大给EPUB章节缓存使用
-export __CONFIG_DMAHEAP_PSRAM_SIZE := 384
+export __CONFIG_DMAHEAP_PSRAM_SIZE := 1024
 
 # LVGL source path for include
-export PRJ_EXTRA_INCLUDE := -I../../demo/FontExp/lvgl/src -I../../demo/FontExp/third_party/miniz
+export PRJ_EXTRA_INCLUDE := -I../../demo/FontExp/lvgl/src -I../../demo/FontExp/third_party/miniz -I../../demo/FontExp/third_party/expat

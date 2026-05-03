@@ -13,8 +13,18 @@
  ../../../../include/kernel/os/os_mutex.h \
  ../../../../include/kernel/os/os_timer.h \
  ../../../../project/demo/FontExp/third_party/miniz/miniz.h \
- ../../../../include/libc/stdio.h ../../../../include/sys/dma_heap.h \
- ../../../../include/types.h
+ ../../../../include/libc/stdio.h \
+ ../../../../project/demo/FontExp/epub_xhtml_parser.h \
+ ../../../../include/sys/dma_heap.h ../../../../include/types.h \
+ ../../../../include/driver/chip/hal_dcache.h \
+ ../../../../include/driver/chip/hal_def.h \
+ ../../../../include/driver/chip/chip.h \
+ ../../../../include/driver/cmsis/core_cm4.h \
+ ../../../../include/driver/cmsis/core_cmInstr.h \
+ ../../../../include/driver/cmsis/core_cmFunc.h \
+ ../../../../include/driver/cmsis/core_cmSimd.h \
+ ../../../../include/driver/chip/psram/psram.h \
+ ../../../../include/sys/sys_heap.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -50,6 +60,26 @@
 
 ../../../../include/libc/stdio.h:
 
+../../../../project/demo/FontExp/epub_xhtml_parser.h:
+
 ../../../../include/sys/dma_heap.h:
 
 ../../../../include/types.h:
+
+../../../../include/driver/chip/hal_dcache.h:
+
+../../../../include/driver/chip/hal_def.h:
+
+../../../../include/driver/chip/chip.h:
+
+../../../../include/driver/cmsis/core_cm4.h:
+
+../../../../include/driver/cmsis/core_cmInstr.h:
+
+../../../../include/driver/cmsis/core_cmFunc.h:
+
+../../../../include/driver/cmsis/core_cmSimd.h:
+
+../../../../include/driver/chip/psram/psram.h:
+
+../../../../include/sys/sys_heap.h:
