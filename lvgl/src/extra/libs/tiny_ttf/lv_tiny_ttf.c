@@ -123,6 +123,13 @@ typedef struct {
     uint8_t cached;
 } level1_glyph_info_t;
 
+// glyf cache查找条目（按文件偏移排序，用于二分查找）
+typedef struct {
+    uint32_t glyf_rel_offset;  // glyph在glyf表内的相对偏移（来自loca）
+    uint32_t compact_offset;   // 对应compact缓冲区中的偏移
+    uint16_t glyf_size;        // 该glyph的数据大小
+} glyf_cache_entry_t;
+
 typedef struct ttf_font_desc {
     lv_fs_file_t file;
     char file_path[256];
@@ -152,6 +159,21 @@ static uint16_t g_shared_level1_glyph_count = 0;
 static ttf_table_cache_t g_shared_table_cache;
 static int g_shared_level1_loaded = 0;
 static ttf_metrics_entry_t *g_shared_metrics_cache = NULL;
+
+// 全局glyf查找表（二分查找，将文件偏移翻译为compact缓冲区偏移）
+static glyf_cache_entry_t *g_glyf_lookup = NULL;     // 排序后的查找表
+static uint16_t g_glyf_lookup_count = 0;              // 查找表条目数
+static uint32_t g_glyf_table_file_offset = 0;         // glyf表在文件中的绝对偏移
+static uint32_t g_glyf_table_size = 0;                // glyf表总大小
+
+static int compare_cache_entries(const void *a, const void *b)
+{
+    const glyf_cache_entry_t *ea = (const glyf_cache_entry_t *)a;
+    const glyf_cache_entry_t *eb = (const glyf_cache_entry_t *)b;
+    if(ea->glyf_rel_offset < eb->glyf_rel_offset) return -1;
+    if(ea->glyf_rel_offset > eb->glyf_rel_offset) return 1;
+    return 0;
+}
 
 static int ttf_stream_read_from_cache(ttf_font_desc_t *dsc, size_t pos, void *out, size_t to_read)
 {
@@ -184,20 +206,54 @@ static int ttf_stream_read_from_cache(ttf_font_desc_t *dsc, size_t pos, void *ou
                 return 1;
             }
         }
-        // glyf 一对一映射：直接按偏移读取
-        if(dsc->level1_glyf_data) {
-            ttf_cached_table_t *glyf_t = &tc->glyf;
-            if(pos >= glyf_t->file_offset && (pos + to_read) <= (glyf_t->file_offset + glyf_t->size)) {
-                lv_memcpy(out, dsc->level1_glyf_data + (pos - glyf_t->file_offset), to_read);
-                cache_hit++; 
-                
-                // 调试：每1000次命中打印glyf表命中
-                if(cache_hit % 1000 == 0) {
-                    printf("[CACHE_HIT_DEBUG] glyf: pos=%lu-%lu size=%lu cached=%lu-%lu\n", 
-                           pos, pos + to_read, to_read, glyf_t->file_offset, glyf_t->file_offset + glyf_t->size);
+        // glyf compact cache: 通过二分查找翻译文件偏移到compact偏移
+        if(g_glyf_lookup && g_shared_level1_glyf_data) {
+            if(pos >= g_glyf_table_file_offset && 
+               pos < g_glyf_table_file_offset + g_glyf_table_size) {
+                uint32_t rel_pos = pos - g_glyf_table_file_offset;
+                // 二分查找：找到包含rel_pos的glyph条目
+                int lo = 0, hi = g_glyf_lookup_count - 1;
+                while(lo <= hi) {
+                    int mid = (lo + hi) / 2;
+                    glyf_cache_entry_t *e = &g_glyf_lookup[mid];
+                    if(rel_pos < e->glyf_rel_offset) {
+                        hi = mid - 1;
+                    } else if(rel_pos >= e->glyf_rel_offset + e->glyf_size) {
+                        lo = mid + 1;
+                    } else {
+                        // 命中！计算在compact buffer中的位置
+                        uint32_t in_glyph_off = rel_pos - e->glyf_rel_offset;
+                        if(in_glyph_off + to_read <= e->glyf_size) {
+                            lv_memcpy(out, g_shared_level1_glyf_data + e->compact_offset + in_glyph_off, to_read);
+                            cache_hit++; 
+                            return 1;
+                        }
+                        break; // 跨glyph边界读取，罕见，回退SD卡
+                    }
                 }
-                
-                return 1;
+            }
+        }
+        // 再尝试当前字体实例的level1_glyf_data（非共享路径fallback）
+        if(dsc && dsc->level1_glyf_data && g_glyf_lookup) {
+            // 利用同样的全局查找表，但从dsc的数据中读取
+            uint32_t rel_pos = pos - g_glyf_table_file_offset;
+            int lo = 0, hi = g_glyf_lookup_count - 1;
+            while(lo <= hi) {
+                int mid = (lo + hi) / 2;
+                glyf_cache_entry_t *e = &g_glyf_lookup[mid];
+                if(rel_pos < e->glyf_rel_offset) {
+                    hi = mid - 1;
+                } else if(rel_pos >= e->glyf_rel_offset + e->glyf_size) {
+                    lo = mid + 1;
+                } else {
+                    uint32_t in_glyph_off = rel_pos - e->glyf_rel_offset;
+                    if(in_glyph_off + to_read <= e->glyf_size) {
+                        lv_memcpy(out, dsc->level1_glyf_data + e->compact_offset + in_glyph_off, to_read);
+                        cache_hit++; 
+                        return 1;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -213,15 +269,8 @@ static int ttf_stream_read_from_cache(ttf_font_desc_t *dsc, size_t pos, void *ou
                 cache_hit++; return 1;
             }
         }
-        // glyf 一对一映射：直接按偏移读取
-        if(g_shared_level1_glyf_data) {
-            uint32_t glyf_start = g_shared_table_cache.glyf.file_offset;
-            uint32_t glyf_end = glyf_start + g_shared_table_cache.glyf.size;
-            if(pos >= glyf_start && (pos + to_read) <= glyf_end) {
-                lv_memcpy(out, g_shared_level1_glyf_data + (pos - glyf_start), to_read);
-                cache_hit++; return 1;
-            }
-        }
+        // 全局共享缓存的glyf，已由上面的二分查找统一处理
+        // （上面的g_glyf_lookup + g_shared_level1_glyf_data已经覆盖了共享路径）
     }
     // 每 5000 次未命中打印一次
     if((cache_miss & 0x1FFF) == 0) {
@@ -258,7 +307,6 @@ static int find_table_location(lv_fs_file_t *file, uint32_t font_start, const ch
     
     // 检查签名 (bytes 0-3)
     uint32_t signature = (buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3];
-    printf("[TTF] find_table: font_start=%lu, signature=0x%08lX\n", font_start, signature);
     if(signature != 0x00010000 && signature != 0x4F54544F) {
         printf("[TTF] Invalid TTF signature\n");
         return 0;
@@ -266,7 +314,6 @@ static int find_table_location(lv_fs_file_t *file, uint32_t font_start, const ch
     
     // numTables (bytes 4-5, big-endian uint16)
     num_tables = (buf[4] << 8) | buf[5];
-    printf("[TTF] num_tables=%u\n", num_tables);
     
     if(num_tables > 100) {
         printf("[TTF] Too many tables, invalid TTF\n");
@@ -287,17 +334,12 @@ static int find_table_location(lv_fs_file_t *file, uint32_t font_start, const ch
         // 长度 (bytes 12-15, big-endian uint32)
         uint32_t length = (entry[12] << 24) | (entry[13] << 16) | (entry[14] << 8) | entry[15];
         
-        printf("[TTF] Table[%d]: '%s' offset=%lu length=%lu\n", i, name, offset, length);
-        
         if(strcmp(name, table_name) == 0) {
             *out_offset = offset + font_start;
             *out_length = length;
-            printf("[TTF] Found table '%s' at file offset %lu\n", table_name, *out_offset);
             return 1;
         }
     }
-    
-    printf("[TTF] Table '%s' not found\n", table_name);
     return 0;
 }
 
@@ -414,26 +456,30 @@ static uint16_t lookup_glyph_in_cmap_format4(uint8_t *cmap_data, uint32_t unicod
 
 static uint16_t lookup_glyph_in_cmap_format12(uint8_t *cmap_data, uint32_t unicode)
 {
-    // cmap format 12 解析（大端序）
+    // cmap format 12 解析（大端序）- 使用二分查找，groups按start_char排序
     uint32_t num_groups = ((uint32_t)cmap_data[12] << 24) | ((uint32_t)cmap_data[13] << 16) |
                           ((uint32_t)cmap_data[14] << 8) | cmap_data[15];
     
-    uint8_t *groups_ptr = cmap_data + 16;
+    uint8_t *groups_base = cmap_data + 16;
+    int lo = 0, hi = (int)num_groups - 1;
     
-    for(uint32_t i = 0; i < num_groups; i++) {
-        // 手动解析大端序uint32
-        uint32_t start_char = ((uint32_t)groups_ptr[0] << 24) | ((uint32_t)groups_ptr[1] << 16) |
-                             ((uint32_t)groups_ptr[2] << 8) | groups_ptr[3];
-        uint32_t end_char = ((uint32_t)groups_ptr[4] << 24) | ((uint32_t)groups_ptr[5] << 16) |
-                           ((uint32_t)groups_ptr[6] << 8) | groups_ptr[7];
-        uint32_t start_glyph = ((uint32_t)groups_ptr[8] << 24) | ((uint32_t)groups_ptr[9] << 16) |
-                              ((uint32_t)groups_ptr[10] << 8) | groups_ptr[11];
+    while(lo <= hi) {
+        int mid = (lo + hi) / 2;
+        uint8_t *g = groups_base + mid * 12;
+        uint32_t start_char = ((uint32_t)g[0] << 24) | ((uint32_t)g[1] << 16) |
+                             ((uint32_t)g[2] << 8) | g[3];
+        uint32_t end_char = ((uint32_t)g[4] << 24) | ((uint32_t)g[5] << 16) |
+                           ((uint32_t)g[6] << 8) | g[7];
         
-        if(unicode >= start_char && unicode <= end_char) {
-            return (uint16_t)((uint32_t)start_glyph + (unicode - start_char));
+        if(unicode < start_char) {
+            hi = mid - 1;
+        } else if(unicode > end_char) {
+            lo = mid + 1;
+        } else {
+            uint32_t start_glyph = ((uint32_t)g[8] << 24) | ((uint32_t)g[9] << 16) |
+                                  ((uint32_t)g[10] << 8) | g[11];
+            return (uint16_t)(start_glyph + (unicode - start_char));
         }
-        
-        groups_ptr += 12;
     }
     
     return 0;  // 未找到
@@ -534,9 +580,41 @@ static int batch_lookup_glyph_indices(ttf_font_desc_t *dsc,
     int valid_count = 0;
     int not_found_count = 0;
     
+    // === 修复1: 预扫描cmap，优先使用format 12（二分查找O(log n)），避免format 4线性扫描 ===
+    uint16_t cmap_num_tables = (cmap_data[2] << 8) | cmap_data[3];
+    uint8_t *best_subtable = NULL;
+    uint16_t best_format = 0;
+    uint8_t *encoding_records = cmap_data + 4;
+    for(int ei = 0; ei < cmap_num_tables; ei++) {
+        uint16_t pid = (encoding_records[ei * 8] << 8) | encoding_records[ei * 8 + 1];
+        uint32_t sub_off = ((uint32_t)encoding_records[ei * 8 + 4] << 24) | 
+                           ((uint32_t)encoding_records[ei * 8 + 5] << 16) |
+                           ((uint32_t)encoding_records[ei * 8 + 6] << 8) | 
+                            encoding_records[ei * 8 + 7];
+        uint8_t *sub = cmap_data + sub_off;
+        uint16_t fmt = (sub[0] << 8) | sub[1];
+        if(fmt == 12 && (pid == 0 || pid == 3)) {
+            best_subtable = sub;
+            best_format = 12;
+            break;  // format 12最佳，立即停止
+        }
+        if(fmt == 4 && best_format != 12 && (pid == 0 || pid == 3)) {
+            best_subtable = sub;
+            best_format = 4;
+        }
+    }
+    printf("[TTF] cmap pre-scan: selected format %d subtable for batch lookup\n", best_format);
+    
     for(uint16_t i = 0; i < count; i++) {
         uint32_t unicode = unicode_list[i];
-        uint16_t glyph_index = lookup_glyph_in_cmap(cmap_data, unicode);
+        uint16_t glyph_index;
+        if(best_format == 12) {
+            glyph_index = lookup_glyph_in_cmap_format12(best_subtable, unicode);
+        } else if(best_format == 4) {
+            glyph_index = lookup_glyph_in_cmap_format4(best_subtable, unicode);
+        } else {
+            glyph_index = lookup_glyph_in_cmap(cmap_data, unicode);
+        }
         
         results[i].unicode = unicode;
         results[i].glyph_index = glyph_index;
@@ -766,10 +844,38 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     dsc->table_cache.loca.file_offset = loca_file_offset;
     dsc->table_cache.loca.size = loca_size;
     
-    // glyf表缓存设为0大小，因为紧凑存储不再支持按文件偏移直接索引
-    dsc->table_cache.glyf.file_offset = 0;
-    dsc->table_cache.glyf.size = 0;
+    // glyf表缓存：存储真实的偏移和大小供全局查找表使用
+    dsc->table_cache.glyf.file_offset = glyf_offset;
+    dsc->table_cache.glyf.size = glyf_size;
     dsc->table_cache.glyf.data = NULL;
+    
+    // 构建glyf查找表（全局共享，用于二分查找）
+    if(g_glyf_lookup) {
+        _dma_free(g_glyf_lookup, DMAHEAP_PSRAM);
+        g_glyf_lookup = NULL;
+    }
+    g_glyf_lookup = _dma_malloc(valid_count * sizeof(glyf_cache_entry_t), DMAHEAP_PSRAM);
+    if(g_glyf_lookup) {
+        g_glyf_lookup_count = valid_count;
+        g_glyf_table_file_offset = glyf_offset;  // glyf表的绝对文件偏移
+        g_glyf_table_size = glyf_size;           // glyf表总大小
+        
+        uint16_t lk_idx = 0;
+        for(uint16_t i = 0; i < count; i++) {
+            if(glyphs[i].cached) {
+                g_glyf_lookup[lk_idx].glyf_rel_offset = glyphs[i].file_glyf_offset;
+                g_glyf_lookup[lk_idx].compact_offset = glyphs[i].compact_offset;
+                g_glyf_lookup[lk_idx].glyf_size = glyphs[i].glyf_size;
+                lk_idx++;
+            }
+        }
+        // 按glyf_rel_offset排序，用于二分查找
+        qsort(g_glyf_lookup, valid_count, sizeof(glyf_cache_entry_t), compare_cache_entries);
+        printf("[TTF] Glyf lookup table built: %u entries, %lu bytes\n", valid_count, (uint32_t)(valid_count * sizeof(glyf_cache_entry_t)));
+    } else {
+        g_glyf_lookup_count = 0;
+        printf("[TTF] WARNING: Failed to allocate glyf lookup table, glyph cache disabled\n");
+    }
     
     if(file_opened) lv_fs_close(&temp_file);
     
@@ -970,23 +1076,27 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
                 }
             }
             if(glyph_idx > 0) {
-                int bbx0, bby0, bbx1, bby1;
-                // P1: 从已加载的compact glyf data直接解析bbox，避免stbtt_GetGlyphBitmapBox的完整轮廓解析
-                if(glyf_data && glyphs[i].glyf_size >= 10) {
-                    uint32_t off = glyphs[i].compact_offset;
-                    // glyf表格式: numberOfContours(2) | xMin(2) | yMin(2) | xMax(2) | yMax(2)
-                    int16_t xMin = (int16_t)((glyf_data[off + 2] << 8) | glyf_data[off + 3]);
-                    int16_t yMin = (int16_t)((glyf_data[off + 4] << 8) | glyf_data[off + 5]);
-                    int16_t xMax = (int16_t)((glyf_data[off + 6] << 8) | glyf_data[off + 7]);
-                    int16_t yMax = (int16_t)((glyf_data[off + 8] << 8) | glyf_data[off + 9]);
-                    bbx0 = xMin; bby0 = yMin; bbx1 = xMax; bby1 = yMax;
+                // === 修复2: 直接从PSRAM compact glyf数据读header前10字节获取bbox ===
+                // glyf header: numberOfContours(2) + xMin(2) + yMin(2) + xMax(2) + yMax(2)
+                // 与stbtt_GetGlyphBitmapBox(scale=1.0)完全等价，但零IO、零轮廓解析
+                if(glyphs[i].cached && glyphs[i].glyf_size >= 10) {
+                    uint8_t *gh = glyf_data + glyphs[i].compact_offset;
+                    int16_t xMin = (int16_t)((gh[2] << 8) | gh[3]);
+                    int16_t yMin = (int16_t)((gh[4] << 8) | gh[5]);
+                    int16_t xMax = (int16_t)((gh[6] << 8) | gh[7]);
+                    int16_t yMax = (int16_t)((gh[8] << 8) | gh[9]);
+                    // stbtt_GetGlyphBitmapBox(scale=1.0): bbx0=xMin, bby0=-yMax, bbx1=xMax, bby1=-yMin
+                    entry->box_w_raw = (uint16_t)((xMax - xMin + 1) > 0 ? (xMax - xMin + 1) : 0);
+                    entry->box_h_raw = (uint16_t)((yMax - yMin + 1) > 0 ? (yMax - yMin + 1) : 0);
+                    entry->ofs_x_raw = xMin;
+                    entry->ofs_y_raw = yMin;  // = -bby1 (bby1=-yMin)
                 } else {
-                    stbtt_GetGlyphBitmapBox(&dsc->info, glyph_idx, 1.0f, 1.0f, &bbx0, &bby0, &bbx1, &bby1);
+                    // 空glyph或数据不足，使用默认值
+                    entry->box_w_raw = 0;
+                    entry->box_h_raw = 0;
+                    entry->ofs_x_raw = 0;
+                    entry->ofs_y_raw = 0;
                 }
-                entry->box_w_raw = (uint16_t)((bbx1 - bbx0 + 1) > 0 ? (uint16_t)(bbx1 - bbx0 + 1) : 0);
-                entry->box_h_raw = (uint16_t)((bby1 - bby0 + 1) > 0 ? (uint16_t)(bby1 - bby0 + 1) : 0);
-                entry->ofs_x_raw = bbx0;
-                entry->ofs_y_raw = -bby1;
                 entry->glyph_index = glyph_idx;
             }
             entry->valid = 1;
@@ -1029,6 +1139,7 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
 
     g_shared_table_cache = dsc->table_cache;
     g_shared_table_cache.glyf.data = NULL;
+    // 全局共享：查找表已经在batch_read_glyf_data中设置好了，无需重复构建
     g_shared_level1_glyf_data = glyf_data;
     g_shared_level1_glyf_size = glyf_size;
     g_shared_level1_glyphs = glyphs;
@@ -1257,9 +1368,10 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
             int exp_y2 = STBTT_iceil(-raw_y0 * s);
             int exp_w = exp_x2 - exp_x1 + 1;
             int exp_h = exp_y2 - exp_y1 + 1;
-            if(exp_w != w || exp_h != h || exp_x1 != x1 || exp_y1 != -y2) {
-                printf("[MISMATCH] U+%04X exp_box=%dx%d+%d,%d got_box=%dx%d+%d,%d\n",
-                       unicode_letter, exp_w, exp_h, exp_x1, exp_y1, w, h, x1, -y2);
+            if(exp_w != w || exp_h != h || exp_x1 != x1 || exp_y1 != y1 || exp_y2 != y2) {
+                printf("[MISMATCH] U+%04X exp=(%dx%d)%+d,%d got=(%dx%d)%+d,%d raw_ofs=%d box=%dx%d\n",
+                       unicode_letter, exp_w, exp_h, exp_x1, exp_y1, w, h, x1, y1,
+                       raw_x0, raw_x1, raw_y0, raw_y1);
                 debug_mismatch_count++;
             }
         }
@@ -1273,7 +1385,10 @@ static void ttf_set_font_size_cb(lv_font_t * font, lv_coord_t line_height)
     ttf_font_desc_t * dsc = (ttf_font_desc_t *)font->dsc;
     int ascent, descent, line_gap;
     stbtt_GetFontVMetrics(&dsc->info, &ascent, &descent, &line_gap);
-    dsc->scale = (float)line_height / (ascent - descent);
+    /* Use EM-based scaling instead of (ascent-descent) to match built-in font pixel size.
+     * For AlibabaPuHuiTi: EM=1000 vs metrics_span=1400,
+     * EM-based: scale=16/1000=0.016 (CJK ~16px) vs old: 16/1400=0.01143 (CJK ~11px) */
+    dsc->scale = stbtt_ScaleForMappingEmToPixels(&dsc->info, (float)line_height);
     dsc->ascent = (int)(ascent * dsc->scale);
     dsc->descent = (int)(-descent * dsc->scale);
     font->base_line = dsc->descent;

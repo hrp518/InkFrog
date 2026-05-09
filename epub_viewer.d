@@ -209,8 +209,7 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/list/../../layouts/flex/lv_flex.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/lv_msgbox.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
- ../../../../project/demo/FontExp/lv_port_disp.h \
- ../../../../include/sys/dma_heap.h ../../../../include/types.h
+ ../../../../project/demo/FontExp/lv_port_disp.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -637,7 +636,3 @@
 ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h:
 
 ../../../../project/demo/FontExp/lv_port_disp.h:
-
-../../../../include/sys/dma_heap.h:
-
-../../../../include/types.h:

@@ -6,8 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <sys/dma_heap.h>
+/* #include <sys/dma_heap.h>  -- 不再使用 DMA heap，改用静态分配 (.psram_bss) */
 #include "fs/fatfs/ff.h"
+
+/* 静态分配到 .psram_bss 段，不走 LVGL 堆，避免碎片化导致分配失败 */
+static char s_whole_xhtml_buf[WHOLE_XHTML_BUF_SIZE]  __attribute__((section(".psram_bss")));
+static char s_decoded_text_buf[DECODED_TEXT_BUF_SIZE] __attribute__((section(".psram_bss")));
 
 extern void epd_mark_refresh_pending(void);
 extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
@@ -207,17 +211,11 @@ EpubViewer* epub_viewer_create(EpubReader *reader) {
     if (!v) return NULL;
     v->reader = reader;
 
-    v->whole_xhtml_buf = (char*)_dma_malloc(WHOLE_XHTML_BUF_SIZE, DMAHEAP_PSRAM);
-    v->decoded_text_buf = (char*)_dma_malloc(DECODED_TEXT_BUF_SIZE, DMAHEAP_PSRAM);
+    /* 直接指向静态数组（.psram_bss段），不再从LVGL堆动态分配 */
+    v->whole_xhtml_buf = s_whole_xhtml_buf;
+    v->decoded_text_buf = s_decoded_text_buf;
 
-    if (!v->whole_xhtml_buf || !v->decoded_text_buf) {
-        VIEW_ERR("Buffer alloc failed (need %d + %d bytes PSRAM)\n",
-                 WHOLE_XHTML_BUF_SIZE, DECODED_TEXT_BUF_SIZE);
-        epub_viewer_destroy(v);
-        return NULL;
-    }
-
-    VIEW_LOG("Buffers allocated: whole_xhtml=%d, decoded_text=%d\n",
+    VIEW_LOG("Buffers static (.psram_bss): whole_xhtml=%d, decoded_text=%d\n",
              WHOLE_XHTML_BUF_SIZE, DECODED_TEXT_BUF_SIZE);
     return v;
 }
@@ -343,8 +341,9 @@ void epub_viewer_close(EpubViewer *viewer) {
 void epub_viewer_destroy(EpubViewer *viewer) {
     if (!viewer) return;
     epub_viewer_close(viewer);
-    if (viewer->whole_xhtml_buf) { _dma_free(viewer->whole_xhtml_buf, DMAHEAP_PSRAM); viewer->whole_xhtml_buf = NULL; }
-    if (viewer->decoded_text_buf) { _dma_free(viewer->decoded_text_buf, DMAHEAP_PSRAM); viewer->decoded_text_buf = NULL; }
+    /* 静态数组（.psram_bss段），不需要free */
+    viewer->whole_xhtml_buf = NULL;
+    viewer->decoded_text_buf = NULL;
     free(viewer);
 }
 
@@ -412,6 +411,50 @@ bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index) {
     return true;
 }
 
+static int utf8_char_len(unsigned char c) {
+    if (c < 0x80) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static uint32_t utf8_to_unicode(const char *p) {
+    const unsigned char *s = (const unsigned char *)p;
+    if (s[0] < 0x80) return s[0];
+    if ((s[0] & 0xE0) == 0xC0) return ((s[0] & 0x1F) << 6) | (s[1] & 0x3F);
+    if ((s[0] & 0xF0) == 0xE0) return ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F);
+    if ((s[0] & 0xF8) == 0xF0) return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
+    return s[0];
+}
+
+/* Get character advance width in pixels for line wrapping.
+   Uses hardcoded estimates matched to the actual font metrics:
+   CJK (0x4E00-0x9FFF): 15px, Fullwidth (0xFF00-0xFFEF): 15px
+   CJK punctuation (0x3000-0x303F): 15px, ASCII: 8px */
+static int get_char_adv_width(uint32_t unicode) {
+    if (unicode >= 0x4E00 && unicode <= 0x9FFF) return 15;
+    if (unicode >= 0x3000 && unicode <= 0x303F) return 15;
+    if (unicode >= 0xFF00 && unicode <= 0xFFEF) return 15;
+    return 8;
+}
+
+/* Create a single-line label (no LVGL wrapping) at given y offset */
+static void create_line_label(EpubViewer *viewer, const char *text, int len,
+                               lv_font_t *font, int *y_offset) {
+    if (len <= 0 || *y_offset >= CONTENT_HEIGHT) return;
+    char buf[80];
+    if (len > 79) len = 79;
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+    lv_obj_t *label = lv_label_create(viewer->content_container);
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    /* Do NOT set width - prevents LVGL from wrapping */
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, *y_offset);
+    lv_label_set_text(label, buf);
+}
+
 static void update_display(EpubViewer *viewer) {
     uint32_t t0 = xTaskGetTickCount();
     if (!viewer || !viewer->content_container) return;
@@ -434,35 +477,32 @@ static void update_display(EpubViewer *viewer) {
     if ((int)to_read <= 0) return;
 
     const char *p = viewer->decoded_text_buf + offset;
+    const char *end = p + to_read;
 
     printf("[UPDATE] page=%d offset=%u len=%u decoded_total=%d\n",
            page, offset, to_read, viewer->decoded_text_len);
 
-    uint32_t t4 = xTaskGetTickCount();
     lv_obj_clean(viewer->content_container);
 
-    const char *block_start = p;
     int y_offset = 0;
     lv_font_t *current_font = FONT;
     int current_lh = LH_BODY;
-    const char *end = p + to_read;
+
+    /* Line-by-line rendering: build one LVGL label per visual line */
+    char line_buf[80];
+    int line_pos = 0;
+    int line_width = 0;
 
     while (p < end && y_offset < CONTENT_HEIGHT) {
+        /* Check for font marker: 0x02 level 0x03 */
         if ((unsigned char)*p == 0x02 && (p + 2) < end &&
             *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
-            int blen = (int)(p - block_start);
-            if (blen > 0 && y_offset < CONTENT_HEIGHT) {
-                int clen = blen > 500 ? 500 : blen;
-                char buf[502];
-                memcpy(buf, block_start, clen);
-                buf[clen] = '\0';
-                lv_obj_t *label = lv_label_create(viewer->content_container);
-                lv_obj_set_style_text_font(label, current_font, 0);
-                lv_obj_set_style_text_color(label, lv_color_black(), 0);
-                lv_obj_set_width(label, CONTENT_WIDTH);
-                lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, y_offset);
-                lv_label_set_text(label, buf);
+            /* Flush current line */
+            if (line_pos > 0) {
+                create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
+                line_pos = 0;
+                line_width = 0;
             }
             int level = *(p + 1) - '0';
             switch (level) {
@@ -472,44 +512,47 @@ static void update_display(EpubViewer *viewer) {
                 default: current_font = FONT; current_lh = LH_BODY; break;
             }
             p += 3;
-            block_start = p;
             continue;
         }
+
+        /* Handle newline: flush line and advance y */
         if (*p == '\n') {
-            int blen = (int)(p - block_start);
-            if (blen > 0 && y_offset < CONTENT_HEIGHT) {
-                int clen = blen > 500 ? 500 : blen;
-                char buf[502];
-                memcpy(buf, block_start, clen);
-                buf[clen] = '\0';
-                lv_obj_t *label = lv_label_create(viewer->content_container);
-                lv_obj_set_style_text_font(label, current_font, 0);
-                lv_obj_set_style_text_color(label, lv_color_black(), 0);
-                lv_obj_set_width(label, CONTENT_WIDTH);
-                lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, y_offset);
-                lv_label_set_text(label, buf);
+            if (line_pos > 0) {
+                create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
+                line_pos = 0;
+                line_width = 0;
             }
             p++;
-            block_start = p;
             continue;
         }
-        p++;
-    }
-    {
-        int blen = (int)(p - block_start);
-        if (blen > 0 && y_offset < CONTENT_HEIGHT) {
-            int clen = blen > 500 ? 500 : blen;
-            char buf[502];
-            memcpy(buf, block_start, clen);
-            buf[clen] = '\0';
-            lv_obj_t *label = lv_label_create(viewer->content_container);
-            lv_obj_set_style_text_font(label, current_font, 0);
-            lv_obj_set_style_text_color(label, lv_color_black(), 0);
-            lv_obj_set_width(label, CONTENT_WIDTH);
-            lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, y_offset);
-            lv_label_set_text(label, buf);
+
+        /* Get next character */
+        int clen = utf8_char_len((unsigned char)*p);
+        if (p + clen > end) break;
+
+        uint32_t unicode = utf8_to_unicode(p);
+        int adv = get_char_adv_width(unicode);
+
+        /* If adding this char exceeds line width, flush current line first */
+        if (line_width + adv > CONTENT_WIDTH && line_pos > 0) {
+            create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
+            y_offset += current_lh;
+            line_pos = 0;
+            line_width = 0;
         }
+
+        /* Add character to line buffer */
+        for (int i = 0; i < clen && line_pos < 78; i++) {
+            line_buf[line_pos++] = p[i];
+        }
+        line_width += adv;
+        p += clen;
+    }
+
+    /* Flush remaining text */
+    if (line_pos > 0 && y_offset < CONTENT_HEIGHT) {
+        create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
     }
 
     char page_str[32];

@@ -38,7 +38,7 @@ extern "C" {
 
 /* 全局静态缓冲区大小（__psram_bss 静态分配，不走堆） */
 #define WHOLE_XHTML_BUF_SIZE    (200 * 1024)
-#define DECODED_TEXT_BUF_SIZE   (200 * 1024)
+#define DECODED_TEXT_BUF_SIZE   (100 * 1024)
 
 /*====================
  *   显示模式
