@@ -209,7 +209,16 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/list/../../layouts/flex/lv_flex.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/lv_msgbox.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
- ../../../../project/demo/FontExp/lv_port_disp.h
+ ../../../../project/demo/FontExp/lv_port_disp.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOS.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOSConfig.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/projdefs.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/portable.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/deprecated_definitions.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/portable/GCC/ARM_CM4F/portmacro.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/mpu_wrappers.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h \
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -636,3 +645,21 @@
 ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h:
 
 ../../../../project/demo/FontExp/lv_port_disp.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOS.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOSConfig.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/projdefs.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/portable.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/deprecated_definitions.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/portable/GCC/ARM_CM4F/portmacro.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/mpu_wrappers.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h:
+
+../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h:

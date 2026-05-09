@@ -28,7 +28,6 @@ extern "C" {
 #define EPUB_VIEWER_BUF_SIZE    8192    /* 章节内容缓冲区大小 */
 #define EPUB_VIEWER_LINE_HEIGHT 24      /* 行高（像素） */
 #define EPUB_VIEWER_FONT_SIZE   16      /* 字体大小 */
-#define EPUB_VIEWER_PAGE_LINES  15       /* 每页行数 */
 #define EPUB_VIEWER_INDENT      32       /* 首行缩进（像素） */
 #define EPUB_VIEWER_LINE_SPACE  6        /* 行间距 */
 

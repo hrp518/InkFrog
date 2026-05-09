@@ -267,7 +267,7 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
 
     int raw_idx = -file_index - 2;
     RawZipEntry *e = &s_raw_entries[raw_idx];
-    char *buf = (char *)malloc(e->uncomp_size + 1);
+    char *buf = (char *)_dma_malloc(e->uncomp_size + 1, DMAHEAP_PSRAM);
     if (!buf) {
         EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
                  filename, (unsigned)(e->uncomp_size + 1));
@@ -282,7 +282,7 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
         return buf;
     }
     EPUB_ERR("Raw extraction failed for: %s\n", filename);
-    free(buf);
+    _dma_free(buf, DMAHEAP_PSRAM);
     return NULL;
 }
 
