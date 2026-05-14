@@ -20,6 +20,7 @@ extern void epd_mark_refresh_pending(void);
 extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 
 #define VIEWER_DEBUG 1
+#define VIEWER_VERBOSE_DEBUG 0  /* hex dump & per-line debug: very slow (~600ms), only enable for debugging */
 #if VIEWER_DEBUG
 #define VIEW_LOG(fmt, ...) printf("[VIEWER] " fmt, ##__VA_ARGS__)
 #define VIEW_ERR(fmt, ...) printf("[VIEWER ERR] " fmt, ##__VA_ARGS__)
@@ -478,8 +479,10 @@ static void update_display(EpubViewer *viewer) {
             *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
             /* Flush current line */
             if (line_pos > 0) {
+                #if VIEWER_VERBOSE_DEBUG
                 printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d\n",
                        line_num, line_pos, line_width, y_offset, current_lh);
+                #endif
                 line_num++;
                 create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
@@ -500,8 +503,10 @@ static void update_display(EpubViewer *viewer) {
         /* Handle newline */
         if (*p == '\n') {
             if (line_pos > 0) {
+                #if VIEWER_VERBOSE_DEBUG
                 printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d\n",
                        line_num, line_pos, line_width, y_offset, current_lh);
+                #endif
                 line_num++;
                 create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
@@ -521,8 +526,10 @@ static void update_display(EpubViewer *viewer) {
 
         /* If adding this char exceeds line width, flush current line first */
         if (line_width + adv > CONTENT_WIDTH && line_pos > 0) {
+            #if VIEWER_VERBOSE_DEBUG
             printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d WRAP\n",
                    line_num, line_pos, line_width, y_offset, current_lh);
+            #endif
             line_num++;
             create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
             y_offset += current_lh;
@@ -544,37 +551,38 @@ static void update_display(EpubViewer *viewer) {
 
     /* Flush remaining text */
     if (line_pos > 0 && y_offset + current_lh <= CONTENT_HEIGHT) {
+        #if VIEWER_VERBOSE_DEBUG
         printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d LAST\n",
                line_num, line_pos, line_width, y_offset, current_lh);
+        #endif
         create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
     } else if (line_pos > 0) {
+        #if VIEWER_VERBOSE_DEBUG
         printf("[LINE_DBG] SKIP chars=%d y=%d+%d>%d\n",
                line_pos, y_offset, current_lh, CONTENT_HEIGHT);
+        #endif
     }
 
     /* 记录本页结束位置（下一页的起始） */
     viewer->page_end_offset = (int)(p - viewer->decoded_text_buf);
 
-    /* [PAGE_TEXT] 调试输出：每页解码后的文字内容 */
+    #if VIEWER_VERBOSE_DEBUG
+    /* [PAGE_TEXT] 调试输出：每页解码后的文字内容 - hex dump很慢，默认关闭 */
     {
         int txt_len = viewer->page_end_offset - start_offset;
         if (txt_len > 0) {
             const char *txt_start = viewer->decoded_text_buf + start_offset;
-            /* 先打印页面范围 */
             printf("[PAGE_TEXT] === offset=%d~%d (%d bytes) ===\n",
                    start_offset, viewer->page_end_offset, txt_len);
-            /* 逐行输出，以\n为分隔符，每行最多80字节 */
             const char *line_start = txt_start;
             const char *txt_end = txt_start + txt_len;
             int line_no = 0;
             while (line_start < txt_end) {
-                /* 找到行尾 */
                 const char *line_end = line_start;
                 while (line_end < txt_end && *line_end != '\n') line_end++;
                 int llen = (int)(line_end - line_start);
-                if (llen > 80) llen = 80; /* 限制每行输出长度 */
-                /* 输出hex和可打印字符 */
-                char hex_buf[241], ascii_buf[81]; /* 80*3+1=241, was 161 causing stack overflow */
+                if (llen > 80) llen = 80;
+                char hex_buf[241], ascii_buf[81];
                 int hx = 0;
                 for (int i = 0; i < llen; i++) {
                     unsigned char c = (unsigned char)line_start[i];
@@ -585,11 +593,12 @@ static void update_display(EpubViewer *viewer) {
                 hex_buf[hx] = '\0';
                 printf("[PAGE_TXT:%d] %s | %s\n", line_no, ascii_buf, hex_buf);
                 line_no++;
-                line_start = line_end + 1; /* 跳过\n */
+                line_start = line_end + 1;
             }
             printf("[PAGE_TEXT] === end ===\n");
         }
     }
+    #endif
 
     /* 更新百分比指示器 */
     float pct = get_read_percentage(viewer);
