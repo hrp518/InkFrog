@@ -35,7 +35,7 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 
 /* 内容区：几乎全屏，顶部8px padding，底部留28px给进度条+百分比 */
 #define CONTENT_X      10
-#define CONTENT_Y      8
+#define CONTENT_Y      14
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
 #define CONTENT_HEIGHT (SCREEN_HEIGHT - 36)
 /* 工具栏 */
