@@ -462,7 +462,7 @@ static void update_display(EpubViewer *viewer) {
            lv_obj_get_height(viewer->content_container),
            SCREEN_HEIGHT, CONTENT_HEIGHT);
 
-    int y_offset = 0;
+    int y_offset = 2;  /* +2px offset to prevent glyph top clipping (CJK ofs=-2) */
     lv_font_t *current_font = FONT;
     int current_lh = LH_BODY;
 
