@@ -295,9 +295,14 @@ void _lv_disp_refr_timer(lv_timer_t * tmr)
 
     extern volatile uint8_t epd_refresh_in_progress;
     extern volatile uint8_t epd_refresh_requested;
-    if(epd_refresh_in_progress || epd_refresh_requested) {
-        printf("[REFR_TIMER] BLOCKED: epd_in_progress=%d, epd_requested=%d\n",
-               epd_refresh_in_progress, epd_refresh_requested);
+    extern volatile int g_rendering_in_progress;
+    if(epd_refresh_in_progress || epd_refresh_requested || g_rendering_in_progress) {
+        static int block_dbg_cnt = 0;
+        if(block_dbg_cnt < 20) {
+            printf("[REFR_TIMER] BLOCKED: epd=%d/%d rendering=%d\n",
+                   epd_refresh_in_progress, epd_refresh_requested, g_rendering_in_progress);
+            block_dbg_cnt++;
+        }
         return;
     }
 

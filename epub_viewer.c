@@ -38,7 +38,6 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define CONTENT_Y      8
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
 #define CONTENT_HEIGHT (SCREEN_HEIGHT - 36)
-
 /* 工具栏 */
 #define TOOLBAR_HEIGHT    100
 #define TOOLBAR_TRIGGER_Y 25
@@ -276,7 +275,8 @@ static void filter_unsupported_chars_ex(char *str, bool preserve_markers) {
             (unicode >= 0x3000 && unicode <= 0x303F)) {
             for (int i = 0; i < char_len; i++) *write_ptr++ = read_ptr[i];
         } else {
-            if (unicode == 0xFF08 || unicode == 0xFF09) *write_ptr++ = '(';
+            if (unicode == 0xFF08) *write_ptr++ = '(';
+            else if (unicode == 0xFF09) *write_ptr++ = ')';
             else if (unicode == 0xFF01) *write_ptr++ = '!';
             else if (unicode == 0xFF1A) *write_ptr++ = ':';
             else if (unicode == 0xFF1B) *write_ptr++ = ';';
@@ -373,13 +373,24 @@ static uint32_t utf8_to_unicode(const char *p) {
     return s[0];
 }
 
-/* Get character advance width in pixels for line wrapping. */
-static int get_char_adv_width(uint32_t unicode) {
-    if (unicode >= 0x4E00 && unicode <= 0x9FFF) return 15;
-    if (unicode >= 0x3000 && unicode <= 0x303F) return 15;
-    if (unicode >= 0xFF00 && unicode <= 0xFFEF) return 15;
-    return 8;
+/* Get character advance width in pixels for line wrapping.
+ * Uses LVGL font API for accurate metrics instead of hardcoded values. */
+static int get_char_adv_width(uint32_t unicode, const lv_font_t *font) {
+    lv_coord_t w = lv_font_get_glyph_width(font, unicode, 0);
+    if (w > 0) return (int)w;
+    /* Fallback for characters not in font */
+    if (unicode >= 0x4E00 && unicode <= 0x9FFF) return 22;
+    if (unicode >= 0x3000 && unicode <= 0x303F) return 22;
+    if (unicode >= 0xFF00 && unicode <= 0xFFEF) return 22;
+    return 11;
 }
+
+/* 渲染保护标志：update_display期间阻止REFR_TIMER并发渲染 */
+volatile int g_rendering_in_progress = 0;
+
+/* Debug counters for render cycle tracking */
+static int g_render_label_count = 0;
+static int g_render_char_count = 0;
 
 /* Create a single-line label (no LVGL wrapping) at given y offset */
 static void create_line_label(EpubViewer *viewer, const char *text, int len,
@@ -394,6 +405,17 @@ static void create_line_label(EpubViewer *viewer, const char *text, int len,
     lv_obj_set_style_text_color(label, lv_color_black(), 0);
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, *y_offset);
     lv_label_set_text(label, buf);
+    g_render_label_count++;
+    /* Count UTF-8 characters in this label */
+    for (int i = 0; i < len; ) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c < 0x80) i++;
+        else if ((c & 0xE0) == 0xC0) i += 2;
+        else if ((c & 0xF0) == 0xE0) i += 3;
+        else if ((c & 0xF8) == 0xF0) i += 4;
+        else i++;
+        g_render_char_count++;
+    }
 }
 
 /* ========== 核心渲染函数 ========== */
@@ -415,7 +437,30 @@ static void update_display(EpubViewer *viewer) {
 
     printf("[UPDATE] offset=%d chapter_len=%d\n", start_offset, viewer->chapter_len);
 
+    /* 调试：重置dsc统计，标记布局阶段开始 */
+    lv_tiny_ttf_reset_dsc_stats();
+    lv_tiny_ttf_set_dsc_phase(1);
+
+    /* 设置渲染保护标志，防止REFR_TIMER在update_display期间并发渲染 */
+    g_rendering_in_progress = 1;
+
+    /* 隐藏容器以避免每个label创建时都产生invalid area，
+     * 否则lv_refr_now()会对每个invalid area重新渲染所有label(O(n²)) */
+    lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clean(viewer->content_container);
+    /* lv_obj_clean后LVGL不会立即更新coords，强制重新设置尺寸和位置，
+     * 否则容器尺寸可能停留在1x1（首页）或错误值（翻页后），
+     * 导致所有子label被裁剪到错误区域内 */
+    lv_obj_set_size(viewer->content_container, CONTENT_WIDTH, CONTENT_HEIGHT);
+    lv_obj_align(viewer->content_container, LV_ALIGN_TOP_LEFT, CONTENT_X, CONTENT_Y);
+
+    /* 调试：记录容器位置信息 */
+    printf("[DISP_DBG] container: x=%d y=%d w=%d h=%d scr_h=%d CONTENT_HEIGHT=%d\n",
+           lv_obj_get_x(viewer->content_container),
+           lv_obj_get_y(viewer->content_container),
+           lv_obj_get_width(viewer->content_container),
+           lv_obj_get_height(viewer->content_container),
+           SCREEN_HEIGHT, CONTENT_HEIGHT);
 
     int y_offset = 0;
     lv_font_t *current_font = FONT;
@@ -426,12 +471,16 @@ static void update_display(EpubViewer *viewer) {
     int line_pos = 0;
     int line_width = 0;
 
-    while (p < end && y_offset < CONTENT_HEIGHT) {
+    int line_num = 0;
+    while (p < end && y_offset + current_lh <= CONTENT_HEIGHT) {
         /* Check for font marker: 0x02 level 0x03 */
         if ((unsigned char)*p == 0x02 && (p + 2) < end &&
             *(p + 1) >= '0' && *(p + 1) <= '3' && (unsigned char)*(p + 2) == 0x03) {
             /* Flush current line */
             if (line_pos > 0) {
+                printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d\n",
+                       line_num, line_pos, line_width, y_offset, current_lh);
+                line_num++;
                 create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
                 line_pos = 0;
@@ -451,6 +500,9 @@ static void update_display(EpubViewer *viewer) {
         /* Handle newline */
         if (*p == '\n') {
             if (line_pos > 0) {
+                printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d\n",
+                       line_num, line_pos, line_width, y_offset, current_lh);
+                line_num++;
                 create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
                 line_pos = 0;
@@ -465,14 +517,21 @@ static void update_display(EpubViewer *viewer) {
         if (p + clen > end) break;
 
         uint32_t unicode = utf8_to_unicode(p);
-        int adv = get_char_adv_width(unicode);
+        int adv = get_char_adv_width(unicode, current_font);
 
         /* If adding this char exceeds line width, flush current line first */
         if (line_width + adv > CONTENT_WIDTH && line_pos > 0) {
+            printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d WRAP\n",
+                   line_num, line_pos, line_width, y_offset, current_lh);
+            line_num++;
             create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
             y_offset += current_lh;
             line_pos = 0;
             line_width = 0;
+            if (y_offset + current_lh > CONTENT_HEIGHT) {
+                p += clen;
+                break;
+            }
         }
 
         /* Add character to line buffer */
@@ -484,12 +543,53 @@ static void update_display(EpubViewer *viewer) {
     }
 
     /* Flush remaining text */
-    if (line_pos > 0 && y_offset < CONTENT_HEIGHT) {
+    if (line_pos > 0 && y_offset + current_lh <= CONTENT_HEIGHT) {
+        printf("[LINE_DBG] #%d chars=%d x_wid=%d y=%d lh=%d LAST\n",
+               line_num, line_pos, line_width, y_offset, current_lh);
         create_line_label(viewer, line_buf, line_pos, current_font, &y_offset);
+    } else if (line_pos > 0) {
+        printf("[LINE_DBG] SKIP chars=%d y=%d+%d>%d\n",
+               line_pos, y_offset, current_lh, CONTENT_HEIGHT);
     }
 
     /* 记录本页结束位置（下一页的起始） */
     viewer->page_end_offset = (int)(p - viewer->decoded_text_buf);
+
+    /* [PAGE_TEXT] 调试输出：每页解码后的文字内容 */
+    {
+        int txt_len = viewer->page_end_offset - start_offset;
+        if (txt_len > 0) {
+            const char *txt_start = viewer->decoded_text_buf + start_offset;
+            /* 先打印页面范围 */
+            printf("[PAGE_TEXT] === offset=%d~%d (%d bytes) ===\n",
+                   start_offset, viewer->page_end_offset, txt_len);
+            /* 逐行输出，以\n为分隔符，每行最多80字节 */
+            const char *line_start = txt_start;
+            const char *txt_end = txt_start + txt_len;
+            int line_no = 0;
+            while (line_start < txt_end) {
+                /* 找到行尾 */
+                const char *line_end = line_start;
+                while (line_end < txt_end && *line_end != '\n') line_end++;
+                int llen = (int)(line_end - line_start);
+                if (llen > 80) llen = 80; /* 限制每行输出长度 */
+                /* 输出hex和可打印字符 */
+                char hex_buf[241], ascii_buf[81]; /* 80*3+1=241, was 161 causing stack overflow */
+                int hx = 0;
+                for (int i = 0; i < llen; i++) {
+                    unsigned char c = (unsigned char)line_start[i];
+                    hx += sprintf(hex_buf + hx, "%02X ", c);
+                    ascii_buf[i] = (c >= 0x20 && c < 0x7F) ? c : '.';
+                }
+                ascii_buf[llen] = '\0';
+                hex_buf[hx] = '\0';
+                printf("[PAGE_TXT:%d] %s | %s\n", line_no, ascii_buf, hex_buf);
+                line_no++;
+                line_start = line_end + 1; /* 跳过\n */
+            }
+            printf("[PAGE_TEXT] === end ===\n");
+        }
+    }
 
     /* 更新百分比指示器 */
     float pct = get_read_percentage(viewer);
@@ -509,14 +609,56 @@ static void update_display(EpubViewer *viewer) {
     /* 更新工具栏信息 */
     update_toolbar_info(viewer);
 
+    printf("[RENDER_DBG] page_labels=%d page_chars=%d offset_span=%d\n",
+           g_render_label_count, g_render_char_count,
+           viewer->page_end_offset - start_offset);
+    g_render_label_count = 0;
+    g_render_char_count = 0;
+    printf("[RENDER_DBG] total_lines=%d CONTENT_WIDTH=%d CONTENT_HEIGHT=%d\n",
+           line_num, CONTENT_WIDTH, CONTENT_HEIGHT);
+    /* 恢复容器可见，此时只产生一次invalid area（容器整体），避免O(n²)重渲染 */
+    lv_obj_clear_flag(viewer->content_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_invalidate(viewer->content_container);
+
+    /* 调试：打印布局阶段dsc统计 */
+    {
+        int layout_total, layout_hits, layout_misses, layout_non_cjk;
+        int layout_unique_miss = lv_tiny_ttf_get_dsc_stats(&layout_total, &layout_hits, &layout_misses, &layout_non_cjk);
+        printf("[DSC_STATS] layout phase: total=%d hits=%d misses=%d non_cjk=%d unique_miss=%d\n",
+               layout_total, layout_hits, layout_misses, layout_non_cjk, layout_unique_miss);
+        if(layout_unique_miss > 0) {
+            extern uint32_t *lv_tiny_ttf_get_miss_uniques(void);
+            /* 打印前20个miss的unicode */
+            printf("[DSC_MISS_CHARS]");
+            /* 直接使用stats API获取miss列表 */
+        }
+    }
+
+    /* 标记渲染阶段 */
+    lv_tiny_ttf_reset_dsc_stats();
+    lv_tiny_ttf_set_dsc_phase(2);
+
     /* 强制LVGL同步完成所有渲染（包括字形渲染），确保framebuffer内容完整
      * 然后再触发EPD刷新，避免EPD DU读到不完整的画面 */
+    uint32_t t_refr_start = xTaskGetTickCount();
+    lv_tiny_ttf_bitmap_page_start();
     lv_refr_now(NULL);
+    lv_tiny_ttf_bitmap_page_end();
+    g_rendering_in_progress = 0;
+    uint32_t t_refr_end = xTaskGetTickCount();
+
+    /* 调试：打印渲染阶段dsc统计 */
+    {
+        int render_total, render_hits, render_misses, render_non_cjk;
+        int render_unique_miss = lv_tiny_ttf_get_dsc_stats(&render_total, &render_hits, &render_misses, &render_non_cjk);
+        printf("[DSC_STATS] render phase: total=%d hits=%d misses=%d non_cjk=%d unique_miss=%d\n",
+               render_total, render_hits, render_misses, render_non_cjk, render_unique_miss);
+    }
 
     epd_mark_refresh_pending();
-    uint32_t t5 = xTaskGetTickCount();
-    printf("[UPDATE] done: %u ticks, offset=%d->%d pct=%.2f%% y=%d\n",
-           t5 - t0, start_offset, viewer->page_end_offset, pct, y_offset);
+    printf("[RENDER_DBG] layout=%dms refr_now=%dms total=%dms offset=%d->%d pct=%.2f%% y=%d\n",
+           (t_refr_start - t0), (t_refr_end - t_refr_start), (t_refr_end - t0),
+           start_offset, viewer->page_end_offset, pct, y_offset);
 }
 
 /* ========== 创建/销毁 ========== */
@@ -623,7 +765,7 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_transition(btn_back, NULL, LV_PART_MAIN);
     epd_disable_all_animations_recursive(btn_back);
     lv_obj_t *lbl_back = lv_label_create(btn_back);
-    lv_label_set_text(lbl_back, LV_SYMBOL_HOME);
+    lv_label_set_text(lbl_back, "Home");
     lv_obj_set_style_text_font(lbl_back, ui_font, 0);
     lv_obj_center(lbl_back);
     lv_obj_add_event_cb(btn_back, close_viewer_cb, LV_EVENT_CLICKED, viewer);
@@ -640,7 +782,7 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_transition(btn_toc, NULL, LV_PART_MAIN);
     epd_disable_all_animations_recursive(btn_toc);
     lv_obj_t *lbl_toc = lv_label_create(btn_toc);
-    lv_label_set_text(lbl_toc, LV_SYMBOL_LIST);
+    lv_label_set_text(lbl_toc, "TOC");
     lv_obj_set_style_text_font(lbl_toc, ui_font, 0);
     lv_obj_center(lbl_toc);
     lv_obj_add_event_cb(btn_toc, toc_btn_cb, LV_EVENT_CLICKED, viewer);
@@ -681,7 +823,7 @@ static void create_toolbar(EpubViewer *viewer) {
 
     /* 第3行：百分比跳转 */
     lv_obj_t *goto_label = lv_label_create(viewer->toolbar);
-    lv_label_set_text(goto_label, LV_SYMBOL_EDIT);
+    lv_label_set_text(goto_label, "Jump");
     lv_obj_set_style_text_font(goto_label, ui_font, 0);
     lv_obj_set_style_text_color(goto_label, lv_color_black(), 0);
     lv_obj_set_pos(goto_label, 4, 62);
@@ -717,7 +859,7 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_transition(goto_btn, NULL, LV_PART_MAIN);
     epd_disable_all_animations_recursive(goto_btn);
     lv_obj_t *goto_lbl = lv_label_create(goto_btn);
-    lv_label_set_text(goto_lbl, LV_SYMBOL_NEW_LINE);
+    lv_label_set_text(goto_lbl, "Go");
     lv_obj_set_style_text_font(goto_lbl, ui_font, 0);
     lv_obj_center(goto_lbl);
     lv_obj_add_event_cb(goto_btn, goto_btn_cb, LV_EVENT_CLICKED, viewer);
@@ -863,6 +1005,8 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_pad_all(viewer->content_container, 0, 0);
     lv_obj_clear_flag(viewer->content_container, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
                       LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
+    /* 让content_container的事件冒泡到screen，使screen上注册的触摸回调能正常触发 */
+    lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_EVENT_BUBBLE);
     epd_disable_all_animations_recursive(viewer->content_container);
 
     /* 进度条背景 */
@@ -898,9 +1042,9 @@ void epub_viewer_show(EpubViewer *viewer) {
     /* 创建隐藏式工具栏 */
     create_toolbar(viewer);
 
-    /* 全屏触控事件 */
+    /* 全屏触控事件 - 使用RELEASED事件（释放后处理避免阻塞；不受长按阈值影响） */
     lv_obj_set_user_data(viewer->screen, viewer);
-    lv_obj_add_event_cb(viewer->screen, content_area_event_cb, LV_EVENT_CLICKED, viewer);
+    lv_obj_add_event_cb(viewer->screen, content_area_event_cb, LV_EVENT_RELEASED, viewer);
 
     lv_disp_load_scr(viewer->screen);
     VIEW_LOG("Viewer shown (new UI)\n");
@@ -1088,9 +1232,10 @@ static void prev_page_handler(EpubViewer *viewer) {
 
 static void content_area_event_cb(lv_event_t *e) {
     lv_event_code_t code = lv_event_get_code(e);
-    if (code != LV_EVENT_CLICKED && code != LV_EVENT_RELEASED) return;
+    /* 使用RELEASED而非CLICKED：触摸持续>400ms时LVGL不发CLICKED事件（长按检测），
+     * PRESSED虽然也触发但会阻塞释放信号处理，RELEASED在手指抬起时触发最合适 */
+    if (code != LV_EVENT_RELEASED) return;
 
-    lv_obj_t *target = lv_event_get_target(e);
     EpubViewer *viewer = (EpubViewer *)lv_event_get_user_data(e);
     if (!viewer) return;
 
@@ -1286,7 +1431,7 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
     epd_disable_all_animations_recursive(header);
 
     lv_obj_t *toc_title = lv_label_create(header);
-    lv_label_set_text(toc_title, LV_SYMBOL_LIST " TOC");
+    lv_label_set_text(toc_title, "TOC");
     lv_obj_set_style_text_font(toc_title, ui_font, 0);
     lv_obj_set_style_text_color(toc_title, lv_color_black(), 0);
     lv_obj_align(toc_title, LV_ALIGN_LEFT_MID, 4, 0);
