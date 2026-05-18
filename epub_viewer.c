@@ -1014,8 +1014,11 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_pad_all(viewer->content_container, 0, 0);
     lv_obj_clear_flag(viewer->content_container, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
                       LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
-    /* 让content_container的事件冒泡到screen，使screen上注册的触摸回调能正常触发 */
-    lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_EVENT_BUBBLE);
+    /* content_container必须同时具备CLICKABLE和EVENT_BUBBLE：
+     * CLICKABLE使LVGL将其识别为有效的触摸目标对象（否则触摸事件被忽略），
+     * EVENT_BUBBLE使RELEASED等事件向上冒泡到screen（回调注册在screen上）。
+     * 缺少CLICKABLE是翻页失效的根因——LVGL不会向不可点击的对象发送触摸事件。 */
+    lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
     epd_disable_all_animations_recursive(viewer->content_container);
 
     /* 进度条背景 */
