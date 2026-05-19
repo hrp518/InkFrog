@@ -69,6 +69,10 @@ void lv_tiny_ttf_bitmap_page_start(void);
 /* bitmap cache: mark end of page render, print timing stats */
 void lv_tiny_ttf_bitmap_page_end(void);
 
+/* DSC L2 cache: reset on page change */
+void lv_tiny_ttf_reset_dsc_l2_cache(void);
+int lv_tiny_ttf_get_l2_hits(void);
+
 /**********************
  *      MACROS
  **********************/

@@ -29,6 +29,18 @@
 
 #define LEVEL1_GLYPH_CACHE_SIZE 3600  /* 3500 CJK + 95 ASCII + 5 reserve */
 
+/* ===== Verbose debug logging switches (set to 0 to suppress, 1 to enable) =====
+ * These macros control per-character verbose output during page rendering.
+ * Disabling them saves ~7 seconds of serial output time per page turn.
+ * ALL logging code is preserved — only the printf calls are compiled out.
+ * Summary-level logs (BM_RENDER summary, DSC_STATS, EPD_RENDER, etc.) remain active.
+ */
+#define TTF_DEBUG_BITMAP_VERBOSE   0  /* FB_AREA ASCII art, GLYPH_HEX, GLYPH_BITMAP per char */
+#define TTF_DEBUG_CACHE_HIT_VERBOSE 0 /* FB_CACHE_HIT + full ASCII art on cache hit */
+#define TTF_DEBUG_METRICS_VERBOSE  0  /* CJK_METRICS per-char output in layout phase */
+#define TTF_DEBUG_MISMATCH_VERBOSE 0  /* MISMATCH debug between dsc cache and actual render */
+/* ============================================================================= */
+
 typedef struct {
     uint16_t adv_w_raw;   // unscaled advance width from hmtx
     uint16_t box_w_raw;   // unscaled bbox width (xMax - xMin + 1)
@@ -1153,6 +1165,25 @@ static int g_dsc_phase = 0; /* 0=unknown, 1=layout, 2=render */
 static uint32_t g_dsc_miss_uniques[200]; /* 记录miss的唯一unicode */
 static int g_dsc_miss_unique_count = 0;
 
+/* === DSC L2 缓存：缓存最终缩放后的 lv_font_glyph_dsc_t，避免重复 PSRAM 读取和 FP 运算 === */
+#define DSC_L2_CACHE_SIZE 512
+typedef struct {
+    uint32_t unicode;
+    const void *font_dsc_ptr;   /* font->dsc 指针，区分不同字号 */
+    lv_font_glyph_dsc_t dsc_result;
+    uint8_t valid;
+} dsc_l2_entry_t;
+
+static dsc_l2_entry_t g_dsc_l2_cache[DSC_L2_CACHE_SIZE];
+static int g_dsc_l2_hits = 0;
+
+void lv_tiny_ttf_reset_dsc_l2_cache(void) {
+    memset(g_dsc_l2_cache, 0, sizeof(g_dsc_l2_cache));
+    g_dsc_l2_hits = 0;
+}
+
+int lv_tiny_ttf_get_l2_hits(void) { return g_dsc_l2_hits; }
+
 void lv_tiny_ttf_set_dsc_phase(int phase) { g_dsc_phase = phase; }
 int lv_tiny_ttf_get_dsc_stats(int *total, int *hits, int *misses, int *non_cjk) {
     if(total) *total = g_dsc_total_calls;
@@ -1190,6 +1221,17 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
 
     ttf_font_desc_t * dsc = (ttf_font_desc_t *)font->dsc;
 
+    /* === DSC L2 cache lookup: avoid repeated PSRAM reads + FP math === */
+    {
+        uint32_t l2_hash = (unicode_letter ^ ((uint32_t)dsc >> 3)) % DSC_L2_CACHE_SIZE;
+        dsc_l2_entry_t *e = &g_dsc_l2_cache[l2_hash];
+        if(e->valid && e->unicode == unicode_letter && e->font_dsc_ptr == (const void *)dsc) {
+            g_dsc_l2_hits++;
+            *dsc_out = e->dsc_result;
+            return true;
+        }
+    }
+
     /* ASCII fast path: use pre-filled ascii_metrics_cache (zero IO) */
     if(unicode_letter >= ASCII_METRICS_START && unicode_letter <= ASCII_METRICS_END) {
         ttf_metrics_entry_t *amc = dsc->ascii_metrics_cache ? dsc->ascii_metrics_cache : g_shared_ascii_metrics_cache;
@@ -1213,6 +1255,10 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
                 dsc_out->ofs_y = (int16_t)(-ry2);
                 dsc_out->bpp = 8;
                 dsc_out->is_placeholder = false;
+                /* Store to L2 cache */
+                { uint32_t _h = (unicode_letter ^ ((uint32_t)dsc >> 3)) % DSC_L2_CACHE_SIZE;
+                  g_dsc_l2_cache[_h].unicode = unicode_letter; g_dsc_l2_cache[_h].font_dsc_ptr = (const void *)dsc;
+                  g_dsc_l2_cache[_h].dsc_result = *dsc_out; g_dsc_l2_cache[_h].valid = 1; }
                 return true;
             }
             if(amc[aidx].valid == 2) return false;
@@ -1250,7 +1296,12 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
             dsc_out->ofs_y = (int16_t)(-ry2);
             dsc_out->bpp = 8;
             dsc_out->is_placeholder = false;
+            /* Store to L2 cache */
+            { uint32_t _h = (unicode_letter ^ ((uint32_t)dsc >> 3)) % DSC_L2_CACHE_SIZE;
+              g_dsc_l2_cache[_h].unicode = unicode_letter; g_dsc_l2_cache[_h].font_dsc_ptr = (const void *)dsc;
+              g_dsc_l2_cache[_h].dsc_result = *dsc_out; g_dsc_l2_cache[_h].valid = 1; }
             
+#if TTF_DEBUG_METRICS_VERBOSE
             static int debug_cjk_count = 0;
             if(debug_cjk_count < 5) {
                 printf("[CJK_METRICS] U+%04X scale=%.4f adv_raw=%u adv=%u box=%ux%u ofs=%d,%d\n",
@@ -1260,6 +1311,7 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
                        dsc_out->ofs_x, dsc_out->ofs_y);
                 debug_cjk_count++;
             }
+#endif
             return true;
         }
         if(dsc->metrics_cache && dsc->metrics_cache[idx].valid == 2) {
@@ -1335,6 +1387,11 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
         }
     }
 
+    /* Store to L2 cache */
+    { uint32_t _h = (unicode_letter ^ ((uint32_t)dsc >> 3)) % DSC_L2_CACHE_SIZE;
+      g_dsc_l2_cache[_h].unicode = unicode_letter; g_dsc_l2_cache[_h].font_dsc_ptr = (const void *)dsc;
+      g_dsc_l2_cache[_h].dsc_result = *dsc_out; g_dsc_l2_cache[_h].valid = 1; }
+
     return true;
 }
 
@@ -1365,7 +1422,7 @@ static void epd_gamma_lut_init(void)
 }
 
 // === Multi-slot bitmap cache ===
-#define BITMAP_CACHE_SLOTS 256
+#define BITMAP_CACHE_SLOTS 512
 typedef struct {
     uint32_t unicode;
     const void * font_dsc;  /* font->dsc to distinguish different font instances/sizes */
@@ -1456,6 +1513,7 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
         if(g_bm_cache[slot].unicode == unicode_letter && g_bm_cache[slot].font_dsc == my_dsc && g_bm_cache[slot].bitmap) {
             g_bm_cache[slot].tick = g_bm_cache_tick;
             g_bm_cache_hits++;
+#if TTF_DEBUG_CACHE_HIT_VERBOSE
             /* Print full FB_AREA for specific chars even on cache hit */
             if(unicode_letter == 0x4EBA || unicode_letter == 0x7684) {
                 printf("[FB_CACHE_HIT] U+%04X sz=%u scale=%.4f dsc=%p\n", 
@@ -1477,6 +1535,7 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
                     printf("\n");
                 }
             }
+#endif
             return g_bm_cache[slot].bitmap;
         }
         if(g_bm_cache[slot].bitmap == NULL) break;
@@ -1549,6 +1608,7 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
     g_bm_cache[best_slot].szb = (uint32_t)szb;
     g_bm_cache[best_slot].tick = g_bm_cache_tick;
     
+#if TTF_DEBUG_BITMAP_VERBOSE
     /* ONLY capture specific chars for debugging: 人=0x4EBA, 的=0x7684 */
     int dbg_this = (unicode_letter == 0x4EBA || unicode_letter == 0x7684) ? 1 : 0;
     if(dbg_this) {
@@ -1574,7 +1634,9 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
             printf("\n");
         }
     }
+#endif
 
+#if TTF_DEBUG_MISMATCH_VERBOSE
     static int debug_mismatch_count = 0;
     if(debug_mismatch_count < 10 && unicode_letter >= CJK_METRICS_START) {
         uint32_t idx = unicode_letter - CJK_METRICS_START;
@@ -1599,6 +1661,7 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
             }
         }
     }
+#endif
     
     return buffer;
 }

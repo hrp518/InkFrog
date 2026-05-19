@@ -373,15 +373,29 @@ static uint32_t utf8_to_unicode(const char *p) {
     if ((s[0] & 0xF8) == 0xF0) return ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F);
     return s[0];
 }
-
+/* CJK快速宽度缓存：同字号下所有CJK字符advance width相同，只需查一次 */
+static int g_cjk_adv_width = -1;
+static lv_font_t *g_cjk_adv_font = NULL;
 /* Get character advance width in pixels for line wrapping.
- * Uses LVGL font API for accurate metrics instead of hardcoded values. */
+ * Uses LVGL font API for accurate metrics instead of hardcoded values.
+ * CJK fast path: all CJK chars share same advance width, cached per font. */
 static int get_char_adv_width(uint32_t unicode, const lv_font_t *font) {
+    /* CJK fast path: all CJK Unified Ideographs share same advance width */
+    if (unicode >= 0x4E00 && unicode <= 0x9FFF) {
+        if (g_cjk_adv_font == font && g_cjk_adv_width > 0) return g_cjk_adv_width;
+        lv_coord_t w = lv_font_get_glyph_width(font, unicode, 0);
+        if (w > 0) { g_cjk_adv_width = (int)w; g_cjk_adv_font = (lv_font_t*)font; return g_cjk_adv_width; }
+        return 22;
+    }
+    /* CJK punctuation: same width as CJK */
+    if (unicode >= 0x3000 && unicode <= 0x303F) {
+        if (g_cjk_adv_font == font && g_cjk_adv_width > 0) return g_cjk_adv_width;
+        lv_coord_t w = lv_font_get_glyph_width(font, 0x4E00, 0);
+        if (w > 0) { g_cjk_adv_width = (int)w; g_cjk_adv_font = (lv_font_t*)font; return g_cjk_adv_width; }
+        return 22;
+    }
     lv_coord_t w = lv_font_get_glyph_width(font, unicode, 0);
     if (w > 0) return (int)w;
-    /* Fallback for characters not in font */
-    if (unicode >= 0x4E00 && unicode <= 0x9FFF) return 22;
-    if (unicode >= 0x3000 && unicode <= 0x303F) return 22;
     if (unicode >= 0xFF00 && unicode <= 0xFFEF) return 22;
     return 11;
 }
@@ -438,8 +452,9 @@ static void update_display(EpubViewer *viewer) {
 
     printf("[UPDATE] offset=%d chapter_len=%d\n", start_offset, viewer->chapter_len);
 
-    /* 调试：重置dsc统计，标记布局阶段开始 */
+    /* 调试：重置dsc统计和L2缓存，标记布局阶段开始 */
     lv_tiny_ttf_reset_dsc_stats();
+    lv_tiny_ttf_reset_dsc_l2_cache();
     lv_tiny_ttf_set_dsc_phase(1);
 
     /* 设置渲染保护标志，防止REFR_TIMER在update_display期间并发渲染 */
@@ -651,17 +666,20 @@ static void update_display(EpubViewer *viewer) {
      * 然后再触发EPD刷新，避免EPD DU读到不完整的画面 */
     uint32_t t_refr_start = xTaskGetTickCount();
     lv_tiny_ttf_bitmap_page_start();
+    /* 在lv_refr_now之前清除保护标志，否则lv_refr_now内部会被REFR_TIMER
+     * 的阻塞检查(g_rendering_in_progress)挡住，导致什么都没渲染，
+     * 造成5-7秒空白期等待下一轮定时器触发 */
+    g_rendering_in_progress = 0;
     lv_refr_now(NULL);
     lv_tiny_ttf_bitmap_page_end();
-    g_rendering_in_progress = 0;
     uint32_t t_refr_end = xTaskGetTickCount();
 
     /* 调试：打印渲染阶段dsc统计 */
     {
         int render_total, render_hits, render_misses, render_non_cjk;
         int render_unique_miss = lv_tiny_ttf_get_dsc_stats(&render_total, &render_hits, &render_misses, &render_non_cjk);
-        printf("[DSC_STATS] render phase: total=%d hits=%d misses=%d non_cjk=%d unique_miss=%d\n",
-               render_total, render_hits, render_misses, render_non_cjk, render_unique_miss);
+        printf("[DSC_STATS] render phase: total=%d hits=%d misses=%d non_cjk=%d unique_miss=%d l2_hits=%d\n",
+               render_total, render_hits, render_misses, render_non_cjk, render_unique_miss, lv_tiny_ttf_get_l2_hits());
     }
 
     epd_mark_refresh_pending();
