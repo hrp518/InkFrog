@@ -40,8 +40,29 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
 #define CONTENT_HEIGHT (SCREEN_HEIGHT - 36)
 /* 工具栏 */
-#define TOOLBAR_HEIGHT    100
+#define TOOLBAR_HEIGHT    130
 #define TOOLBAR_TRIGGER_Y 25
+
+/* 字体大小挡位配置（5挡） */
+#define FONT_SIZE_COUNT   5
+typedef struct {
+    int font_size;    /* 字体像素高度 */
+    int lh_body;      /* 正文体行高 */
+    int lh_h3;        /* H3行高 */
+    int lh_h2;        /* H2行高 */
+    int lh_h1;        /* H1行高 */
+} FontSizeConfig;
+
+static const FontSizeConfig g_font_sizes[FONT_SIZE_COUNT] = {
+    { 12, 16, 20, 22, 26 },  /* 挡位1: 极小 */
+    { 14, 19, 23, 26, 30 },  /* 挡位2: 小 */
+    { 16, 22, 26, 30, 34 },  /* 挡位3: 中（默认） */
+    { 18, 25, 29, 33, 37 },  /* 挡位4: 大 */
+    { 20, 28, 32, 36, 40 },  /* 挡位5: 极大 */
+};
+
+/* 当前字体大小挡位索引（默认挡位3 = 16px） */
+static int g_font_size_index = 2;
 
 /* 偏移历史栈 */
 #define OFFSET_HISTORY_SIZE 32
@@ -127,6 +148,7 @@ static void close_viewer_cb(lv_event_t *e);
 static void toc_item_cb(lv_event_t *e);
 static void toc_close_cb(lv_event_t *e);
 static void toc_btn_cb(lv_event_t *e);
+static void font_size_btn_cb(lv_event_t *e);
 static void toolbar_close_cb(lv_event_t *e);
 static void prev_chapter_cb(lv_event_t *e);
 static void next_chapter_cb(lv_event_t *e);
@@ -478,9 +500,11 @@ static void update_display(EpubViewer *viewer) {
            lv_obj_get_height(viewer->content_container),
            SCREEN_HEIGHT, CONTENT_HEIGHT);
 
+    /* 从配置表获取当前挡位的动态行高 */
+    const FontSizeConfig *fsz_cfg = &g_font_sizes[g_font_size_index];
     int y_offset = 2;  /* +2px offset to prevent glyph top clipping (CJK ofs=-2) */
     lv_font_t *current_font = FONT;
-    int current_lh = LH_BODY;
+    int current_lh = fsz_cfg->lh_body;
 
     /* Line-by-line rendering */
     char line_buf[80];
@@ -506,10 +530,10 @@ static void update_display(EpubViewer *viewer) {
             }
             int level = *(p + 1) - '0';
             switch (level) {
-                case 1: current_font = FONT_H1; current_lh = LH_H1; break;
-                case 2: current_font = FONT_H2; current_lh = LH_H2; break;
-                case 3: current_font = FONT_H3; current_lh = LH_H3; break;
-                default: current_font = FONT; current_lh = LH_BODY; break;
+                case 1: current_font = FONT_H1; current_lh = fsz_cfg->lh_h1; break;
+                case 2: current_font = FONT_H2; current_lh = fsz_cfg->lh_h2; break;
+                case 3: current_font = FONT_H3; current_lh = fsz_cfg->lh_h3; break;
+                default: current_font = FONT; current_lh = fsz_cfg->lh_body; break;
             }
             p += 3;
             continue;
@@ -897,8 +921,43 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_text_font(chap_label, ui_font, 0);
     lv_obj_set_style_text_color(chap_label, lv_color_make(0x99, 0x99, 0x99), 0);
     lv_obj_set_pos(chap_label, 170, 64);
-    /* 用user_data存储章节label以便后续更新 - 暂时不做，简单方案 */
-    (void)chap_label;
+
+    /* 第4行：字体大小调节按钮（5挡） */
+    static const char *font_labels[FONT_SIZE_COUNT] = {"S", "s", "M", "L", "XL"};
+    int fs_btn_w = 38, fs_btn_h = 24, fs_btn_y = 92;
+    int fs_total_w = FONT_SIZE_COUNT * fs_btn_w + (FONT_SIZE_COUNT - 1) * 4;
+    int fs_start_x = (SCREEN_WIDTH - fs_total_w) / 2;
+
+    for (int i = 0; i < FONT_SIZE_COUNT; i++) {
+        lv_obj_t *fbtn = lv_btn_create(viewer->toolbar);
+        lv_obj_set_size(fbtn, fs_btn_w, fs_btn_h);
+        lv_obj_set_pos(fbtn, fs_start_x + i * (fs_btn_w + 4), fs_btn_y);
+        lv_obj_set_style_radius(fbtn, 2, 0);
+        lv_obj_set_style_transition(fbtn, NULL, LV_PART_MAIN);
+        epd_disable_all_animations_recursive(fbtn);
+        /* 高亮当前挡位 */
+        if (i == g_font_size_index) {
+            lv_obj_set_style_bg_color(fbtn, lv_color_black(), 0);
+            lv_obj_set_style_border_width(fbtn, 1, 0);
+            lv_obj_set_style_border_color(fbtn, lv_color_black(), 0);
+        } else {
+            lv_obj_set_style_bg_color(fbtn, lv_color_white(), 0);
+            lv_obj_set_style_border_width(fbtn, 1, 0);
+            lv_obj_set_style_border_color(fbtn, lv_color_make(0x99, 0x99, 0x99), 0);
+        }
+        /* 用100+index编码，避免和其他按钮冲突 */
+        lv_obj_set_user_data(fbtn, (void*)(long)(100 + i));
+        lv_obj_add_event_cb(fbtn, font_size_btn_cb, LV_EVENT_CLICKED, viewer);
+        lv_obj_t *flbl = lv_label_create(fbtn);
+        lv_label_set_text(flbl, font_labels[i]);
+        lv_obj_set_style_text_font(flbl, ui_font, 0);
+        if (i == g_font_size_index) {
+            lv_obj_set_style_text_color(flbl, lv_color_white(), 0);
+        } else {
+            lv_obj_set_style_text_color(flbl, lv_color_black(), 0);
+        }
+        lv_obj_center(flbl);
+    }
 }
 
 static void toggle_toolbar(EpubViewer *viewer) {
@@ -1306,6 +1365,55 @@ static void content_area_event_cb(lv_event_t *e) {
 }
 
 /* ========== 工具栏回调 ========== */
+
+/* 字体大小按钮回调 - 点击切换字体挡位 */
+static void font_size_btn_cb(lv_event_t *e) {
+    lv_obj_t *btn = lv_event_get_target(e);
+    int raw = (int)(long)lv_obj_get_user_data(btn);
+    int idx = raw - 100;  /* user_data存储的是100+index */
+    if (idx < 0 || idx >= FONT_SIZE_COUNT) return;
+
+    EpubViewer *viewer = (EpubViewer *)lv_event_get_user_data(e);
+    if (!viewer) return;
+
+    if (g_font_size_index == idx) return; /* 已是当前挡位 */
+
+    printf("[FONT_BTN] Switching to gear %d (size=%d)\n", idx + 1, g_font_sizes[idx].font_size);
+    g_font_size_index = idx;
+
+    /* 切换file_manager中的TTF字体大小 */
+    file_manager_set_reader_font_size(g_font_sizes[idx].font_size);
+
+    /* 重置CJK宽度缓存（字体变了） */
+    g_cjk_adv_width = -1;
+    g_cjk_adv_font = NULL;
+
+    /* 重新渲染当前页 */
+    update_display(viewer);
+
+    /* 更新字体按钮样式 - 高亮当前选中的挡位 */
+    if (viewer->toolbar) {
+        uint32_t ci, total_children = lv_obj_get_child_cnt(viewer->toolbar);
+        for (ci = 0; ci < total_children; ci++) {
+            lv_obj_t *child = lv_obj_get_child(viewer->toolbar, ci);
+            if (child && lv_obj_check_type(child, &lv_btn_class)) {
+                int child_idx = (int)(long)lv_obj_get_user_data(child);
+                if (child_idx >= 100 && child_idx < 100 + FONT_SIZE_COUNT) {
+                    int gear = child_idx - 100;
+                    if (gear == idx) {
+                        lv_obj_set_style_bg_color(child, lv_color_black(), 0);
+                        lv_obj_t *lbl = lv_obj_get_child(child, 0);
+                        if (lbl) lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
+                    } else {
+                        lv_obj_set_style_bg_color(child, lv_color_white(), 0);
+                        lv_obj_t *lbl = lv_obj_get_child(child, 0);
+                        if (lbl) lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
+                    }
+                }
+            }
+        }
+    }
+}
 
 static void toolbar_close_cb(lv_event_t *e) {
     EpubViewer *viewer = (EpubViewer *)lv_event_get_user_data(e);

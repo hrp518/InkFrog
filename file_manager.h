@@ -48,6 +48,20 @@ lv_font_t * get_reader_font_h1(void);
 lv_font_t * get_reader_font_h2(void);
 lv_font_t * get_reader_font_h3(void);
 int file_manager_prepare_reader_fonts(void);
+
+/**
+ * @brief 切换阅读器字体大小
+ * @param new_size 新的字体大小(像素高度)，如 12/14/16/18/20
+ * @return 0 成功，-1 失败
+ */
+int file_manager_set_reader_font_size(int new_size);
+
+/**
+ * @brief 获取当前阅读器字体大小
+ * @return 当前字体大小(像素高度)
+ */
+int file_manager_get_reader_font_size(void);
+
 void file_manager_print_memory_stats(const char *tag);
 
 void epd_disable_all_animations_recursive(lv_obj_t *obj);

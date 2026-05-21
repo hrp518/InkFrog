@@ -1489,9 +1489,7 @@ static const uint8_t * ttf_get_glyph_bitmap_cb(const lv_font_t * font, uint32_t 
         if(dsc->metrics_cache && dsc->metrics_cache[idx].valid == 1) valid = 1;
         if(!valid && g_shared_metrics_cache && g_shared_metrics_cache[idx].valid == 1) valid = 1;
         if(!valid) {
-            uint8_t *buf = _dma_malloc(256, DMAHEAP_PSRAM);
-            if(buf) lv_memset(buf, 0, 256);
-            return buf;
+            return NULL; /* glyph not in level1 cache */
         }
     }
     /* ASCII: check ascii_metrics_cache validity */
@@ -1823,18 +1821,34 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
                 lv_fs_close(&dsc->file);
             }
 #endif
+            /* Don't free shared caches - they persist across font size changes.
+             * Only detach pointers so the new font can reuse them. */
             if(dsc->metrics_cache) {
-                _dma_free(dsc->metrics_cache, DMAHEAP_PSRAM);
+                if(dsc->metrics_cache != g_shared_metrics_cache) {
+                    _dma_free(dsc->metrics_cache, DMAHEAP_PSRAM);
+                }
                 dsc->metrics_cache = NULL;
             }
+            if(dsc->ascii_metrics_cache) {
+                if(dsc->ascii_metrics_cache != g_shared_ascii_metrics_cache) {
+                    _dma_free(dsc->ascii_metrics_cache, DMAHEAP_PSRAM);
+                }
+                dsc->ascii_metrics_cache = NULL;
+            }
             if(dsc->level1_glyphs) {
-                _dma_free(dsc->level1_glyphs, DMAHEAP_PSRAM);
+                if(dsc->level1_glyphs != g_shared_level1_glyphs) {
+                    _dma_free(dsc->level1_glyphs, DMAHEAP_PSRAM);
+                }
                 dsc->level1_glyphs = NULL;
             }
             if(dsc->level1_glyf_data) {
-                psram_free(dsc->level1_glyf_data);
+                if(dsc->level1_glyf_data != g_shared_level1_glyf_data) {
+                    psram_free(dsc->level1_glyf_data);
+                }
                 dsc->level1_glyf_data = NULL;
             }
+            /* Clear bitmap cache on font destroy (glyphs rendered for old size are invalid) */
+            lv_tiny_ttf_bitmap_cache_reset();
             TTF_FREE(dsc);
         }
         TTF_FREE(font);

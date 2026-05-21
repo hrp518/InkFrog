@@ -1601,4 +1601,74 @@ lv_font_t *get_reader_font_h3(void)
     return custom_ttf_font_h3;
 }
 
+/* 当前字体大小（像素高度） */
+static int s_current_font_size = 16;
+
+int file_manager_set_reader_font_size(int new_size)
+{
+#if LV_USE_TINY_TTF
+    if (new_size == s_current_font_size && custom_ttf_font != NULL) {
+        return 0;  /* 大小未变，无需操作 */
+    }
+    if (new_size < 10 || new_size > 28) {
+        printf("[FONT] Invalid font size: %d (range: 10-28)\n", new_size);
+        return -1;
+    }
+    if (ttf_file_path[0] == '\0') {
+        printf("[FONT] No TTF file available for resize\n");
+        return -1;
+    }
+
+    printf("[FONT] Switching font size: %d -> %d\n", s_current_font_size, new_size);
+
+    /* 销毁旧字体（body + h1/h2/h3 全部销毁，避免悬空指针） */
+    if (custom_ttf_font != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font);
+        custom_ttf_font = NULL;
+    }
+    if (custom_ttf_font_h3 != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font_h3);
+        custom_ttf_font_h3 = NULL;
+    }
+    if (custom_ttf_font_h2 != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font_h2);
+        custom_ttf_font_h2 = NULL;
+    }
+    if (custom_ttf_font_h1 != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font_h1);
+        custom_ttf_font_h1 = NULL;
+    }
+
+    /* 创建新字号 body 字体 */
+    custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, new_size);
+    if (custom_ttf_font == NULL) {
+        printf("[FONT] Failed to create font at size %d, fallback to 16\n", new_size);
+        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, 16);
+        if (custom_ttf_font != NULL) {
+            custom_ttf_font->fallback = &lv_font_misans_16;
+            s_current_font_size = 16;
+        }
+        return -1;
+    }
+    custom_ttf_font->fallback = &lv_font_misans_16;
+    s_current_font_size = new_size;
+
+    /* 按比例重建 h3/h2/h1 字体（与body保持固定偏移：+2/+4/+6） */
+    custom_ttf_font_h3 = create_ttf_font_at_size(new_size + 2);
+    custom_ttf_font_h2 = create_ttf_font_at_size(new_size + 4);
+    custom_ttf_font_h1 = create_ttf_font_at_size(new_size + 6);
+
+    printf("[FONT] Font size changed to %d (h3=%d h2=%d h1=%d) successfully\n",
+           new_size, new_size + 2, new_size + 4, new_size + 6);
+    return 0;
+#else
+    return -1;
+#endif
+}
+
+int file_manager_get_reader_font_size(void)
+{
+    return s_current_font_size;
+}
+
 #endif /* LV_USE_TINY_TTF */
