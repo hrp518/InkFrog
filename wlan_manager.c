@@ -29,6 +29,7 @@
 /* 全局变量 */
 static volatile WLAN_State_t g_wlan_state = WLAN_STATE_IDLE;
 static int g_connected = 0;
+static volatile int g_connect_canceled = 0;  /* 取消连接标志 */
 
 /* 获取WLAN netif - 使用SDK内部的g_wlan_netif */
 static struct netif* wlan_get_netif(void)
@@ -210,6 +211,12 @@ int wlan_manager_wait_for_ip(uint32_t timeout_ms)
             WLAN_LOG("Network up but IP not ready, waiting...");
         }
         
+        /* 检查是否被取消 */
+        if (g_connect_canceled) {
+            WLAN_LOG("WiFi connect canceled by user");
+            return -1;
+        }
+        
         /* 检查超时 */
         if (elapsed >= timeout_ticks) {
             /* 最后再检查一次IP */
@@ -237,6 +244,35 @@ void wlan_manager_register_callback(WLAN_Callback_t callback, void *user_data)
     /* 回调功能暂未实现 */
 }
 
+/*
+ * 取消正在进行的WiFi连接
+ * 用于进入FM/EPUB阅读器前释放WiFi连接占用的内存
+ */
+void wlan_manager_cancel_connect(void)
+{
+    WLAN_State_t state = g_wlan_state;
+    
+    if (state == WLAN_STATE_CONNECTED) {
+        WLAN_LOG("Already connected, skip cancel");
+        return;
+    }
+    
+    if (state == WLAN_STATE_CONNECTING || state == WLAN_STATE_IDLE) {
+        WLAN_LOG("Canceling WiFi connect (current state=%d)", state);
+        
+        /* 设置取消标志，让wait_for_ip轮询退出 */
+        g_connect_canceled = 1;
+        
+        /* 停STA，释放WLAN资源 */
+        wlan_sta_disable();
+        
+        /* 重置状态 */
+        g_wlan_state = WLAN_STATE_IDLE;
+        g_connected = 0;
+        
+        WLAN_LOG("WiFi connect canceled, resources released");
+    }
+}
 /*
  * 设置连接状态（内部使用）
  */

@@ -711,6 +711,12 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
     // 【EPD优化】先暂停刷新，防止刷出半成品UI
     epd_pause_refresh();
     
+    // 【内存优化】如果WiFi还没连上，取消后台连接以释放内存给FM/EPUB阅读器
+    if (wlan_manager_get_state() != WLAN_STATE_CONNECTED) {
+        printf("[FM] WiFi not connected, canceling background connect to free memory\n");
+        wlan_manager_cancel_connect();
+    }
+    
     // 挂载SD卡文件系统
     printf("[FM] Mounting SD card...\n");
     fs_ctrl_mount(FS_MNT_DEV_TYPE_SDCARD, 0);

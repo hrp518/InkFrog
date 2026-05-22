@@ -83,6 +83,13 @@ int wlan_manager_wait_for_ip(uint32_t timeout_ms);
 void wlan_manager_register_callback(WLAN_Callback_t callback, void *user_data);
 
 /*
+ * 取消正在进行的WiFi连接（用于进入FM前释放内存）
+ * 如果WiFi已连接，不做任何操作
+ * 如果WiFi正在连接中，停止连接并释放资源
+ */
+void wlan_manager_cancel_connect(void);
+
+/*
  * 启动WLAN管理任务（内部使用）
  */
 void wlan_manager_task(void *arg);
