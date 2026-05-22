@@ -35,11 +35,11 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define SCREEN_WIDTH   240
 #define SCREEN_HEIGHT  415
 
-/* 内容区：几乎全屏，顶部8px padding，底部留28px给进度条+百分比 */
+/* 内容区：几乎全屏，顶部14px padding，底部留4px margin */
 #define CONTENT_X      10
 #define CONTENT_Y      14
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
-#define CONTENT_HEIGHT (SCREEN_HEIGHT - 36)
+#define CONTENT_HEIGHT (SCREEN_HEIGHT - 18)
 /* 工具栏 */
 #define TOOLBAR_HEIGHT    130
 #define TOOLBAR_TRIGGER_Y 130
@@ -194,8 +194,8 @@ static void history_clear(EpubViewer *viewer) {
 
 static float get_read_percentage(EpubViewer *viewer) {
     if (!viewer || viewer->chapter_len <= 0) return 0.0f;
-    /* 使用page_end_offset作为当前阅读进度，因为read_offset在渲染后会被更新 */
-    int pos = viewer->page_end_offset;
+    /* 使用read_offset（页首）作为当前阅读进度，与跳转百分比一致 */
+    int pos = viewer->read_offset;
     if (pos <= 0) return 0.0f;
     if (pos >= viewer->chapter_len) return 100.0f;
     return (float)pos * 100.0f / (float)viewer->chapter_len;
@@ -1136,35 +1136,10 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
     epd_disable_all_animations_recursive(viewer->content_container);
 
-    /* 进度条背景 */
-    viewer->progress_bg = lv_obj_create(viewer->screen);
-    lv_obj_set_size(viewer->progress_bg, SCREEN_WIDTH - 20, 2);
-    lv_obj_align(viewer->progress_bg, LV_ALIGN_BOTTOM_LEFT, 10, -16);
-    lv_obj_set_style_bg_color(viewer->progress_bg, lv_color_make(0xEE, 0xEE, 0xEE), 0);
-    lv_obj_set_style_bg_opa(viewer->progress_bg, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(viewer->progress_bg, 0, 0);
-    lv_obj_set_style_radius(viewer->progress_bg, 0, 0);
-    lv_obj_set_style_pad_all(viewer->progress_bg, 0, 0);
-    lv_obj_clear_flag(viewer->progress_bg, LV_OBJ_FLAG_SCROLLABLE);
-    epd_disable_all_animations_recursive(viewer->progress_bg);
-
-    /* 进度条填充 */
-    viewer->progress_bar = lv_obj_create(viewer->progress_bg);
-    lv_obj_set_size(viewer->progress_bar, 0, 2);
-    lv_obj_set_pos(viewer->progress_bar, 0, 0);
-    lv_obj_set_style_bg_color(viewer->progress_bar, lv_color_make(0x99, 0x99, 0x99), 0);
-    lv_obj_set_style_bg_opa(viewer->progress_bar, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(viewer->progress_bar, 0, 0);
-    lv_obj_set_style_radius(viewer->progress_bar, 0, 0);
-    lv_obj_set_style_pad_all(viewer->progress_bar, 0, 0);
-    epd_disable_all_animations_recursive(viewer->progress_bar);
-
-    /* 底部百分比文字 */
-    viewer->pct_indicator = lv_label_create(viewer->screen);
-    lv_label_set_text(viewer->pct_indicator, "0.00%");
-    lv_obj_set_style_text_font(viewer->pct_indicator, ui_font, 0);
-    lv_obj_set_style_text_color(viewer->pct_indicator, lv_color_make(0x99, 0x99, 0x99), 0);
-    lv_obj_align(viewer->pct_indicator, LV_ALIGN_BOTTOM_MID, 0, -2);
+    /* 不在阅读界面创建进度条和百分比（进度信息仅在工具栏中显示） */
+    viewer->progress_bg = NULL;
+    viewer->progress_bar = NULL;
+    viewer->pct_indicator = NULL;
 
     /* 创建隐藏式工具栏 */
     create_toolbar(viewer);
