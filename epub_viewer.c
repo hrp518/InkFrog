@@ -324,9 +324,21 @@ static void filter_unsupported_chars(char *str) {
 
 /* ========== XHTML解码回调 ========== */
 
+/* 用于过滤<head>内的<title>等元数据文本 */
+static bool s_decode_in_head = false;
+
 static void decode_start_cb(const char *name, const char **atts, void *user_data) {
     EpubViewer *v = (EpubViewer *)user_data;
     if (!v) return;
+
+    /* 跟踪<head>标签，过滤其中的<title>等文本 */
+    if (strcmp(name, "head") == 0) {
+        s_decode_in_head = true;
+        return;
+    }
+    /* 在<head>内时忽略所有内容 */
+    if (s_decode_in_head) return;
+
     int remaining = DECODED_TEXT_BUF_SIZE - v->decoded_text_len - 10;
     if (remaining < 3) return;
 
@@ -352,6 +364,15 @@ static void decode_start_cb(const char *name, const char **atts, void *user_data
 static void decode_end_cb(const char *name, void *user_data) {
     EpubViewer *v = (EpubViewer *)user_data;
     if (!v) return;
+
+    /* </head>时重置标记 */
+    if (strcmp(name, "head") == 0) {
+        s_decode_in_head = false;
+        return;
+    }
+    /* 在<head>内时忽略 */
+    if (s_decode_in_head) return;
+
     int remaining = DECODED_TEXT_BUF_SIZE - v->decoded_text_len - 10;
     if (remaining < 1) return;
 
@@ -367,6 +388,9 @@ static void decode_end_cb(const char *name, void *user_data) {
 static void decode_char_cb(const char *data, int len, void *user_data) {
     EpubViewer *v = (EpubViewer *)user_data;
     if (!v || len <= 0) return;
+
+    /* 在<head>内时忽略所有字符数据（如<title>文本） */
+    if (s_decode_in_head) return;
 
     if (v->decoded_text_len + len >= DECODED_TEXT_BUF_SIZE - 10) {
         len = DECODED_TEXT_BUF_SIZE - 10 - v->decoded_text_len;
@@ -1388,10 +1412,7 @@ static void font_size_btn_cb(lv_event_t *e) {
     g_cjk_adv_width = -1;
     g_cjk_adv_font = NULL;
 
-    /* 重新渲染当前页 */
-    update_display(viewer);
-
-    /* 更新字体按钮样式 - 高亮当前选中的挡位 */
+    /* 更新字体按钮样式 - 高亮当前选中的挡位（必须在update_display之前，否则EPD刷的是旧样式） */
     if (viewer->toolbar) {
         uint32_t ci, total_children = lv_obj_get_child_cnt(viewer->toolbar);
         for (ci = 0; ci < total_children; ci++) {
@@ -1402,17 +1423,23 @@ static void font_size_btn_cb(lv_event_t *e) {
                     int gear = child_idx - 100;
                     if (gear == idx) {
                         lv_obj_set_style_bg_color(child, lv_color_black(), 0);
+                        lv_obj_set_style_border_color(child, lv_color_black(), 0);
                         lv_obj_t *lbl = lv_obj_get_child(child, 0);
                         if (lbl) lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
                     } else {
                         lv_obj_set_style_bg_color(child, lv_color_white(), 0);
+                        lv_obj_set_style_border_color(child, lv_color_make(0x99, 0x99, 0x99), 0);
                         lv_obj_t *lbl = lv_obj_get_child(child, 0);
                         if (lbl) lv_obj_set_style_text_color(lbl, lv_color_black(), 0);
                     }
                 }
             }
         }
+        lv_obj_invalidate(viewer->toolbar);
     }
+
+    /* 重新渲染当前页（样式已更新，EPD会刷新样式画面） */
+    update_display(viewer);
 }
 
 static void toolbar_close_cb(lv_event_t *e) {
