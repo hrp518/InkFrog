@@ -835,8 +835,8 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_text_font(close_lbl, ui_font, 0);
     lv_obj_center(close_lbl);
 
-    /* 第2行：按钮组（返回书架/目录/上一章/下一章） */
-    int btn_w = 52, btn_h = 26, btn_y = 28, gap = 4;
+    /* 第2行：按钮组（返回书架/目录），删除了上一章/下一章按钮 */
+    int btn_w = 112, btn_h = 26, btn_y = 28, gap = 8;
     int btn_x = 4;
 
     /* 返回书架 */
@@ -871,42 +871,8 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_text_font(lbl_toc, ui_font, 0);
     lv_obj_center(lbl_toc);
     lv_obj_add_event_cb(btn_toc, toc_btn_cb, LV_EVENT_CLICKED, viewer);
-    btn_x += btn_w + gap;
 
-    /* 上一章 */
-    lv_obj_t *btn_prev = lv_btn_create(viewer->toolbar);
-    lv_obj_set_size(btn_prev, btn_w, btn_h);
-    lv_obj_set_pos(btn_prev, btn_x, btn_y);
-    lv_obj_set_style_bg_color(btn_prev, lv_color_white(), 0);
-    lv_obj_set_style_border_width(btn_prev, 1, 0);
-    lv_obj_set_style_border_color(btn_prev, lv_color_black(), 0);
-    lv_obj_set_style_radius(btn_prev, 2, 0);
-    lv_obj_set_style_transition(btn_prev, NULL, LV_PART_MAIN);
-    epd_disable_all_animations_recursive(btn_prev);
-    lv_obj_t *lbl_prev = lv_label_create(btn_prev);
-    lv_label_set_text(lbl_prev, "<<");
-    lv_obj_set_style_text_font(lbl_prev, ui_font, 0);
-    lv_obj_center(lbl_prev);
-    lv_obj_add_event_cb(btn_prev, prev_chapter_cb, LV_EVENT_CLICKED, viewer);
-    btn_x += btn_w + gap;
-
-    /* 下一章 */
-    lv_obj_t *btn_next = lv_btn_create(viewer->toolbar);
-    lv_obj_set_size(btn_next, btn_w, btn_h);
-    lv_obj_set_pos(btn_next, btn_x, btn_y);
-    lv_obj_set_style_bg_color(btn_next, lv_color_white(), 0);
-    lv_obj_set_style_border_width(btn_next, 1, 0);
-    lv_obj_set_style_border_color(btn_next, lv_color_black(), 0);
-    lv_obj_set_style_radius(btn_next, 2, 0);
-    lv_obj_set_style_transition(btn_next, NULL, LV_PART_MAIN);
-    epd_disable_all_animations_recursive(btn_next);
-    lv_obj_t *lbl_next = lv_label_create(btn_next);
-    lv_label_set_text(lbl_next, ">>");
-    lv_obj_set_style_text_font(lbl_next, ui_font, 0);
-    lv_obj_center(lbl_next);
-    lv_obj_add_event_cb(btn_next, next_chapter_cb, LV_EVENT_CLICKED, viewer);
-
-    /* 第3行：百分比跳转 */
+    /* 第3行：百分比跳转（删除了Go按钮，点击输入框直接弹出键盘） */
     lv_obj_t *goto_label = lv_label_create(viewer->toolbar);
     lv_label_set_text(goto_label, "Jump");
     lv_obj_set_style_text_font(goto_label, ui_font, 0);
@@ -915,8 +881,8 @@ static void create_toolbar(EpubViewer *viewer) {
 
     /* 百分比输入框 */
     viewer->toolbar_goto_ta = lv_textarea_create(viewer->toolbar);
-    lv_obj_set_size(viewer->toolbar_goto_ta, 70, 24);
-    lv_obj_set_pos(viewer->toolbar_goto_ta, 22, 60);
+    lv_obj_set_size(viewer->toolbar_goto_ta, 80, 24);
+    lv_obj_set_pos(viewer->toolbar_goto_ta, 40, 60);
     lv_textarea_set_text(viewer->toolbar_goto_ta, "0.00");
     lv_textarea_set_accepted_chars(viewer->toolbar_goto_ta, "0123456789.");
     lv_textarea_set_max_length(viewer->toolbar_goto_ta, 6);
@@ -931,30 +897,14 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_label_set_text(pct_sign, "%");
     lv_obj_set_style_text_font(pct_sign, ui_font, 0);
     lv_obj_set_style_text_color(pct_sign, lv_color_black(), 0);
-    lv_obj_set_pos(pct_sign, 96, 64);
+    lv_obj_set_pos(pct_sign, 124, 64);
 
-    /* 前往按钮 */
-    lv_obj_t *goto_btn = lv_btn_create(viewer->toolbar);
-    lv_obj_set_size(goto_btn, 50, 24);
-    lv_obj_set_pos(goto_btn, 112, 60);
-    lv_obj_set_style_bg_color(goto_btn, lv_color_white(), 0);
-    lv_obj_set_style_border_width(goto_btn, 1, 0);
-    lv_obj_set_style_border_color(goto_btn, lv_color_black(), 0);
-    lv_obj_set_style_radius(goto_btn, 2, 0);
-    lv_obj_set_style_transition(goto_btn, NULL, LV_PART_MAIN);
-    epd_disable_all_animations_recursive(goto_btn);
-    lv_obj_t *goto_lbl = lv_label_create(goto_btn);
-    lv_label_set_text(goto_lbl, "Go");
-    lv_obj_set_style_text_font(goto_lbl, ui_font, 0);
-    lv_obj_center(goto_lbl);
-    lv_obj_add_event_cb(goto_btn, goto_btn_cb, LV_EVENT_CLICKED, viewer);
-
-    /* 章节信息 */
+    /* 章节信息（移到右侧） */
     lv_obj_t *chap_label = lv_label_create(viewer->toolbar);
     lv_label_set_text(chap_label, "Ch.1");
     lv_obj_set_style_text_font(chap_label, ui_font, 0);
     lv_obj_set_style_text_color(chap_label, lv_color_make(0x99, 0x99, 0x99), 0);
-    lv_obj_set_pos(chap_label, 170, 64);
+    lv_obj_set_pos(chap_label, 150, 64);
 
     /* 第4行：字体大小调节按钮（5挡） */
     static const char *font_labels[FONT_SIZE_COUNT] = {"S", "s", "M", "L", "XL"};
@@ -1012,6 +962,21 @@ static void toggle_toolbar(EpubViewer *viewer) {
 
 /* ========== 跳转键盘界面 ========== */
 
+/* 自定义数字键盘映射：替换FontAwesome符号为ASCII文本（lv_font_misans_16不含FontAwesome图标） */
+static const char * const kb_num_map[] = {
+    "1", "2", "3", "Del", "\n",
+    "4", "5", "6", "OK", "\n",
+    "7", "8", "9", "\x11", "\n",     /* \x11=LV_KEYBOARD_BACKSPACE */
+    "+/-", "0", ".", "\x12", ""      /* \x12=LV_KEYBOARD_ENTER/OK */
+};
+
+static const lv_btnmatrix_ctrl_t kb_num_ctrl[] = {
+    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1,
+    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1,
+    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1,
+    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1
+};
+
 static void show_goto_keyboard(EpubViewer *viewer) {
     if (!viewer) return;
     lv_font_t *ui_font = (lv_font_t*)&lv_font_misans_16;
@@ -1047,11 +1012,11 @@ static void show_goto_keyboard(EpubViewer *viewer) {
     lv_obj_set_style_text_color(pct_sign, lv_color_black(), 0);
     lv_obj_align_to(pct_sign, viewer->goto_ta, LV_ALIGN_OUT_RIGHT_MID, 4, 0);
 
-    /* 数字键盘 */
+    /* 数字键盘 - 使用自定义映射替换FontAwesome图标 */
     viewer->goto_kb = lv_keyboard_create(viewer->goto_screen);
     lv_obj_set_size(viewer->goto_kb, 230, 150);
     lv_obj_align(viewer->goto_kb, LV_ALIGN_BOTTOM_MID, 0, -35);
-    lv_keyboard_set_mode(viewer->goto_kb, LV_KEYBOARD_MODE_NUMBER);
+    lv_keyboard_set_map(viewer->goto_kb, LV_KEYBOARD_MODE_NUMBER, kb_num_map, kb_num_ctrl);
     lv_keyboard_set_textarea(viewer->goto_kb, viewer->goto_ta);
     epd_disable_all_animations_recursive(viewer->goto_kb);
 
