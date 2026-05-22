@@ -113,7 +113,7 @@ bool epub_viewer_next_page(EpubViewer *viewer);
  * @param chapter_index 章节索引
  * @return true 成功，false 失败
  */
-bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index);
+bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset);
 
 /**
  * @brief 显示目录
@@ -155,6 +155,33 @@ void epub_viewer_set_chapter_loaded_cb(EpubViewer *viewer, epub_chapter_loaded_c
  * @param cb 关闭回调函数（返回文件管理器时调用）
  */
 void epub_viewer_set_close_cb(EpubViewer *viewer, epub_close_callback_t cb);
+
+/**
+ * @brief 重新渲染当前页面（用于恢复书签后刷新显示）
+ * @param viewer 视图句柄
+ */
+void epub_viewer_refresh(EpubViewer *viewer);
+
+/**
+ * @brief 设置EPUB文件路径（用于书签存储）
+ * @param viewer 视图句柄
+ * @param filepath EPUB文件完整路径
+ */
+void epub_viewer_set_filepath(EpubViewer *viewer, const char *filepath);
+
+/**
+ * @brief 获取当前阅读偏移量
+ * @param viewer 视图句柄
+ * @return int 当前read_offset
+ */
+int epub_viewer_get_read_offset(EpubViewer *viewer);
+
+/**
+ * @brief 设置阅读偏移量（用于恢复书签位置）
+ * @param viewer 视图句柄
+ * @param offset 偏移量
+ */
+void epub_viewer_set_read_offset(EpubViewer *viewer, int offset);
 
 /*====================
  *   HTML简化处理函数

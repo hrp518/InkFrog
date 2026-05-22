@@ -28,6 +28,7 @@
 /* EPUB阅读器支持 */
 #include "epub_reader.h"
 #include "epub_viewer.h"
+#include "settings_storage.h"
 #include "font_priority_loader.h"
 
 extern void main_ui_create(void);
@@ -1250,10 +1251,20 @@ static void open_epub_viewer(const char *filepath)
     /* 设置EPUB关闭回调，返回文件管理器 */
     epub_viewer_set_close_cb(g_epub_viewer, file_manager_show);
     
-    epub_viewer_show(g_epub_viewer);
-    epub_viewer_goto_chapter(g_epub_viewer, 0);
+    /* 设置文件路径（用于书签存储） */
+    epub_viewer_set_filepath(g_epub_viewer, filepath);
     
-    epd_mark_refresh_pending();
+    epub_viewer_show(g_epub_viewer);
+    
+    /* 尝试恢复上次阅读位置（一次性加载，避免双刷新） */
+    int saved_chapter = 0, saved_offset = 0;
+    if (settings_load_bookmark(filepath, &saved_chapter, &saved_offset) == 0) {
+        printf("[FM] Restoring bookmark: ch=%d off=%d (single render)\n", saved_chapter, saved_offset);
+        /* goto_chapter直接使用saved_offset，只渲染一次 */
+        epub_viewer_goto_chapter(g_epub_viewer, saved_chapter, saved_offset);
+    } else {
+        epub_viewer_goto_chapter(g_epub_viewer, 0, 0);
+    }
 }
 
 /*====================

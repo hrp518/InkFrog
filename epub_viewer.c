@@ -1,6 +1,7 @@
 #include "epub_viewer.h"
 #include "epub_xhtml_parser.h"
 #include "file_manager.h"
+#include "settings_storage.h"
 #include "lv_port_disp.h"
 #include "lvgl/lvgl.h"
 #include <stdio.h>
@@ -90,6 +91,9 @@ struct EpubViewer {
     EpubReader *reader;
     lv_obj_t *screen;
     lv_obj_t *content_container;
+
+    /* EPUB文件路径（用于书签存储） */
+    char filepath[SETTINGS_MAX_PATH];
 
     /* 字节偏移定位系统 */
     int read_offset;           /* 当前渲染起始位置（decoded_text_buf偏移） */
@@ -734,6 +738,11 @@ static void update_display(EpubViewer *viewer) {
     printf("[RENDER_DBG] layout=%dms refr_now=%dms total=%dms offset=%d->%d pct=%.2f%% y=%d\n",
            (t_refr_start - t0), (t_refr_end - t_refr_start), (t_refr_end - t0),
            start_offset, viewer->page_end_offset, pct, y_offset);
+
+    /* 保存书签到settings.ini（每次翻页/跳转后自动保存） */
+    if (viewer->filepath[0] != '\0') {
+        settings_save_bookmark(viewer->filepath, viewer->current_chapter, viewer->read_offset);
+    }
 }
 
 /* ========== 创建/销毁 ========== */
@@ -786,6 +795,7 @@ static void create_toolbar(EpubViewer *viewer) {
     viewer->toolbar = lv_obj_create(viewer->screen);
     lv_obj_set_size(viewer->toolbar, SCREEN_WIDTH, TOOLBAR_HEIGHT);
     lv_obj_set_pos(viewer->toolbar, 0, -TOOLBAR_HEIGHT);
+    lv_obj_add_flag(viewer->toolbar, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_bg_color(viewer->toolbar, lv_color_white(), 0);
     lv_obj_set_style_bg_opa(viewer->toolbar, LV_OPA_COVER, 0);
     lv_obj_set_style_border_side(viewer->toolbar, LV_BORDER_SIDE_BOTTOM, 0);
@@ -990,7 +1000,11 @@ static void toggle_toolbar(EpubViewer *viewer) {
 
     if (viewer->toolbar_visible) {
         lv_obj_set_pos(viewer->toolbar, 0, 0);
+        lv_obj_clear_flag(viewer->toolbar, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(viewer->toolbar);
+        lv_obj_invalidate(viewer->toolbar);
     } else {
+        lv_obj_add_flag(viewer->toolbar, LV_OBJ_FLAG_HIDDEN);
         lv_obj_set_pos(viewer->toolbar, 0, -TOOLBAR_HEIGHT);
     }
     epd_mark_refresh_pending();
@@ -1193,8 +1207,8 @@ void epub_viewer_destroy(EpubViewer *viewer) {
 
 /* ========== 章节加载 ========== */
 
-bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index) {
-    if (!viewer || !viewer->reader) return false;
+bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset) {
+if (!viewer || !viewer->reader) return false;
     if (chapter_index < 0 || chapter_index >= viewer->reader->spine_count) return false;
 
     viewer->current_chapter = chapter_index;
@@ -1248,7 +1262,7 @@ bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index) {
 
     /* 设置百分比定位参数 */
     viewer->chapter_len = viewer->decoded_text_len;
-    viewer->read_offset = 0;
+    viewer->read_offset = (init_offset > 0 && init_offset < viewer->decoded_text_len) ? init_offset : 0;
     viewer->page_end_offset = 0;
     viewer->prev_page_start = 0;
     history_clear(viewer);
@@ -1268,7 +1282,7 @@ static void next_page_handler(EpubViewer *viewer) {
     if (viewer->page_end_offset >= viewer->chapter_len) {
         /* 尝试下一章 */
         if (viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
-            epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1);
+            epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1, 0);
         }
         return;
     }
@@ -1322,7 +1336,7 @@ static void prev_page_handler(EpubViewer *viewer) {
     } else {
         /* 已在章节开头，尝试上一章 */
         if (viewer->reader && viewer->current_chapter > 0) {
-            epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1);
+            epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1, 0);
             /* 跳到上一章末尾附近 */
             int back = viewer->chapter_len - ESTIMATED_PAGE_BYTES;
             if (back < 0) back = 0;
@@ -1468,7 +1482,7 @@ static void prev_chapter_cb(lv_event_t *e) {
     if (!viewer) return;
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
     if (viewer->reader && viewer->current_chapter > 0) {
-        epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1);
+        epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1, 0);
     }
 }
 
@@ -1477,7 +1491,7 @@ static void next_chapter_cb(lv_event_t *e) {
     if (!viewer) return;
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
     if (viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
-        epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1);
+        epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1, 0);
     }
 }
 
@@ -1678,7 +1692,7 @@ static void toc_item_cb(lv_event_t *e) {
 
     if (viewer->reader) {
         int chapter = epub_reader_jump_to_toc(viewer->reader, toc_idx);
-        if (chapter >= 0) epub_viewer_goto_chapter(viewer, chapter);
+        if (chapter >= 0) epub_viewer_goto_chapter(viewer, chapter, 0);
     }
 
     if (viewer->toc_overlay) {
@@ -1714,6 +1728,22 @@ bool epub_viewer_next_page(EpubViewer *viewer) {
 }
 
 int epub_viewer_get_current_chapter(EpubViewer *viewer) { return viewer ? viewer->current_chapter : 0; }
+
+void epub_viewer_refresh(EpubViewer *viewer) {
+    update_display(viewer);
+}
+
+void epub_viewer_set_filepath(EpubViewer *viewer, const char *filepath) {
+    if (!viewer || !filepath) return;
+    strncpy(viewer->filepath, filepath, sizeof(viewer->filepath) - 1);
+    viewer->filepath[sizeof(viewer->filepath) - 1] = '\0';
+}
+
+int epub_viewer_get_read_offset(EpubViewer *viewer) { return viewer ? viewer->read_offset : 0; }
+
+void epub_viewer_set_read_offset(EpubViewer *viewer, int offset) {
+    if (viewer) viewer->read_offset = offset;
+}
 
 int epub_viewer_get_current_page(EpubViewer *viewer) {
     /* 兼容旧接口，返回1 */
