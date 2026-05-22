@@ -1080,14 +1080,14 @@ static void show_goto_keyboard(EpubViewer *viewer) {
 
 static void cleanup_goto_screen(EpubViewer *viewer) {
     if (!viewer) return;
+    /* 先切换到阅读界面，确保display有有效screen */
+    if (viewer->screen) lv_disp_load_scr(viewer->screen);
     if (viewer->goto_kb) { lv_obj_del(viewer->goto_kb); viewer->goto_kb = NULL; }
     if (viewer->goto_ta) { lv_obj_del(viewer->goto_ta); viewer->goto_ta = NULL; }
     if (viewer->goto_screen) {
         lv_obj_del(viewer->goto_screen);
         viewer->goto_screen = NULL;
     }
-    /* 重新加载阅读界面 */
-    if (viewer->screen) lv_disp_load_scr(viewer->screen);
 }
 
 /* ========== 显示/关闭/销毁 ========== */
