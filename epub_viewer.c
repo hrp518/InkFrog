@@ -41,7 +41,7 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define CONTENT_HEIGHT (SCREEN_HEIGHT - 36)
 /* 工具栏 */
 #define TOOLBAR_HEIGHT    130
-#define TOOLBAR_TRIGGER_Y 25
+#define TOOLBAR_TRIGGER_Y 130
 
 /* 字体大小挡位配置（5挡） */
 #define FONT_SIZE_COUNT   5
@@ -1496,6 +1496,7 @@ static void goto_btn_cb(lv_event_t *e) {
     if (!viewer || !viewer->toolbar_goto_ta) return;
 
     const char *text = lv_textarea_get_text(viewer->toolbar_goto_ta);
+    printf("[GOTO_BTN] raw_text='%s'\n", text ? text : "(null)");
     float pct = 0.0f;
 
     /* 解析百分比 */
@@ -1508,6 +1509,8 @@ static void goto_btn_cb(lv_event_t *e) {
 
     int pct_x100 = (int)(pct * 100 + 0.5f);
     int new_offset = pct_to_offset(viewer, pct_x100);
+    printf("[GOTO_BTN] pct=%.2f pct_x100=%d new_offset=%d chapter_len=%d\n",
+           pct, pct_x100, new_offset, viewer->chapter_len);
 
     /* 关闭工具栏 */
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
@@ -1532,6 +1535,7 @@ static void goto_confirm_cb(lv_event_t *e) {
     if (!viewer || !viewer->goto_ta) return;
 
     const char *text = lv_textarea_get_text(viewer->goto_ta);
+    printf("[GOTO_CONFIRM] raw_text='%s'\n", text ? text : "(null)");
     float pct = 0.0f;
 
     if (text && text[0]) {
@@ -1543,6 +1547,8 @@ static void goto_confirm_cb(lv_event_t *e) {
 
     int pct_x100 = (int)(pct * 100 + 0.5f);
     int new_offset = pct_to_offset(viewer, pct_x100);
+    printf("[GOTO_CONFIRM] pct=%.2f pct_x100=%d new_offset=%d chapter_len=%d\n",
+           pct, pct_x100, new_offset, viewer->chapter_len);
 
     /* 清理键盘界面 */
     cleanup_goto_screen(viewer);
