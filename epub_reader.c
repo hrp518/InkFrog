@@ -25,7 +25,7 @@
 #define MZ_ZIP_LDH_FILENAME_LEN_OFS   26
 #define MZ_ZIP_LDH_EXTRA_LEN_OFS      28
 
-#define MAX_RAW_ENTRIES 64
+#define MAX_RAW_ENTRIES 256
 
 typedef struct {
     char name[256];
@@ -218,10 +218,22 @@ static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *b
 
 static size_t miniz_fatfs_read_cb(void *pOpaque, mz_uint64 file_ofs, void *pBuf, size_t n) {
     FIL *fp = (FIL *)pOpaque;
-    if (!fp) return 0;
-    if (f_lseek(fp, (FSIZE_t)file_ofs) != FR_OK) return 0;
+    if (!fp) { EPUB_ERR("fatfs_read: fp=NULL\n"); return 0; }
+    FRESULT res = f_lseek(fp, (FSIZE_t)file_ofs);
+    if (res != FR_OK) {
+        EPUB_ERR("fatfs_read: f_lseek to %u failed (%d)\n", (unsigned)file_ofs, (int)res);
+        return 0;
+    }
     UINT br = 0;
-    if (f_read(fp, pBuf, (UINT)n, &br) != FR_OK) return 0;
+    res = f_read(fp, pBuf, (UINT)n, &br);
+    if (res != FR_OK) {
+        EPUB_ERR("fatfs_read: f_read %u at %u failed (%d)\n", (unsigned)n, (unsigned)file_ofs, (int)res);
+        return 0;
+    }
+    if (br != (UINT)n) {
+        EPUB_ERR("fatfs_read: partial read at %u: want %u got %u\n",
+                 (unsigned)file_ofs, (unsigned)n, (unsigned)br);
+    }
     return br;
 }
 
@@ -252,6 +264,15 @@ static int fuzzy_locate_file(mz_zip_archive *zip, const char *target, bool verbo
         return -2 - raw_idx;
     }
 
+    /* Fallback: try miniz's central directory index (works if mz_zip_reader_init succeeded) */
+    if (zip->m_zip_mode == MZ_ZIP_MODE_READING) {
+        int mz_idx = mz_zip_reader_locate_file(zip, target, NULL, 0);
+        if (mz_idx >= 0) {
+            EPUB_LOG("Located '%s' via mz_zip_reader_locate_file at index %d\n", target, mz_idx);
+            return mz_idx;
+        }
+    }
+
     if (verbose) {
         EPUB_LOG("Failed to locate '%s' in ZIP\n", target);
     }
@@ -265,25 +286,50 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
         return NULL;
     }
 
-    int raw_idx = -file_index - 2;
-    RawZipEntry *e = &s_raw_entries[raw_idx];
-    char *buf = (char *)_dma_malloc(e->uncomp_size + 1, DMAHEAP_PSRAM);
-    if (!buf) {
-        EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
-                 filename, (unsigned)(e->uncomp_size + 1));
+    /* Negative return: raw scan index */
+    if (file_index < -1) {
+        int raw_idx = -file_index - 2;
+        RawZipEntry *e = &s_raw_entries[raw_idx];
+        char *buf = (char *)_dma_malloc(e->uncomp_size + 1, DMAHEAP_PSRAM);
+        if (!buf) {
+            EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
+                     filename, (unsigned)(e->uncomp_size + 1));
+            return NULL;
+        }
+        memset(buf, 0, e->uncomp_size + 1);
+        mz_uint extracted_size = 0;
+        if (extract_file_at_raw_offset(&reader->zip_archive, raw_idx, buf, e->uncomp_size, &extracted_size)) {
+            buf[extracted_size] = '\0';
+            *out_size = extracted_size;
+            EPUB_LOG("Extracted '%s' via raw scan (%u bytes)\n", filename, (unsigned)extracted_size);
+            return buf;
+        }
+        EPUB_ERR("Raw extraction failed for: %s\n", filename);
+        _dma_free(buf, DMAHEAP_PSRAM);
         return NULL;
     }
-    memset(buf, 0, e->uncomp_size + 1);
-    mz_uint extracted_size = 0;
-    if (extract_file_at_raw_offset(&reader->zip_archive, raw_idx, buf, e->uncomp_size, &extracted_size)) {
-        buf[extracted_size] = '\0';
-        *out_size = extracted_size;
-        EPUB_LOG("Extracted '%s' via raw scan (%u bytes)\n", filename, (unsigned)extracted_size);
-        return buf;
+
+    /* Non-negative return: miniz central directory index */
+    mz_zip_archive_file_stat stat;
+    if (!mz_zip_reader_file_stat(&reader->zip_archive, file_index, &stat)) {
+        EPUB_ERR("Failed to stat '%s' (mz idx %d)\n", filename, file_index);
+        return NULL;
     }
-    EPUB_ERR("Raw extraction failed for: %s\n", filename);
-    _dma_free(buf, DMAHEAP_PSRAM);
-    return NULL;
+    char *buf = (char *)_dma_malloc((size_t)stat.m_uncomp_size + 1, DMAHEAP_PSRAM);
+    if (!buf) {
+        EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
+                 filename, (unsigned)(stat.m_uncomp_size + 1));
+        return NULL;
+    }
+    if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, buf, (size_t)stat.m_uncomp_size, 0)) {
+        EPUB_ERR("mz extract failed for: %s\n", filename);
+        _dma_free(buf, DMAHEAP_PSRAM);
+        return NULL;
+    }
+    buf[stat.m_uncomp_size] = '\0';
+    *out_size = (size_t)stat.m_uncomp_size;
+    EPUB_LOG("Extracted '%s' via mz API (%u bytes)\n", filename, (unsigned)stat.m_uncomp_size);
+    return buf;
 }
 
 struct container_parse_ctx {
@@ -458,10 +504,48 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
     reader->zip_archive.m_pFree = miniz_psram_free;
     reader->zip_archive.m_pRealloc = miniz_psram_realloc;
 
-    if (!mz_zip_reader_init(&reader->zip_archive, f_size(&reader->archive_fp), 0)) {
-        EPUB_ERR("mz_zip_reader_init failed\n");
-        f_close(&reader->archive_fp);
-        return false;
+    {
+        FSIZE_t archive_size = f_size(&reader->archive_fp);
+        EPUB_LOG("mz_zip_reader_init: archive_size=%u bytes, pRead=%p, pIO=%p\n",
+                 (unsigned)archive_size, reader->zip_archive.m_pRead, reader->zip_archive.m_pIO_opaque);
+
+        /* Debug: read and print last 64 bytes of file to verify EOCD signature */
+        {
+            #define TAIL_BUF_SIZE 64
+            mz_uint8 tail_buf[TAIL_BUF_SIZE];
+            FSIZE_t tail_ofs = (archive_size > TAIL_BUF_SIZE) ? (archive_size - TAIL_BUF_SIZE) : 0;
+            UINT tail_br = 0;
+            if (f_lseek(&reader->archive_fp, tail_ofs) == FR_OK &&
+                f_read(&reader->archive_fp, tail_buf, TAIL_BUF_SIZE, &tail_br) == FR_OK) {
+                EPUB_LOG("File tail at ofs %u (%u bytes read):\n", (unsigned)tail_ofs, (unsigned)tail_br);
+                for (int ti = 0; ti < (int)tail_br; ti++) {
+                    printf("%02x ", tail_buf[ti]);
+                    if ((ti + 1) % 16 == 0) printf("\n");
+                }
+                printf("\n");
+                /* Check for EOCD signature 0x06054b50 (PK\x05\x06, little-endian) */
+                for (int ti = 0; ti <= (int)tail_br - 4; ti++) {
+                    if (tail_buf[ti] == 0x50 && tail_buf[ti+1] == 0x4B &&
+                        tail_buf[ti+2] == 0x05 && tail_buf[ti+3] == 0x06) {
+                        EPUB_LOG("EOCD signature found at tail+%d (file ofs %u)\n",
+                                 ti, (unsigned)(tail_ofs + ti));
+                        break;
+                    }
+                }
+            } else {
+                EPUB_ERR("Failed to read file tail for verification\n");
+            }
+            /* Seek back to beginning */
+            f_lseek(&reader->archive_fp, 0);
+            #undef TAIL_BUF_SIZE
+        }
+
+        if (!mz_zip_reader_init(&reader->zip_archive, archive_size, 0)) {
+            EPUB_ERR("mz_zip_reader_init failed: size=%u, last_error=%d\n",
+                     (unsigned)archive_size, (int)reader->zip_archive.m_last_error);
+            f_close(&reader->archive_fp);
+            return false;
+        }
     }
 
     size_t container_size;

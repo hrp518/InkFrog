@@ -3859,20 +3859,29 @@ mz_bool mz_zip_reader_end(mz_zip_archive *pZip)
 mz_bool mz_zip_reader_init(mz_zip_archive *pZip, mz_uint64 size, mz_uint flags)
 {
     if ((!pZip) || (!pZip->m_pRead))
+    {
+        printf("[MINIZ] mz_zip_reader_init FAIL: pZip=%p pRead=%p\n", (void*)pZip, pZip ? (void*)pZip->m_pRead : NULL);
         return mz_zip_set_error(pZip, MZ_ZIP_INVALID_PARAMETER);
+    }
 
     if (!mz_zip_reader_init_internal(pZip, flags))
+    {
+        printf("[MINIZ] mz_zip_reader_init_internal FAIL\n");
         return MZ_FALSE;
+    }
 
     pZip->m_zip_type = MZ_ZIP_TYPE_USER;
     pZip->m_archive_size = size;
+    printf("[MINIZ] mz_zip_reader_init: size=%llu flags=%u\n", (unsigned long long)size, (unsigned)flags);
 
     if (!mz_zip_reader_read_central_dir(pZip, flags))
     {
+        printf("[MINIZ] mz_zip_reader_read_central_dir FAIL: last_error=%d\n", (int)pZip->m_last_error);
         mz_zip_reader_end_internal(pZip, MZ_FALSE);
         return MZ_FALSE;
     }
 
+    printf("[MINIZ] mz_zip_reader_init OK: total_files=%u\n", (unsigned)pZip->m_total_files);
     return MZ_TRUE;
 }
 

@@ -53,6 +53,7 @@ static OS_Thread_t g_http_thread;
 static volatile int g_http_running = 0;
 static int g_http_port = HTTP_SERVER_PORT;
 static int g_server_sock = -1;           /* 服务器socket，用于stop时shutdown */
+static volatile int g_client_sock = -1;  /* 客户端socket，用于stop时shutdown中断recv */
 static char *g_http_buffer = NULL;       /* 接收缓冲区(PSRAM) */
 static char *g_http_response = NULL;     /* 响应缓冲区(PSRAM) */
 
@@ -834,6 +835,13 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     buf_used = copy_len;
     
     while (!found_filename) {
+        /* 检查是否被要求停止 */
+        if (!g_http_running) {
+            HTTP_LOG("Upload aborted (finding filename): server stopping");
+            _dma_free(recv_buffer, 0);
+            return -1;
+        }
+        
         /* 在buffer中搜索filename */
         p = recv_buffer;
         while (p < recv_buffer + buf_used - 10) {
@@ -886,6 +894,13 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     int part_header_end = -1;
     
     while (part_header_end < 0) {
+        /* 检查是否被要求停止 */
+        if (!g_http_running) {
+            HTTP_LOG("Upload aborted (finding header end): server stopping");
+            _dma_free(recv_buffer, 0);
+            return -1;
+        }
+        
         p = recv_buffer;
         while (p < recv_buffer + buf_used - 3) {
             if (p[0] == '\r' && p[1] == '\n' && p[2] == '\r' && p[3] == '\n') {
@@ -942,6 +957,12 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     int keep_len = boundary_len + 4; // 稍微多保留几个字节，防止 boundary 和 \r\n 被切断
     
     while (1) {
+        /* 检查是否被要求停止 */
+        if (!g_http_running) {
+            HTTP_LOG("Upload aborted (streaming): server stopping, %d bytes written", total_written);
+            break;
+        }
+        
         /* 1. 先在现有的 g_http_buffer 中搜索 boundary */
         if (buf_used > 0) {
             char *boundary_pos = find_binary_boundary(recv_buffer, buf_used, boundary, boundary_len);
@@ -1179,6 +1200,13 @@ static int parse_request(const char *req, char *method, char *path, char *versio
             break;
         }
         
+        /* 记录client_sock到全局变量，以便stop时可以shutdown中断recv */
+        g_client_sock = client_sock;
+        
+        /* 设置recv超时为2秒，避免stop时recv永久阻塞 */
+        struct timeval recv_tv = {2, 0};
+        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+        
         HTTP_LOG("Client connected: %s:%d",
                 inet_ntoa(client_addr.sin_addr),
                 ntohs(client_addr.sin_port));
@@ -1405,8 +1433,9 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         }
         
         closesocket(client_sock);
+        g_client_sock = -1;
     }
-    
+     
     closesocket(g_server_sock);
     g_server_sock = -1;
     
@@ -1481,18 +1510,40 @@ void http_server_stop(void)
     HTTP_LOG("Stopping HTTP server...");
     g_http_running = 0;
     
-    /* 关闭server socket使accept返回，触发线程退出 */
+    /* 1. 先shutdown client socket，中断正在进行的recv() */
+    if (g_client_sock >= 0) {
+        HTTP_LOG("Shutting down client socket %d", g_client_sock);
+        shutdown(g_client_sock, SHUT_RDWR);
+        /* 不在这里closesocket，让HTTP线程自己关闭 */
+    }
+    
+    /* 2. 关闭server socket使accept返回，触发线程退出 */
     if (g_server_sock >= 0) {
         closesocket(g_server_sock);
         g_server_sock = -1;
     }
 
-    /* 等待线程结束 */
+    /* 3. 等待线程自行清理退出（最多等2秒） */
+    int wait_count;
+    for (wait_count = 0; wait_count < 20 && g_http_running; wait_count++) {
+        OS_MSleep(100);
+    }
+    if (g_http_running) {
+        HTTP_LOG("Thread did not exit in time, force deleting");
+    }
+    
+    /* 4. 强制删除线程（保底措施） */
     OS_ThreadDelete(&g_http_thread);
     
-    /* 确保PSRAM缓冲区被释放（防止线程异常退出时泄漏） */
+    /* 5. 确保PSRAM缓冲区被释放（防止线程异常退出时泄漏） */
     if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
     if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
+    
+    /* 6. 清理残留的client socket */
+    if (g_client_sock >= 0) {
+        closesocket(g_client_sock);
+        g_client_sock = -1;
+    }
 
     HTTP_LOG("HTTP server stopped");
 }
