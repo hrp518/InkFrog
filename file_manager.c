@@ -210,6 +210,40 @@ static void touch_event_cb(lv_event_t *e)
 static void physical_back_btn_handler(void)
 {
     // 物理返回按键处理 - 抬手触发
+
+    /* 【修复】如果EPUB viewer正在显示，先关闭它返回文件管理器 */
+    if (g_epub_viewer) {
+        printf("[FM] Physical back: EPUB viewer active, closing viewer\n");
+        /* 保存书签 */
+        if (g_epub_reader) {
+            int ch = epub_viewer_get_current_chapter(g_epub_viewer);
+            int off = epub_viewer_get_read_offset(g_epub_viewer);
+            const char *fp = NULL;
+            /* 获取filepath需要从viewer获取，使用selected_filepath作为备选 */
+            if (selected_filepath[0] != '\0') {
+                fp = selected_filepath;
+            }
+            if (fp) {
+                settings_save_bookmark(fp, ch, off);
+                printf("[FM] Bookmark saved: ch=%d off=%d\n", ch, off);
+            }
+        }
+        /* 销毁viewer和reader（close_cb会调用file_manager_show，先置NULL避免递归） */
+        EpubViewer *v = g_epub_viewer;
+        EpubReader *r = g_epub_reader;
+        g_epub_viewer = NULL;
+        g_epub_reader = NULL;
+        epub_viewer_destroy(v);
+        epub_reader_destroy(r);
+        /* 恢复滑动回调 */
+        touch_register_swipe_callback(swipe_handler);
+        /* 重新加载文件管理器 */
+        lv_disp_load_scr(fm_screen);
+        refresh_file_list(current_path);
+        epd_mark_refresh_pending();
+        return;
+    }
+
     if (strcmp(current_path, "/") == 0) {
         // 已在根目录，退出文件管理器返回首页
         printf("[FM] Physical back: at root, closing file manager\n");
@@ -1328,14 +1362,20 @@ void file_manager_show(void)
         return;
     }
     
-    /* 【重要修复】从EPUB返回时清理全局变量，避免在file_manager_close时再次调用epub相关函数 */
+    /* 【重要修复】从EPUB返回时正确销毁资源，释放PSRAM内存 */
     if (g_epub_viewer) {
-        printf("[FM] Cleaning up EPUB viewer (return from EPUB)\n");
-        g_epub_viewer = NULL;  /* 清理全局变量，避免重复处理 */
+        printf("[FM] Destroying EPUB viewer (return from EPUB)\n");
+        /* 先置NULL防止close_cb递归调用file_manager_show */
+        EpubViewer *v = g_epub_viewer;
+        g_epub_viewer = NULL;
+        g_epub_reader = NULL;  /* 防止epub_viewer_close中的回调访问已释放的reader */
+        epub_viewer_destroy(v);
     }
     if (g_epub_reader) {
-        printf("[FM] Cleaning up EPUB reader (return from EPUB)\n");
-        g_epub_reader = NULL;  /* 清理全局变量，避免重复处理 */
+        printf("[FM] Destroying EPUB reader (return from EPUB)\n");
+        EpubReader *r = g_epub_reader;
+        g_epub_reader = NULL;
+        epub_reader_destroy(r);
     }
     
     /* 重新加载文件管理器屏幕 */
