@@ -209,6 +209,7 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/list/../../layouts/flex/lv_flex.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/lv_msgbox.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
+ ../../../../project/demo/FontExp/settings_storage.h \
  ../../../../project/demo/FontExp/lv_port_disp.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOS.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOSConfig.h \
@@ -643,6 +644,8 @@
 ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/lv_msgbox.h:
 
 ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h:
+
+../../../../project/demo/FontExp/settings_storage.h:
 
 ../../../../project/demo/FontExp/lv_port_disp.h:
 

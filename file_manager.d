@@ -213,6 +213,7 @@
  ../../../../project/demo/FontExp/epub_reader.h \
  ../../../../project/demo/FontExp/third_party/miniz/miniz.h \
  ../../../../project/demo/FontExp/epub_viewer.h \
+ ../../../../project/demo/FontExp/settings_storage.h \
  ../../../../project/demo/FontExp/font_priority_loader.h
 
 ../../../../project/common/prj_conf_opt.h:
@@ -646,5 +647,7 @@
 ../../../../project/demo/FontExp/third_party/miniz/miniz.h:
 
 ../../../../project/demo/FontExp/epub_viewer.h:
+
+../../../../project/demo/FontExp/settings_storage.h:
 
 ../../../../project/demo/FontExp/font_priority_loader.h:

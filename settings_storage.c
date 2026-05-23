@@ -188,8 +188,8 @@ int settings_load_bookmark(const char *filepath, int *chapter_out, int *offset_o
 
 int settings_set_string(const char *section, const char *key, const char *value)
 {
-    static char ini_buf[SETTINGS_MAX_FILE_SIZE];
-    static char out_buf[SETTINGS_MAX_FILE_SIZE];
+    static char ini_buf[SETTINGS_MAX_FILE_SIZE] __attribute__((section(".psram_bss")));
+    static char out_buf[SETTINGS_MAX_FILE_SIZE] __attribute__((section(".psram_bss")));
     char line_buf[SETTINGS_MAX_PATH + 64];
 
     /* 1. 读取现有INI文件 */
@@ -274,7 +274,7 @@ int settings_set_string(const char *section, const char *key, const char *value)
 
 int settings_get_string(const char *section, const char *key, char *value_out, int value_size)
 {
-    static char ini_buf[SETTINGS_MAX_FILE_SIZE];
+    static char ini_buf[SETTINGS_MAX_FILE_SIZE] __attribute__((section(".psram_bss")));
     char line_buf[SETTINGS_MAX_PATH + 64];
 
     /* 1. 读取INI文件 */
