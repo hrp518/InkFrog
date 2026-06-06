@@ -1199,6 +1199,23 @@ static int ensure_ttf_path_discovered(void)
         return (ttf_file_path[0] != '\0') ? 0 : -1;
     }
     ttf_path_discovered = true;
+    
+    /* 优先从settings.ini读取用户选择的字体路径 */
+    char saved_font[256] = {0};
+    if (settings_get_string("font", "path", saved_font, sizeof(saved_font)) == 0) {
+        /* 验证文件是否存在 */
+        FILINFO fno;
+        if (f_stat(saved_font, &fno) == FR_OK) {
+            strncpy(ttf_file_path, saved_font, sizeof(ttf_file_path) - 1);
+            ttf_file_path[sizeof(ttf_file_path) - 1] = '\0';
+            printf("[FONT] Using user-selected font from settings: %s\n", ttf_file_path);
+            return 0;
+        } else {
+            printf("[FONT] Saved font not found: %s, falling back to auto-detect\n", saved_font);
+        }
+    }
+    
+    /* 没有用户设置，回退到自动查找最小字体 */
     print_memory_stats_internal("before_find_smallest_ttf_font");
     int ret = find_smallest_ttf_font();
     print_memory_stats_internal("after_find_smallest_ttf_font");

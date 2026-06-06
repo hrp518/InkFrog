@@ -20,6 +20,7 @@
 #include "kernel/os/os.h"
 #include "driver/chip/hal_gpio.h"
 #include "driver/chip/hal_prcm.h"
+#include "driver/chip/hal_adc.h"
 #include "driver/chip/sdmmc/sdmmc.h"
 #include "lvgl/lvgl.h"
 #include "lv_port_disp.h"
@@ -32,9 +33,14 @@
 #include "heap_debug.h"
 #include "wlan_manager.h"
 #include "http_server.h"
+#include "wifi_controller.h"
 #include "screensaver.h"
+#include "driver/chip/hal_wakeup.h"
+#include "pm/pm.h"
 #include "coremark/coremark_runner.h"
 #include "font_priority_loader.h"
+#include "settings_screen.h"
+#include "settings_storage.h"
 
 extern const lv_font_t lv_font_montserrat_12;
 
@@ -53,21 +59,27 @@ extern struct mmc_card *mmc_scan_init(uint16_t sd_id, uint16_t sdc_id, void *car
 OS_Thread_t lvgl_thread;
 static OS_Thread_t disp_task_thread;
 
-/* HTTP对话框和SW1全局引用 */
+/* HTTP对话框 */
 static lv_obj_t *g_http_dialog = NULL;
 static lv_obj_t *g_http_dialog_bg = NULL;
-static lv_obj_t *g_net_label = NULL;
 
-/* WiFi/HTTP 状态管理 */
-static uint8_t g_wifi_connected = 0;
-static uint8_t g_http_running = 0;
-static char g_ip_text[32] = "WiFi: OFF";
-static lv_obj_t *g_wifi_icon = NULL;  /* WiFi图标，与Home标题对齐 */
-static OS_Thread_t wifi_connect_thread;  /* WiFi连接后台任务线程 */
+/* Home 顶部 WiFi 状态栏已删除 (按设计简化 UI) */
+
+/* WiFi/HTTP 状态全部在 wifi_controller.g_wifi 里, 不再散落 */
+
+/* VBAT电压显示 */
+static lv_obj_t *g_vbat_label = NULL;
+static char g_vbat_text[16] = "";
+static uint8_t g_adc_inited = 0;
+
+/* Home 顶部 WiFi 图标 (仅 CONNECTED 时显示) */
+static lv_obj_t *g_wifi_icon_label = NULL;
+
+/* PA6 按键屏保触发 */
+#define PA6_BUTTON_PIN  GPIO_PIN_6
 
 /* Settings 页面引用 */
 static lv_obj_t *g_settings_scr = NULL;
-static lv_obj_t *g_settings_wifi_sw = NULL;
 static lv_obj_t *g_settings_http_btn = NULL;
 
 /* 全局样式 - 必须在文件作用域，因为 main_ui_create() 可被多次调用 */
@@ -81,6 +93,7 @@ extern void platform_init(void);
 
 /* 前向声明 - 解决main_ui_create在定义前被调用的问题 */
 void main_ui_create(void);
+static void settings_btn_event_handler(lv_event_t * e);
 
 /*====================
  * SD卡测试函数
@@ -416,7 +429,8 @@ static void fatfs_filesystem_test(void)
 static void http_dialog_stop_cb(lv_event_t *e) {
     printf("[HTTP_DIALOG] Stop button clicked\n");
     http_server_stop();
-    g_http_running = 0;
+    g_wifi.http_running = 0;
+    wifi_controller_set_http_running(0);
     
     /* 关闭对话框 */
     if (g_http_dialog_bg) {
@@ -485,104 +499,35 @@ static void http_dialog_create(const char *ip_str) {
     epd_mark_refresh_pending();
 }
 
-/* Settings WiFi开关事件处理 */
-static void settings_wifi_switch_event_handler(lv_event_t * e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_obj_t * sw = lv_event_get_target(e);
-
-    if(code == LV_EVENT_VALUE_CHANGED) {
-        bool is_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
-        printf("[Settings] WiFi Switch Toggled! State: %s\n", is_on ? "ON" : "OFF");
-        
-        if (is_on) {
-            /* 启动WiFi */
-            printf("[Settings] Connecting WiFi...\n");
-            int ret = wlan_manager_connect(WIFI_SSID, WIFI_PASSWD);
-            if (ret == 0) {
-                if (wlan_manager_wait_for_ip(30000) == 0) {
-                    WLAN_IPInfo_t ip_info;
-                    wlan_manager_get_ip_info(&ip_info);
-                    printf("[Settings] WiFi connected! IP: %s\n", ip_info.ip);
-                    
-                    g_wifi_connected = 1;
-                    snprintf(g_ip_text, sizeof(g_ip_text), "IP: %s", ip_info.ip);
-                    
-                    /* 更新首页标签 */
-                    if (g_net_label) {
-                        lv_label_set_text(g_net_label, g_ip_text);
-                    }
-                    
-                    /* 如果在 Settings 页面，显示 HTTP 按钮 */
-                    if (g_settings_scr && g_settings_http_btn) {
-                        lv_obj_clear_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
-                    }
-                } else {
-                    printf("[Settings] WiFi connect timeout!\n");
-                    lv_obj_clear_state(sw, LV_STATE_CHECKED);
-                    g_wifi_connected = 0;
-                }
-            } else {
-                printf("[Settings] WiFi connect failed!\n");
-                lv_obj_clear_state(sw, LV_STATE_CHECKED);
-                g_wifi_connected = 0;
-            }
-        } else {
-            /* 关闭WiFi */
-            printf("[Settings] Disconnecting WiFi...\n");
-            /* 先停止HTTP */
-            if (g_http_running) {
-                http_server_stop();
-                g_http_running = 0;
-                if (g_http_dialog_bg) {
-                    lv_obj_del(g_http_dialog_bg);
-                    g_http_dialog_bg = NULL;
-                    g_http_dialog = NULL;
-                }
-            }
-            wlan_manager_disconnect();
-            g_wifi_connected = 0;
-            snprintf(g_ip_text, sizeof(g_ip_text), "WiFi: OFF");
-            
-            /* 更新首页标签 */
-            if (g_net_label) {
-                lv_label_set_text(g_net_label, g_ip_text);
-            }
-            
-            /* 如果在 Settings 页面，隐藏 HTTP 按钮 */
-            if (g_settings_scr && g_settings_http_btn) {
-                lv_obj_add_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
-            }
-        }
-        epd_mark_refresh_pending();
-    }
-}
+/* Settings WiFi 开关已合并到 settings_screen.c 的 wifi_switch_event_handler
+ * (手机式: 开关和扫描在同一页). 此函数废弃. */
 
 /* Settings HTTP Server按钮事件处理 */
 static void settings_http_btn_event_handler(lv_event_t * e) {
     printf("[Settings] HTTP Server button clicked\n");
-    
-    if (!g_wifi_connected) {
+
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
         printf("[Settings] WiFi not connected, cannot start HTTP\n");
         return;
     }
-    
-    if (g_http_running) {
+
+    if (g_wifi.http_running) {
         printf("[Settings] HTTP already running\n");
         return;
     }
-    
+
     /* 启动HTTP服务器（阻塞） */
     http_server_init(HTTP_SERVER_PORT);
     if (http_server_start() == 0) {
         printf("[Settings] HTTP server started!\n");
-        g_http_running = 1;
-        
+        g_wifi.http_running = 1;
+        wifi_controller_set_http_running(1);
+
         /* 提取 IP 地址显示 */
         char ip_str[32];
-        WLAN_IPInfo_t ip_info;
-        wlan_manager_get_ip_info(&ip_info);
-        snprintf(ip_str, sizeof(ip_str), "%s", ip_info.ip);
-        
+        strncpy(ip_str, g_wifi.ip, sizeof(ip_str) - 1);
+        ip_str[sizeof(ip_str) - 1] = '\0';
+
         /* 弹出对话框 */
         http_dialog_create(ip_str);
     } else {
@@ -599,16 +544,71 @@ static void settings_back_btn_event_handler(lv_event_t * e) {
      */
     lv_obj_t *scr = lv_scr_act();
     lv_obj_clean(scr);
-    
+
     /* 清理 Settings 相关指针 */
     g_settings_scr = NULL;
-    g_settings_wifi_sw = NULL;
     g_settings_http_btn = NULL;
-    
+
     /* 重建首页 */
     main_ui_create();
-    
+
     epd_mark_refresh_pending();
+}
+
+/* WiFi扫描按钮回调 - 打开WiFi扫描子界面 */
+static void settings_wifi_scan_open_btn_cb(lv_event_t *e) {
+    (void)e;
+    printf("[Settings] Opening WiFi scan screen\n");
+    epd_pause_refresh();
+    lv_obj_t *scr = lv_scr_act();
+    settings_wifi_scan_open(scr);
+    epd_resume_refresh();
+}
+
+/* 字体选择按钮回调 - 打开字体选择子界面 */
+static void settings_font_sel_btn_cb(lv_event_t *e) {
+    (void)e;
+    printf("[Settings] Opening font select screen\n");
+    epd_pause_refresh();
+    lv_obj_t *scr = lv_scr_act();
+    settings_font_select_open(scr);
+    epd_resume_refresh();
+}
+
+/*====================
+ * Home 顶部 WiFi 状态栏 (由 wifi_controller phase 回调驱动)
+ *===================*/
+
+/* 在 LVGL 线程中由 wlan_manager_poll() 触发
+ * 主要作用: WiFi 掉了自动停 HTTP + 更新 home WiFi 图标 */
+static void on_wifi_phase_change(WLAN_Phase_t phase, void *user_data)
+{
+    (void)user_data;
+    printf("[WIFIC] Phase callback: %d\n", (int)phase);
+
+    /* Home 顶部 WiFi 图标 - 仅 CONNECTED 时显示 */
+    if (g_wifi_icon_label) {
+        if (phase == WLAN_PHASE_CONNECTED) {
+            lv_label_set_text(g_wifi_icon_label, LV_SYMBOL_WIFI);
+        } else {
+            lv_label_set_text(g_wifi_icon_label, "");
+        }
+    }
+
+    /* WiFi 掉了 -> 自动停 HTTP */
+    if (phase != WLAN_PHASE_CONNECTED && g_wifi.http_running) {
+        printf("[WIFIC] WiFi lost, stopping HTTP server\n");
+        http_server_stop();
+        g_wifi.http_running = 0;
+        if (g_http_dialog_bg) {
+            lv_obj_del(g_http_dialog_bg);
+            g_http_dialog_bg = NULL;
+            g_http_dialog = NULL;
+        }
+    }
+
+    /* 通知 settings WiFi 界面更新开关行 */
+    settings_wifi_on_phase_change(phase);
 }
 
 /* Settings 入口按钮事件处理 */
@@ -652,24 +652,23 @@ static void settings_btn_event_handler(lv_event_t * e) {
     lv_obj_center(btn_back_label);
     lv_obj_add_event_cb(btn_back, settings_back_btn_event_handler, LV_EVENT_CLICKED, NULL);
     
-    /* WiFi 开关行 - 调整位置到返回按钮下方 */
-    lv_obj_t *wifi_label = lv_label_create(scr);
-    lv_label_set_text(wifi_label, "WiFi");
+    /* WiFi 行 - 纯入口, 开关已合并到 WiFi 子页 (手机式) */
+    lv_obj_t *wifi_btn = lv_btn_create(scr);
+    lv_obj_set_size(wifi_btn, 200, 30);
+    lv_obj_set_pos(wifi_btn, 20, 90);
+    lv_obj_set_style_bg_color(wifi_btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(wifi_btn, 2, 0);
+    lv_obj_set_style_border_color(wifi_btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(wifi_btn, 4, 0);
+    lv_obj_set_style_transition(wifi_btn, NULL, LV_PART_MAIN);
+    lv_obj_clear_flag(wifi_btn, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *wifi_label = lv_label_create(wifi_btn);
+    lv_label_set_text(wifi_label, LV_SYMBOL_WIFI "  WiFi >");
     lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(wifi_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_pos(wifi_label, 20, 90);  /* Y=90，在返回按钮下方 */
-    
-    g_settings_wifi_sw = lv_switch_create(scr);
-    lv_obj_set_size(g_settings_wifi_sw, 60, 30);
-    lv_obj_set_pos(g_settings_wifi_sw, 160, 85);  /* Y=85，与WiFi标签对齐 */
-    lv_obj_add_style(g_settings_wifi_sw, &style_sw, LV_PART_MAIN | LV_STATE_DEFAULT);
-    lv_obj_set_style_transition(g_settings_wifi_sw, NULL, LV_PART_MAIN | LV_STATE_ANY);
-    lv_obj_add_event_cb(g_settings_wifi_sw, settings_wifi_switch_event_handler, LV_EVENT_VALUE_CHANGED, NULL);
-    
-    /* 同步 WiFi 状态 */
-    if (g_wifi_connected) {
-        lv_obj_add_state(g_settings_wifi_sw, LV_STATE_CHECKED);
-    }
+    lv_obj_center(wifi_label);
+    lv_obj_add_event_cb(wifi_btn, settings_wifi_scan_open_btn_cb, LV_EVENT_CLICKED, NULL);
     
     /* HTTP Server 按钮（仅 WiFi 连接时显示）- 调整位置 */
     g_settings_http_btn = lv_btn_create(scr);
@@ -690,9 +689,26 @@ static void settings_btn_event_handler(lv_event_t * e) {
     lv_obj_add_event_cb(g_settings_http_btn, settings_http_btn_event_handler, LV_EVENT_CLICKED, NULL);
     
     /* 根据 WiFi 状态决定是否显示 HTTP 按钮 */
-    if (!g_wifi_connected) {
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
         lv_obj_add_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
     }
+    
+    /* 字体选择按钮 - Y=185 (原Y=225上移) */
+    lv_obj_t *btn_font_sel = lv_btn_create(scr);
+    lv_obj_set_size(btn_font_sel, 200, 35);
+    lv_obj_set_pos(btn_font_sel, 10, 185);
+    lv_obj_set_style_bg_color(btn_font_sel, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(btn_font_sel, 2, 0);
+    lv_obj_set_style_border_color(btn_font_sel, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(btn_font_sel, 4, 0);
+    lv_obj_set_style_transition(btn_font_sel, NULL, LV_PART_MAIN);
+    
+    lv_obj_t *font_sel_label = lv_label_create(btn_font_sel);
+    lv_label_set_text(font_sel_label, LV_SYMBOL_IMAGE "  Font Select");
+    lv_obj_set_style_text_font(font_sel_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(font_sel_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_center(font_sel_label);
+    lv_obj_add_event_cb(btn_font_sel, settings_font_sel_btn_cb, LV_EVENT_CLICKED, NULL);
     
     /* 【EPD优化】恢复刷新，触发一次完整刷新 */
     epd_resume_refresh();
@@ -712,7 +728,7 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
     epd_pause_refresh();
     
     // 【内存优化】如果WiFi还没连上，取消后台连接以释放内存给FM/EPUB阅读器
-    if (wlan_manager_get_state() != WLAN_STATE_CONNECTED) {
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
         printf("[FM] WiFi not connected, canceling background connect to free memory\n");
         wlan_manager_cancel_connect();
     }
@@ -770,14 +786,31 @@ static lv_obj_t *create_home_tile(lv_obj_t *parent,
 
 static void lvgl_task(void *arg) {
     printf("[LVGL] Task started\r\n");
-    
+
+    static uint32_t s_lvgl_loop_count = 0;
+    static uint32_t s_last_diag_tick = 0;
+
     while (1) {
+        s_lvgl_loop_count++;
+
         /* 【关键修复】：告诉 LVGL 时间过去了 LVGL_TIMER_PERIOD 毫秒 */
         lv_tick_inc(LVGL_TIMER_PERIOD);
-        
+
         /* LVGL定时器处理（内部会检查是否该触发 read_cb 了） */
         lv_timer_handler();
-        
+
+        /* 轮询 wifi controller (扫描/连接/phase 回调) - 确保在LVGL线程中调用 */
+        wifi_controller_poll();
+
+        /* 诊断: 每 200 次循环 ~1s 打印一次, 验证 lvgl_task 在 resume 后是否还在跑 */
+        if (s_lvgl_loop_count % 200 == 0) {
+            uint32_t now = OS_GetTicks();
+            if (s_last_diag_tick == 0) s_last_diag_tick = now;
+            uint32_t gap = now - s_last_diag_tick;
+            s_last_diag_tick = now;
+            printf("[LVGL_DIAG] loop=%u gap=%ums\n", s_lvgl_loop_count, gap);
+        }
+
         /* 休眠一小段时间 */
         OS_MSleep(LVGL_TIMER_PERIOD);
     }
@@ -787,10 +820,33 @@ static void lvgl_task(void *arg) {
  * 显示刷新任务
  *===================*/
 
+/* ADC函数前向声明（定义在disp_task之后） */
+static void adc_vbat_init(void);
+static float adc_read_vbat(void);
+static void update_vbat_display(void);
+
+/* VBAT更新间隔（每5秒更新一次） */
+#define VBAT_UPDATE_INTERVAL_MS  5000
+
 static void disp_task(void *arg) {
     printf("[Display] Task started\r\n");
+    uint32_t vbat_counter = 0;
+
+    /* 初始化ADC并在首次读取VBAT */
+    adc_vbat_init();
+    update_vbat_display();
     
     while (1) {
+        /* PA6 按键检测：低电平=按下，进入休眠 */
+        if (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
+            printf("[PA6] Button pressed, entering hibernation\r\n");
+            OS_MSleep(50);
+            while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
+                OS_MSleep(20);
+            }
+            enter_hibernation();
+        }
+
         screensaver_task();
 
         /* 处理待刷新的显示 - 检查状态 */
@@ -798,68 +854,17 @@ static void disp_task(void *arg) {
         
         /* 执行EPD刷新 - 可能阻塞本线程，但不影响lvgl */
         epd_do_refresh();
+
+        /* 定期更新VBAT显示 */
+        vbat_counter += DISP_TASK_PERIOD;
+        if (vbat_counter >= VBAT_UPDATE_INTERVAL_MS) {
+            vbat_counter = 0;
+            update_vbat_display();
+        }
         
         /* 休眠 */
         OS_MSleep(DISP_TASK_PERIOD);
     }
-}
-
-/*====================
- * WiFi后台连接任务
- *===================*/
-static void wifi_connect_task(void *arg) {
-    printf("[WiFi_TASK] ========================================\n");
-    printf("[WiFi_TASK] Background WiFi connect task STARTED\n");
-    printf("[WiFi_TASK] SSID: %s, PASSWORD: %s\n", WIFI_SSID, WIFI_PASSWD);
-    printf("[WiFi_TASK] ========================================\n");
-    
-    OS_MSleep(1000);  /* 等待UI完全初始化和EPD刷新完成 */
-    
-    printf("[WiFi_TASK] Now connecting to WiFi...\n");
-    int ret = wlan_manager_connect(WIFI_SSID, WIFI_PASSWD);
-    printf("[WiFi_TASK] wlan_manager_connect returned: %d\n", ret);
-    
-    if (ret == 0) {
-        printf("[WiFi_TASK] Waiting for IP address (timeout 30s)...\n");
-        int wait_ret = wlan_manager_wait_for_ip(30000);
-        printf("[WiFi_TASK] wlan_manager_wait_for_ip returned: %d\n", wait_ret);
-        
-        if (wait_ret == 0) {
-            WLAN_IPInfo_t ip_info;
-            wlan_manager_get_ip_info(&ip_info);
-            printf("[WiFi_TASK] WiFi connected! IP: %s\n", ip_info.ip);
-            
-            g_wifi_connected = 1;
-            snprintf(g_ip_text, sizeof(g_ip_text), "IP: %s", ip_info.ip);
-            
-            /* 更新WiFi图标 - 显示 */
-            if (g_wifi_icon) {
-                lv_label_set_text(g_wifi_icon, LV_SYMBOL_WIFI);
-                printf("[WiFi_TASK] WiFi icon updated to show\n");
-            } else {
-                printf("[WiFi_TASK] WARNING: g_wifi_icon is NULL!\n");
-            }
-            
-            /* 更新首页网络标签 */
-            if (g_net_label) {
-                lv_label_set_text(g_net_label, g_ip_text);
-                printf("[WiFi_TASK] Network label updated\n");
-            }
-            
-            epd_mark_refresh_pending();
-            printf("[WiFi_TASK] EPD refresh marked\n");
-        } else {
-            printf("[WiFi_TASK] WiFi connect TIMEOUT!\n");
-            g_wifi_connected = 0;
-        }
-    } else {
-        printf("[WiFi_TASK] WiFi connect FAILED with error: %d\n", ret);
-        g_wifi_connected = 0;
-    }
-    
-    printf("[WiFi_TASK] Background WiFi connect task FINISHED\n");
-    printf("[WiFi_TASK] ========================================\n");
-    OS_ThreadDelete(&wifi_connect_thread);
 }
 
 /*====================
@@ -909,53 +914,175 @@ void main_ui_create(void)
     lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
     lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
 
-    /* 标题 */
+    /* 标题 - 居左, 让出右侧给 vbat + WiFi 图标 */
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "Home");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(title, 200, 30);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_set_size(title, 80, 30);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 5, 10);
 
-    /* WiFi图标 - 与Home标题对齐，初始隐藏 */
-    g_wifi_icon = lv_label_create(scr);
-    lv_label_set_text(g_wifi_icon, "");  /* 初始为空，连接成功后显示WiFi符号 */
-    lv_obj_set_style_text_font(g_wifi_icon, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(g_wifi_icon, lv_color_make(0, 0, 0), 0);
-    lv_obj_align(g_wifi_icon, LV_ALIGN_TOP_RIGHT, -10, 10);  /* 与Home标题同一行，右侧对齐 */
-    if (g_wifi_connected) {
-        lv_label_set_text(g_wifi_icon, LV_SYMBOL_WIFI);
-    }
+    /* WiFi 图标 - 紧贴 vbat 左侧, 仅 CONNECTED 时显示 */
+    g_wifi_icon_label = lv_label_create(scr);
+    lv_label_set_text(g_wifi_icon_label, "");
+    lv_obj_set_style_text_font(g_wifi_icon_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_wifi_icon_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(g_wifi_icon_label, 18, 14);
+    lv_obj_align(g_wifi_icon_label, LV_ALIGN_TOP_RIGHT, -78, 12);
 
     /* 第一行按钮: Files 和 Settings */
-    create_home_tile(scr, 10, 52, 106, 84,
+    create_home_tile(scr, 10, 78, 106, 84,
                      LV_SYMBOL_DIRECTORY,
                      "Files",
                      file_manager_btn_event_handler);
 
-    create_home_tile(scr, 124, 52, 106, 84,
+    create_home_tile(scr, 124, 78, 106, 84,
                      LV_SYMBOL_SETTINGS,
                      "Settings",
                      settings_btn_event_handler);
 
     /* 第二行按钮: CoreMark */
-    create_home_tile(scr, 10, 144, 220, 60,
+    create_home_tile(scr, 10, 170, 220, 60,
                      LV_SYMBOL_CHARGE,
                      "CoreMark",
                      coremark_btn_event_handler);
 
-    /* 网络状态标签 */
-    g_net_label = lv_label_create(scr);
-    lv_label_set_text(g_net_label, g_ip_text);
-    lv_obj_set_style_text_font(g_net_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(g_net_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(g_net_label, 120, 20);
-    lv_obj_align(g_net_label, LV_ALIGN_TOP_RIGHT, -10, 34);
+    /* VBAT SOC%标签 - 标题右侧 */
+    g_vbat_label = lv_label_create(scr);
+    lv_label_set_text(g_vbat_label, g_vbat_text[0] ? g_vbat_text : "");
+    lv_obj_set_style_text_font(g_vbat_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_vbat_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_size(g_vbat_label, 70, 14);
+    lv_obj_align(g_vbat_label, LV_ALIGN_TOP_RIGHT, -5, 12);
 
     printf("[UI] Main UI created\n");
-    
+
     /* 主界面创建完成后，请求刷新EPD */
     epd_mark_refresh_pending();
+}
+
+/*====================
+ * ADC VBAT 读取
+ *===================*/
+static void adc_vbat_init(void)
+{
+    if (g_adc_inited) return;
+    ADC_InitParam param;
+    memset(&param, 0, sizeof(param));
+    param.delay = 0;
+    param.freq = 1000;
+    param.mode = ADC_CONTI_CONV;
+    param.vref_mode = ADC_VREF_MODE_1;
+    HAL_ADC_Init(&param);
+    g_adc_inited = 1;
+    printf("[ADC] VBAT ADC initialized\n");
+}
+
+static float adc_read_vbat(void)
+{
+    uint32_t raw = 0;
+    if (!g_adc_inited) return 0.0f;
+    if (HAL_ADC_Conv_Polling(ADC_CHANNEL_VBAT, &raw, 100) != 0) {
+        return 0.0f;
+    }
+    /* 12-bit ADC, 2.5V reference, VBAT channel ratio=3
+     * voltage_mv = raw * 2500 * 3 / 4096
+     */
+    return (float)raw * 2.5f * 3.0f / 4096.0f;
+}
+
+void enter_hibernation(void)
+{
+    printf("[PM] Entering hibernation...\n");
+
+    /* 1. 关闭 HTTP 服务器（如果在运行） */
+    if (http_server_is_running()) {
+        http_server_stop();
+    }
+
+    /* 2. 断开 WiFi，避免 WLAN 事件立即唤醒 */
+    wlan_manager_disconnect();
+    OS_MSleep(100);
+
+    /* 3. EPD 显示 Tuwa Reader */
+    EPD_DrawStringCentered("Tuwa Reader");
+
+    /* 4. EPD deep sleep */
+    EPD_3IN52_Init();
+    EPD_3IN52_Display();
+    EPD_Sleep();
+    printf("[PM] EPD entered deep sleep\n");
+
+    /* 5. 配置 PA06 (数组索引 2) 为唤醒源，下降沿+上拉
+     * 注意：HAL_Wakeup_SetIO 的 pn 是数组索引 0-9，WAKEUP_IO2 的枚举值
+     * 是 GPIO_PIN_6 = 6，会被当成索引 6 (PA20)。必须传字面 2 才对应 PA6。 */
+    HAL_Wakeup_SetIO(2, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);
+
+    /* 6. 进入 hibernation（不返回，唤醒后系统重启） */
+    pm_enter_mode(PM_MODE_HIBERNATION);
+}
+
+/* batt_status.md: 电压 -> SOC 查表 (12 段, 单调, 不插值)
+ * v < kSocLut[0].voltage -> 0
+ * v >= kSocLut[last].voltage -> 100
+ * 否则返回最大 i 使 kSocLut[i].voltage <= v 的 SOC */
+typedef struct { float voltage; int soc; } soc_lut_t;
+static const soc_lut_t kSocLut[] = {
+    {2.70f,   0},   /* 截止 */
+    {3.00f,   0},
+    {3.50f,  10},
+    {3.70f,  20},
+    {3.76f,  30},
+    {3.78f,  40},
+    {3.81f,  50},
+    {3.85f,  60},
+    {3.90f,  70},
+    {3.95f,  80},
+    {4.00f,  90},
+    {4.10f,  90},
+    {4.20f, 100},
+};
+#define SOC_LUT_LEN (sizeof(kSocLut)/sizeof(kSocLut[0]))
+
+static int voltage_to_soc(float v)
+{
+    if (v <= kSocLut[0].voltage) return 0;
+    if (v >= kSocLut[SOC_LUT_LEN-1].voltage) return kSocLut[SOC_LUT_LEN-1].soc;
+    int soc = 0;
+    for (int i = (int)SOC_LUT_LEN - 1; i >= 0; i--) {
+        if (v >= kSocLut[i].voltage) {
+            soc = kSocLut[i].soc;
+            break;
+        }
+    }
+    return soc;
+}
+
+static void update_vbat_display(void)
+{
+    static int last_soc = -1;
+    static int last_charging = -1;
+
+    float vbat = adc_read_vbat();
+    int pa21 = HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21);
+    int charging = (pa21 == 0);
+    int soc = voltage_to_soc(vbat);
+
+    printf("[VBAT] raw=%.2fV soc=%d%% PA21=%d charging=%d\n", vbat, soc, pa21, charging);
+
+    /* 变化才更新 UI - 避免每 5s 触发 EPD 刷新 */
+    if (soc == last_soc && charging == last_charging) return;
+    last_soc = soc;
+    last_charging = charging;
+
+    if (charging) {
+        snprintf(g_vbat_text, sizeof(g_vbat_text), "%d%% +", soc);
+    } else {
+        snprintf(g_vbat_text, sizeof(g_vbat_text), "%d%%", soc);
+    }
+    if (g_vbat_label) {
+        lv_label_set_text(g_vbat_label, g_vbat_text);
+    }
 }
 
 /*====================
@@ -973,7 +1100,32 @@ int main(void)
     
     /* 平台初始化 */
     platform_init();
-    
+
+    /* 检测唤醒来源 */
+    {
+        uint32_t wakeup_event = HAL_Wakeup_GetEvent();
+        printf("[PM] wakeup_event = 0x%08x\n", wakeup_event);
+        if (wakeup_event & PM_WAKEUP_SRC_WKIO2) {
+            printf("[PM] Woken by PA06 button\n");
+        }
+    }
+
+    /* 配置PA6为GPIO输入+上拉（屏保按键） */
+    printf("[PA6] Configuring PA6 as input with pull-up (screensaver button)...\r\n");
+    param.mode = GPIOx_Pn_F0_INPUT;
+    param.driving = GPIO_DRIVING_LEVEL_1;
+    param.pull = GPIO_PULL_UP;
+    HAL_GPIO_Init(GPIO_PORT_A, PA6_BUTTON_PIN, &param);
+    printf("[PA6] PA6 configured\r\n");
+
+    /* 配置PA21为GPIO输入（充电检测） */
+    printf("[PA21] Configuring PA21 as input (charge detect)...\r\n");
+    param.mode = GPIOx_Pn_F0_INPUT;
+    param.driving = GPIO_DRIVING_LEVEL_1;
+    param.pull = GPIO_PULL_UP;
+    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_21, &param);
+    printf("[PA21] PA21 configured\r\n");
+
     /* 先配置EXT LDO到3.3V，为SD卡供电 */
     printf("[EXT LDO] Setting EXT LDO to 3.3V...\r\n");
     HAL_PRCM_SelectEXTLDOVolt(PRCM_EXT_LDO_3V3);
@@ -1060,6 +1212,9 @@ int main(void)
     }
     printf("\r\n");
     
+    /* 初始化设置模块（从INI加载字体选择等） */
+    settings_screen_init();
+    
     /* 创建主界面UI - 先显示UI，WiFi后台连接 */
     main_ui_create();
     screensaver_init();
@@ -1082,12 +1237,11 @@ int main(void)
         printf("[ERROR] Failed to create lvgl_task\r\n");
     }
 
-    /* 启动WiFi后台连接任务 */
-    printf("[WiFi] Starting background WiFi connect task\r\n");
-    if (OS_ThreadCreate(&wifi_connect_thread, "wifi_task", wifi_connect_task, NULL,
-                        OS_PRIORITY_NORMAL, 4096) != 0) {
-        printf("[ERROR] Failed to create wifi_connect_task\r\n");
-    }
+    /* 启动 WiFi 状态机 (取代原来的 wifi_connect_task) */
+    printf("[WiFi] Initializing WiFi controller\r\n");
+    wifi_controller_init();
+    wifi_controller_register_cb(on_wifi_phase_change, NULL);
+    wifi_controller_start();
 
     // 初始化完成，恢复EPD刷新
     epd_resume_refresh();

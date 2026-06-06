@@ -45,6 +45,12 @@ static TouchState_t current_touch_state = TOUCH_STATE_IDLE;
 // PRESSED时强制查询确保不漏报，RELEASED后依赖INT触发
 static uint8_t force_query_chsc = 0;
 
+// 心跳：每 N 次 poll 打印一次，验证 lvgl_task 仍在调度 touch_read_cb
+// touch_read_cb 在 lvgl_task 中被 lv_timer_handler 周期性调用,
+// 若 LVGL 线程卡死, 心跳停止, 借此快速定位死锁
+static uint32_t s_touch_poll_count = 0;
+#define TOUCH_HEARTBEAT_INTERVAL  500   /* 约 2.5s @ 5ms period */
+
 // 返回按键相关
 static uint8_t back_btn_pressed = 0;  // 返回按键按下标志
 static void (*back_btn_callback)(void) = NULL;  // 返回按键回调函数
@@ -158,7 +164,15 @@ void touch_clear_swipe_callback(void) {
 static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {
     GPIO_PinState int_state = HAL_GPIO_ReadPin(TOUCH_INT_PORT, TOUCH_INT_PIN);
-    
+
+    /* 心跳: 验证 lvgl_task 仍在调度 touch_read_cb.
+     * 若日志中此消息停止, 意味着 LVGL 线程卡死. */
+    s_touch_poll_count++;
+    if ((s_touch_poll_count % TOUCH_HEARTBEAT_INTERVAL) == 0) {
+        printf("[TOUCH] poll heartbeat #%u (INT=%d, force=%d)\n",
+               s_touch_poll_count, (int)int_state, force_query_chsc);
+    }
+
     // 两种情况需要查询CHSC：
     // 1. force_query_chsc置位（PRESSED状态时强制每次都查，确保能收到RELEASE）
     // 2. INT低电平触发（手指按下时中断必然产生）

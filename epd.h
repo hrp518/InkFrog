@@ -72,6 +72,9 @@ void EPD_Sleep(void);
 /* Graphics primitive */
 void EPD_DrawLine(int x0, int y0, int x1, int y1);
 
+/* Draw text string centered on screen */
+void EPD_DrawStringCentered(const char *text);
+
 /* Animation Demos */
 void EPD_Demo_DrawingAnimation(void);
 void EPD_Demo_TypingEffect(void);

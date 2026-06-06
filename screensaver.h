@@ -14,11 +14,13 @@ extern "C" {
 
 void screensaver_init(void);
 void screensaver_task(void);
+void screensaver_task_force_enter(void);
 int screensaver_handle_touch(TouchState_t state);
 int screensaver_is_active(void);
 int screensaver_has_image(void);
 int screensaver_save_raw_file(const uint8_t *data, uint32_t len);
 int screensaver_get_status_json(char *buf, int buf_size);
+void enter_hibernation(void);
 
 #ifdef __cplusplus
 }

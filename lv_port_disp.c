@@ -409,12 +409,15 @@ void epd_do_refresh(void) {
 
     lv_disp_t * disp_before = lv_disp_get_default();
     printf("[EPD] Starting display (T=%ums) inv_p_before=%d\n", t, disp_before ? disp_before->inv_p : -1);
-    
+
     /* 挂起LVGL任务，执行EPD刷新（关键：只在挂起期间做硬件刷新） */
     vTaskSuspend(lvgl_thread.handle);
+    printf("[EPD] lvgl suspended, calling EPD_3IN52_Display_DU\n");
     EPD_3IN52_Display_DU();
+    printf("[EPD] EPD_3IN52_Display_DU returned, resuming lvgl\n");
     vTaskResume(lvgl_thread.handle);
-    
+    printf("[EPD] lvgl resumed (call returned)\n");
+
     lv_disp_t * disp = lv_disp_get_default();
     int inv_p_during = disp ? disp->inv_p : -1;
     printf("[EPD] Display done (T=%ums, epd_cost=%ums) inv_p_during=%d\n", epd_get_tick(), epd_get_tick() - t, inv_p_during);
@@ -466,6 +469,15 @@ void epd_mark_refresh_pending(void) {
             lv_disp_enable_invalidation(disp, true);
         }
         epd_sync.refresh_pending = 1;
+    } else {
+        /* Debug: 找出为何 mark 无效 - 关键诊断点 */
+        static uint32_t s_mark_skip_count = 0;
+        s_mark_skip_count++;
+        if ((s_mark_skip_count % 50) == 1) {
+            printf("[EPD] mark_refresh SKIPPED #%u (state=%d busy=%d paused=%d)\n",
+                   s_mark_skip_count, (int)epd_sync.state,
+                   (int)epd_sync.refresh_busy, (int)epd_sync.refresh_paused);
+        }
     }
 }
 

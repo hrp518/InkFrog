@@ -13,6 +13,9 @@
 #include "epd.h"
 #include "lv_port_disp.h"
 #include "http_server.h"
+#include "wlan_manager.h"
+#include "driver/chip/hal_wakeup.h"
+#include "pm/pm.h"
 
 extern OS_Thread_t lvgl_thread;
 extern void main_ui_create(void);
@@ -58,9 +61,9 @@ static int screensaver_load_to_framebuffer(void)
     return 0;
 }
 
-static int screensaver_enter(void)
+static int screensaver_enter(int force)
 {
-    lv_disp_t *disp;
+    int has_image = 0;
 
     if (g_ss.active) {
         return 0;
@@ -68,26 +71,38 @@ static int screensaver_enter(void)
     if (http_server_is_running()) {
         return -1;
     }
-    if (screensaver_load_to_framebuffer() != 0) {
-        return -1;
+
+    /* 尝试加载屏保图片 */
+    if (screensaver_load_to_framebuffer() == 0) {
+        has_image = 1;
     }
 
-    printf("[SS] entering screensaver\n");
-    disp = lv_disp_get_default();
-    epd_pause_refresh();
-    if (disp) {
-        lv_disp_enable_invalidation(disp, false);
+    /* 无图片时：显示 Tuwa Reader 文字 */
+    if (!has_image) {
+        printf("[SS] no image, showing Tuwa Reader text\n");
+        EPD_DrawStringCentered("Tuwa Reader");
     }
 
-    vTaskSuspend(lvgl_thread.handle);
+    printf("[SS] entering hibernation (has_image=%d, force=%d)\n", has_image, force);
+
+    /* 断开 WiFi，避免 WLAN 事件立即唤醒 */
+    wlan_manager_disconnect();
+    OS_MSleep(100);
+
+    /* EPD deep sleep */
     EPD_3IN52_Init();
     EPD_3IN52_Display();
     EPD_Sleep();
-    vTaskResume(lvgl_thread.handle);
+    printf("[SS] EPD entered deep sleep\n");
 
-    g_ss.active = 1;
-    g_ss.swallow_until_release = 0;
-    g_ss.last_enter_tick = epd_get_tick();
+    /* 配置 PA06 (数组索引 2) 为唤醒源
+     * 注意：HAL_Wakeup_SetIO 的 pn 是数组索引 0-9，WAKEUP_IO2 的枚举值
+     * 是 GPIO_PIN_6 = 6，会被当成索引 6 (PA20)。必须传字面 2 才对应 PA6。 */
+    HAL_Wakeup_SetIO(2, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);
+
+    /* 进入 MCU hibernation */
+    pm_enter_mode(PM_MODE_HIBERNATION);
+
     return 0;
 }
 
@@ -159,9 +174,6 @@ void screensaver_task(void)
     if (http_server_is_running()) {
         return;
     }
-    if (!screensaver_has_image()) {
-        return;
-    }
 
     disp = lv_disp_get_default();
     if (!disp) {
@@ -170,8 +182,19 @@ void screensaver_task(void)
 
     inactive_ms = lv_disp_get_inactive_time(disp);
     if (inactive_ms >= SCREENSAVER_IDLE_TIMEOUT_MS) {
-        screensaver_enter();
+        screensaver_enter(0);
     }
+}
+
+void screensaver_task_force_enter(void)
+{
+    if (!g_ss.initialized || g_ss.active) {
+        return;
+    }
+    if (http_server_is_running()) {
+        return;
+    }
+    screensaver_enter(1);
 }
 
 int screensaver_handle_touch(TouchState_t state)
