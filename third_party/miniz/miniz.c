@@ -2912,10 +2912,15 @@ int tinfl_decompress_mem_to_callback(const void *pIn_buf, size_t *pIn_buf_size, 
 {
     int result = 0;
     tinfl_decompressor decomp;
-    mz_uint8 *pDict = (mz_uint8 *)MZ_MALLOC(TINFL_LZ_DICT_SIZE);
+    /* XR872 修复: 用 static 32KB dict 代替 MZ_MALLOC
+     * 现象: heap exhausted, incr 32776, ... 在 inflate 时申请 32KB SRAM 失败
+     *       (SRAM heap 只剩 ~80KB,WiFi/LVGL/lwIP 等占了 50KB+)
+     * 原因: miniz 内部 LZ77 滑动窗口 dict 用 MZ_MALLOC, 32KB 在 SRAM heap 紧张时失败
+     * 修复: dict 改为 static 变量, .bss 段分配(零运行时分配), 永远不失败
+     * 注意: 这个函数不是可重入的, 单线程使用安全 (epub_reader inflate 路径) */
+    static mz_uint8 s_dict[TINFL_LZ_DICT_SIZE];
+    mz_uint8 *pDict = s_dict;
     size_t in_buf_ofs = 0, dict_ofs = 0;
-    if (!pDict)
-        return TINFL_STATUS_FAILED;
     tinfl_init(&decomp);
     for (;;)
     {

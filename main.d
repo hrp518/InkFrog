@@ -19,6 +19,7 @@
  ../../../../include/driver/cmsis/core_cmSimd.h \
  ../../../../include/driver/chip/hal_prcm.h \
  ../../../../include/driver/chip/hal_ccm.h \
+ ../../../../include/driver/chip/hal_adc.h \
  ../../../../include/driver/chip/sdmmc/sdmmc.h \
  ../../../../include/driver/chip/sdmmc/card.h \
  ../../../../project/demo/FontExp/lvgl/lvgl.h \
@@ -231,9 +232,14 @@
  ../../../../project/demo/FontExp/heap_debug.h \
  ../../../../project/demo/FontExp/wlan_manager.h \
  ../../../../project/demo/FontExp/http_server.h \
+ ../../../../project/demo/FontExp/wifi_controller.h \
  ../../../../project/demo/FontExp/screensaver.h \
+ ../../../../include/driver/chip/hal_wakeup.h \
+ ../../../../include/driver/chip/hal_clock.h ../../../../include/pm/pm.h \
  ../../../../project/demo/FontExp/coremark/coremark_runner.h \
- ../../../../project/demo/FontExp/font_priority_loader.h
+ ../../../../project/demo/FontExp/font_priority_loader.h \
+ ../../../../project/demo/FontExp/settings_screen.h \
+ ../../../../project/demo/FontExp/settings_storage.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -276,6 +282,8 @@
 ../../../../include/driver/chip/hal_prcm.h:
 
 ../../../../include/driver/chip/hal_ccm.h:
+
+../../../../include/driver/chip/hal_adc.h:
 
 ../../../../include/driver/chip/sdmmc/sdmmc.h:
 
@@ -705,8 +713,20 @@
 
 ../../../../project/demo/FontExp/http_server.h:
 
+../../../../project/demo/FontExp/wifi_controller.h:
+
 ../../../../project/demo/FontExp/screensaver.h:
+
+../../../../include/driver/chip/hal_wakeup.h:
+
+../../../../include/driver/chip/hal_clock.h:
+
+../../../../include/pm/pm.h:
 
 ../../../../project/demo/FontExp/coremark/coremark_runner.h:
 
 ../../../../project/demo/FontExp/font_priority_loader.h:
+
+../../../../project/demo/FontExp/settings_screen.h:
+
+../../../../project/demo/FontExp/settings_storage.h:

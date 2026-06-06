@@ -23,6 +23,7 @@ typedef struct {
     char ip[16];
     int  retry_count;     /* 当前重试次数 */
     int  http_running;    /* HTTP 服务器是否在跑 (用于联动关闭) */
+    int  fm_paused;       /* XR872 修复: FM/EPUB 期间 wc_task 暂停重试, 释放 SRAM 给 inflate */
 } wifi_ctx_t;
 
 extern wifi_ctx_t g_wifi;

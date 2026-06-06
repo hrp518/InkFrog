@@ -44,6 +44,7 @@ DIRS_IGNORE += $(PRJ_ROOT_PATH)/example%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/lvgl/demos%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/lvgl/examples%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/LVGL_withSDandNetwork%
+DIRS_IGNORE += $(PRJ_ROOT_PATH)/FontExp_prev%
 DIRS_IGNORE += $(ROOT_PATH)/project/common/board/%
 DIRS_IGNORE += $(PRJ_BOARD)
 

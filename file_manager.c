@@ -30,6 +30,8 @@
 #include "epub_viewer.h"
 #include "settings_storage.h"
 #include "font_priority_loader.h"
+#include "wifi_controller.h"
+#include "kernel/os/os.h"
 
 extern void main_ui_create(void);
 
@@ -1260,7 +1262,22 @@ static int ensure_reader_font_loaded(void)
 static void open_epub_viewer(const char *filepath)
 {
     printf("[FM] Opening EPUB: %s\n", filepath);
-    
+
+    /* 【内存优化】EPUB 打开时强制断开 WiFi, 释放 SRAM 给 inflate / 缓存
+     * 现象: EPUB 开启后立即 inflate 申请 32KB 失败 (heap exhausted),
+     *       根因是 wc_task 后台连接 / DHCP 持有 ~30KB SRAM。
+     * 修复: 设 fm_paused=1, wc_task 在 DISCONNECTED 分支将不再重试;
+     *       同时强制 wlan_manager_disconnect() 立即停 STA, 释放 SRAM。
+     *       fm_paused 不清 INI, 退出 FM 后 wc_task 自动恢复重试。 */
+    if (!g_wifi.fm_paused) {
+        printf("[FM] Pausing WiFi controller (fm_paused=1) before EPUB to free SRAM\n");
+        g_wifi.fm_paused = 1;
+        /* 强制停 STA 立即释放 SRAM, 不等 wc_task */
+        wlan_manager_disconnect();
+        /* 等 wc_task 看到 fm_paused (1s 内) 停止重试 */
+        OS_MSleep(500);
+    }
+
     if (g_epub_viewer) {
         epub_viewer_destroy(g_epub_viewer);
         g_epub_viewer = NULL;
@@ -1325,7 +1342,14 @@ static void open_epub_viewer(const char *filepath)
 void file_manager_close(void)
 {
     printf("[FM] Closing File Manager...\n");
-    
+
+    /* XR872 修复: 退出 FM 恢复 WiFi 重试
+     * 进入 FM/EPUB 时设了 fm_paused=1 让 wc_task 暂停, 退出时清掉 */
+    if (g_wifi.fm_paused) {
+        printf("[FM] Resuming WiFi controller (fm_paused=0)\n");
+        g_wifi.fm_paused = 0;
+    }
+
     /* 清空滑动回调 */
     touch_clear_swipe_callback();
     

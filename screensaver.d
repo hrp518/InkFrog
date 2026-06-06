@@ -225,7 +225,19 @@
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h \
  ../../../../project/demo/FontExp/epd.h \
  ../../../../project/demo/FontExp/lv_port_disp.h \
- ../../../../project/demo/FontExp/http_server.h
+ ../../../../project/demo/FontExp/http_server.h \
+ ../../../../project/demo/FontExp/wlan_manager.h \
+ ../../../../include/driver/chip/hal_wakeup.h \
+ ../../../../include/driver/chip/hal_clock.h \
+ ../../../../include/driver/chip/hal_prcm.h \
+ ../../../../include/driver/chip/hal_def.h \
+ ../../../../include/driver/chip/chip.h \
+ ../../../../include/driver/cmsis/core_cm4.h \
+ ../../../../include/driver/cmsis/core_cmInstr.h \
+ ../../../../include/driver/cmsis/core_cmFunc.h \
+ ../../../../include/driver/cmsis/core_cmSimd.h \
+ ../../../../include/driver/chip/hal_ccm.h \
+ ../../../../include/driver/chip/hal_gpio.h ../../../../include/pm/pm.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -686,3 +698,29 @@
 ../../../../project/demo/FontExp/lv_port_disp.h:
 
 ../../../../project/demo/FontExp/http_server.h:
+
+../../../../project/demo/FontExp/wlan_manager.h:
+
+../../../../include/driver/chip/hal_wakeup.h:
+
+../../../../include/driver/chip/hal_clock.h:
+
+../../../../include/driver/chip/hal_prcm.h:
+
+../../../../include/driver/chip/hal_def.h:
+
+../../../../include/driver/chip/chip.h:
+
+../../../../include/driver/cmsis/core_cm4.h:
+
+../../../../include/driver/cmsis/core_cmInstr.h:
+
+../../../../include/driver/cmsis/core_cmFunc.h:
+
+../../../../include/driver/cmsis/core_cmSimd.h:
+
+../../../../include/driver/chip/hal_ccm.h:
+
+../../../../include/driver/chip/hal_gpio.h:
+
+../../../../include/pm/pm.h:

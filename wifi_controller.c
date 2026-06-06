@@ -178,6 +178,12 @@ static void wc_task(void *arg)
                 wc_set_phase(WLAN_PHASE_NO_CONFIG);
                 break;
             }
+            /* XR872 修复: FM/EPUB 期间暂停重试, 避免 wc_task 抢 SRAM 触发 heap exhausted */
+            if (g_wifi.fm_paused) {
+                WC_LOG("[TRACE] branch=DISCONNECTED, fm_paused=1, sleeping 1s");
+                OS_MSleep(1000);
+                break;
+            }
             if (g_wifi.retry_count >= (int)BACKOFF_COUNT) {
                 WC_LOG("Max retries exhausted, staying DISCONNECTED. User must tap to retry.");
                 /* 停在这, 每 60s 打印一次, 等用户主动 retry */
