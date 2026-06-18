@@ -304,26 +304,23 @@ void wlan_manager_cancel_connect(void)
 {
     WLAN_State_t state = g_wlan_state;
     
-    if (state == WLAN_STATE_CONNECTED) {
-        WLAN_LOG("Already connected, skip cancel");
-        return;
-    }
+    /* XR872 修复: 即使已 CONNECTED 也要设停止标志 (不再 skip)。
+     * wifi_controller_stop 调本函数是为了让 wc_task 主循环尽快退出，
+     * 若已连接就 skip，wc_task 会卡在 CONNECTED 分支的 OS_MSleep 里不退出，
+     * 导致休眠时 net_sys_onoff teardown 与本线程竞争 wlan 驱动 ->
+     * BUG at wsm_remove_key_request:1027 断言崩溃。 */
+    WLAN_LOG("Cancel requested (current state=%d)", state);
     
-    if (state == WLAN_STATE_CONNECTING || state == WLAN_STATE_IDLE) {
-        WLAN_LOG("Canceling WiFi connect (current state=%d)", state);
-        
-        /* 设置取消标志，让wait_for_ip轮询退出 */
-        g_connect_canceled = 1;
-        
-        /* 停STA，释放WLAN资源 */
-        wlan_sta_disable();
-        
-        /* 重置状态 */
+    /* 设置取消标志 (wait_for_ip 轮询 + wc_task 主循环都会检查) */
+    g_connect_canceled = 1;
+    
+    if (state != WLAN_STATE_CONNECTED) {
+        /* 重置状态 (不停 STA，留给 disconnect/net_sys_onoff) */
         g_wlan_state = WLAN_STATE_IDLE;
         g_connected = 0;
-        
-        WLAN_LOG("WiFi connect canceled, resources released");
     }
+    
+    WLAN_LOG("Cancel requested (STA disable deferred to net_sys_onoff)");
 }
 
 /*
@@ -502,8 +499,10 @@ static void scan_async_task(void *arg)
  */
 void wlan_manager_scan_async(WLAN_ScanDoneCb_t cb, void *user_data)
 {
+    WLAN_LOG("[SCAN_ASYNC] enter, cb=%p ud=%p", (void*)cb, user_data);
+
     if (cb == NULL) return;
-    
+
     ScanAsyncCtx_t *ctx = (ScanAsyncCtx_t *)malloc(sizeof(ScanAsyncCtx_t));
     if (!ctx) {
         WLAN_LOG("[ASYNC_SCAN] Failed to allocate context");

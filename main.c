@@ -837,14 +837,19 @@ static void disp_task(void *arg) {
     update_vbat_display();
     
     while (1) {
-        /* PA6 按键检测：低电平=按下，进入休眠 */
+        /* PA6 按键检测：低电平=按下，进入休眠
+         * XR872 修复: 旧代码调 enter_hibernation() 走自己实现,
+         *   调 EPD_DrawStringCentered("Tuwa Reader") 覆盖画面。
+         *   正确做法是调 screensaver_task_force_enter() → screensaver_enter(),
+         *   内部会先加载 screensaver.bin (有图) 或显示 Tuwa Reader (无图),
+         *   再断 WiFi + EPD deep sleep + PA6 唤醒源。 */
         if (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
-            printf("[PA6] Button pressed, entering hibernation\r\n");
+            printf("[PA6] Button pressed, entering hibernation (via screensaver)\r\n");
             OS_MSleep(50);
             while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
                 OS_MSleep(20);
             }
-            enter_hibernation();
+            screensaver_task_force_enter();
         }
 
         screensaver_task();
@@ -991,36 +996,10 @@ static float adc_read_vbat(void)
     return (float)raw * 2.5f * 3.0f / 4096.0f;
 }
 
-void enter_hibernation(void)
-{
-    printf("[PM] Entering hibernation...\n");
-
-    /* 1. 关闭 HTTP 服务器（如果在运行） */
-    if (http_server_is_running()) {
-        http_server_stop();
-    }
-
-    /* 2. 断开 WiFi，避免 WLAN 事件立即唤醒 */
-    wlan_manager_disconnect();
-    OS_MSleep(100);
-
-    /* 3. EPD 显示 Tuwa Reader */
-    EPD_DrawStringCentered("Tuwa Reader");
-
-    /* 4. EPD deep sleep */
-    EPD_3IN52_Init();
-    EPD_3IN52_Display();
-    EPD_Sleep();
-    printf("[PM] EPD entered deep sleep\n");
-
-    /* 5. 配置 PA06 (数组索引 2) 为唤醒源，下降沿+上拉
-     * 注意：HAL_Wakeup_SetIO 的 pn 是数组索引 0-9，WAKEUP_IO2 的枚举值
-     * 是 GPIO_PIN_6 = 6，会被当成索引 6 (PA20)。必须传字面 2 才对应 PA6。 */
-    HAL_Wakeup_SetIO(2, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);
-
-    /* 6. 进入 hibernation（不返回，唤醒后系统重启） */
-    pm_enter_mode(PM_MODE_HIBERNATION);
-}
+/* XR872 修复: enter_hibernation() 已删除, PA6 休眠改走
+ *   screensaver_task_force_enter() → screensaver_enter(force=1),
+ *   内部会先加载 screensaver.bin 显示, 再断 WiFi + EPD deep sleep + PA6 唤醒源。
+ *   之前 enter_hibernation 自己画 "Tuwa Reader" 覆盖了屏保图。 */
 
 /* batt_status.md: 电压 -> SOC 查表 (12 段, 单调, 不插值)
  * v < kSocLut[0].voltage -> 0

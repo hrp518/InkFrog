@@ -33,6 +33,7 @@ wifi_ctx_t g_wifi;
 
 static OS_Thread_t g_wc_thread;
 static volatile int g_wc_running = 0;
+static volatile int g_wc_exited = 0;  /* 线程真正退出标志 (休眠同步用) */
 static volatile int g_wc_request_retry = 0;
 static volatile int g_wc_request_disconnect = 0;
 
@@ -123,6 +124,7 @@ static void wc_task(void *arg)
     }
 
     g_wc_running = 1;
+    g_wc_exited = 0;
 
     while (g_wc_running) {
         WC_LOG("[TRACE] wc_task loop top, phase=%d", (int)g_wifi.phase);
@@ -206,9 +208,18 @@ static void wc_task(void *arg)
             break;
 
         case WLAN_PHASE_CONNECTED:
-            WC_LOG("[TRACE] branch=CONNECTED, sleeping %dms", POLL_INTERVAL_MS);
-            /* 监控 link: 每 5s 检查一次 */
-            OS_MSleep(POLL_INTERVAL_MS);
+            WC_LOG("[TRACE] branch=CONNECTED, polling link every 100ms (stop-responsive)");
+            /* 监控 link: 每 5s 检查一次，但以 100ms 粒度轮询以便快速响应停止请求。
+             * XR872 修复: 原来用 OS_MSleep(5000) 会卡 5 秒不检测 g_wc_running，
+             *   导致休眠时 wifi_controller_stop() 超时，wlan 驱动在 disconnect
+             *   期间被本线程访问，触发 BUG at wsm_remove_key_request:1027 断言。 */
+            for (int i = 0; i < (POLL_INTERVAL_MS / 100) && g_wc_running; i++) {
+                OS_MSleep(100);
+            }
+            if (!g_wc_running) {
+                WC_LOG("[TRACE] stop requested during CONNECTED poll, exiting loop");
+                break;
+            }
             WC_LOG("[TRACE] CONNECTED woke, calling is_connected");
             if (!wlan_manager_is_connected()) {
                 WC_LOG("[TRACE] link lost");
@@ -231,6 +242,7 @@ static void wc_task(void *arg)
     }
 
     WC_LOG("Controller task exiting");
+    g_wc_exited = 1;
     OS_ThreadDelete(&g_wc_thread);
 }
 
@@ -247,6 +259,35 @@ void wifi_controller_start(void)
     if (OS_ThreadCreate(&g_wc_thread, "wifi_ctrl", wc_task, NULL,
                         OS_PRIORITY_NORMAL, 4096) != 0) {
         WC_LOG("Failed to create controller thread");
+    }
+}
+
+/* XR872 修复: 休眠前必须停止控制器线程
+ * 现象: 用户在 WiFi 连接中途 (scan/assoc/dhcp) 按 PA6 触发休眠,
+ *   screensaver 在活跃的 net 子系统上做 teardown ->
+ *   net_sys_onoff poweroff 崩溃 (PC=0x00200024, UFSR=0x1 UNDEFINSTR)。
+ * 修复: 休眠前先取消连接 + 停控制器线程 + 等 net 栈沉淀, 再进 hibernation。 */
+void wifi_controller_stop(void)
+{
+    WC_LOG("Stopping controller (for hibernation)");
+
+    /* 1. 取消进行中的连接 (让 wait_for_ip 轮询退出) */
+    wlan_manager_cancel_connect();
+
+    /* 2. 让 wc_task 主循环退出 */
+    g_wc_running = 0;
+
+    /* 3. 等线程真正退出 (wc_task 在 OS_MSleep 间检测 g_wc_running,
+     *    最坏情况卡在 wait_for_ip 的轮询, 被 cancel_connect 解开) */
+    int wait_ms = 0;
+    while (!g_wc_exited && wait_ms < 2000) {
+        OS_MSleep(20);
+        wait_ms += 20;
+    }
+    if (wait_ms >= 2000) {
+        WC_LOG("WARN: controller thread did not exit within 2s");
+    } else {
+        WC_LOG("Controller thread exited (waited %dms)", wait_ms);
     }
 }
 

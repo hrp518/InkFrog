@@ -34,6 +34,11 @@ void wifi_controller_init(void);
 /* 启动状态机后台线程 */
 void wifi_controller_start(void);
 
+/* 停止控制器线程 (休眠前调用, 取消进行中的 WiFi 连接 + 等线程退出)
+ * 必须在 screensaver_enter / hibernation 之前调用, 防止在活跃的 net
+ * 子系统上做 teardown 导致 net_sys_onoff poweroff 崩溃。 */
+void wifi_controller_stop(void);
+
 /* 注册 phase 回调 (LVGL 线程中安全) - 通常 main.c 用来更新 status bar */
 void wifi_controller_register_cb(WLAN_PhaseCb_t cb, void *user_data);
 

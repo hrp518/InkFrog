@@ -2912,13 +2912,13 @@ int tinfl_decompress_mem_to_callback(const void *pIn_buf, size_t *pIn_buf_size, 
 {
     int result = 0;
     tinfl_decompressor decomp;
-    /* XR872 修复: 用 static 32KB dict 代替 MZ_MALLOC
+    /* XR872 修复: dict 放到 PSRAM (.psram_bss)
      * 现象: heap exhausted, incr 32776, ... 在 inflate 时申请 32KB SRAM 失败
-     *       (SRAM heap 只剩 ~80KB,WiFi/LVGL/lwIP 等占了 50KB+)
-     * 原因: miniz 内部 LZ77 滑动窗口 dict 用 MZ_MALLOC, 32KB 在 SRAM heap 紧张时失败
-     * 修复: dict 改为 static 变量, .bss 段分配(零运行时分配), 永远不失败
+     *       (SRAM heap 只剩 ~86KB,WiFi/LVGL/lwIP 等占了 50KB+)
+     * 原因: miniz 内部 LZ77 滑动窗口 dict 32KB，放在 SRAM .bss 会吃掉堆空间
+     * 修复: dict 移到 PSRAM (.psram_bss)，释放 32KB SRAM 堆给 WiFi/net 初始化用
      * 注意: 这个函数不是可重入的, 单线程使用安全 (epub_reader inflate 路径) */
-    static mz_uint8 s_dict[TINFL_LZ_DICT_SIZE];
+    static mz_uint8 s_dict[TINFL_LZ_DICT_SIZE] __attribute__((section(".psram_bss")));
     mz_uint8 *pDict = s_dict;
     size_t in_buf_ofs = 0, dict_ofs = 0;
     tinfl_init(&decomp);
@@ -2937,7 +2937,7 @@ int tinfl_decompress_mem_to_callback(const void *pIn_buf, size_t *pIn_buf_size, 
         }
         dict_ofs = (dict_ofs + dst_buf_size) & (TINFL_LZ_DICT_SIZE - 1);
     }
-    MZ_FREE(pDict);
+    /* XR872: 原 MZ_FREE(pDict) 是 free 静态变量 (无意义 + 触发 warning)，删除 */
     *pIn_buf_size = in_buf_ofs;
     return result;
 }

@@ -17,9 +17,11 @@
 #include "kernel/os/os.h"
 #include "kernel/os/os_mutex.h"
 
-/* Frame buffer - 240x415 pixels = 12450 bytes */
-/* Note: framebuffer must be accessible by lv_port_disp.c, so NOT static */
-uint8_t framebuffer[240 * 415 / 8];
+/* Frame buffer - 240x415 pixels = 12450 bytes
+ * Note: framebuffer must be accessible by lv_port_disp.c, so NOT static
+ * XR872 修复: 移到 PSRAM (.psram_bss)，释放 12KB SRAM 堆给 WiFi/net 初始化用。
+ *   EPD 刷新不频繁，PSRAM 带宽充足，访问延迟可忽略。 */
+uint8_t framebuffer[240 * 415 / 8] __attribute__((section(".psram_bss")));
 
 /* Global flag for display state */
 static uint8_t EPD_3IN52_Flag = 0;

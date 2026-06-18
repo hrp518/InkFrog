@@ -227,6 +227,7 @@
  ../../../../project/demo/FontExp/lv_port_disp.h \
  ../../../../project/demo/FontExp/http_server.h \
  ../../../../project/demo/FontExp/wlan_manager.h \
+ ../../../../project/demo/FontExp/wifi_controller.h \
  ../../../../include/driver/chip/hal_wakeup.h \
  ../../../../include/driver/chip/hal_clock.h \
  ../../../../include/driver/chip/hal_prcm.h \
@@ -237,7 +238,11 @@
  ../../../../include/driver/cmsis/core_cmFunc.h \
  ../../../../include/driver/cmsis/core_cmSimd.h \
  ../../../../include/driver/chip/hal_ccm.h \
- ../../../../include/driver/chip/hal_gpio.h ../../../../include/pm/pm.h
+ ../../../../include/driver/chip/hal_gpio.h ../../../../include/pm/pm.h \
+ ../../../../include/driver/chip/hal_i2c.h \
+ ../../../../include/driver/chip/sdmmc/sdmmc.h \
+ ../../../../include/driver/chip/sdmmc/card.h \
+ ../../../../include/driver/chip/sdmmc/hal_sdhost.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -701,6 +706,8 @@
 
 ../../../../project/demo/FontExp/wlan_manager.h:
 
+../../../../project/demo/FontExp/wifi_controller.h:
+
 ../../../../include/driver/chip/hal_wakeup.h:
 
 ../../../../include/driver/chip/hal_clock.h:
@@ -724,3 +731,11 @@
 ../../../../include/driver/chip/hal_gpio.h:
 
 ../../../../include/pm/pm.h:
+
+../../../../include/driver/chip/hal_i2c.h:
+
+../../../../include/driver/chip/sdmmc/sdmmc.h:
+
+../../../../include/driver/chip/sdmmc/card.h:
+
+../../../../include/driver/chip/sdmmc/hal_sdhost.h:
