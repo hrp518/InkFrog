@@ -107,14 +107,24 @@ static int screensaver_enter(int force)
     printf("[SS] EPD entered deep sleep\n");
 
     /* ========================================
-     * 【休眠前电源管理 - 临时全部关闭以定位唤醒异常】
+     * 休眠前外设操作 (严格按原版固件休眠.log 的顺序)
+     * ========================================
+     * 原版顺序: EPD flush -> WakeupIO -> net_sys_onoff -> spi deinit
+     *           -> mod_vfat_power:en=0 -> suspend devices -> nvic/WFE
+     *
+     * WiFi: 跳过 net_sys_onoff (pm_unregister_wlan_power_onoff),
+     *       hibernation 的 SetSys1SleepPowerFlags 硬断电 WLAN CPU。
+     *
+     * 原版【没有】的操作 (不在这里做!):
+     *   - PA07/PA23/PA03 等 GPIO 操作
+     *   - SPI GPIO 输入模式配置
+     *   - I2C deinit / I2C GPIO 输入
+     *   这些都破坏了 flash 唤醒 (rom_flash_rw fail)。
      * ======================================== */
-#if 0  // 暂时关闭, 定位唤醒后 flash 读取失败 (rom_flash_rw fail)
-    /* 1. 卸载 SD 卡文件系统 */
+    /* 按原版顺序: spi deinit (SD 控制器) -> mod_vfat_power:en=0 (断电) */
     printf("[SS] Unmount SD card filesystem\n");
     f_mount(NULL, "0:", 0);
 
-    /* 2. 反初始化 SD 卡 */
     printf("[SS] Deinit SD card\n");
     struct mmc_card *card = mmc_card_open(0);
     if (card != NULL) {
@@ -124,46 +134,12 @@ static int screensaver_enter(int force)
         mmc_card_close(0);
     }
 
-    /* 3. 关闭 SD 控制器 */
-    printf("[SS] Deinit SD controller\n");
+    printf("[SS] Deinit SD controller (spi deinit)\n");
     HAL_SDC_Deinit(0);
 
-    /* 4. 关闭 EXT LDO (SD 卡 3.3V 断电) */
-    printf("[SS] Power off EXT LDO (SD card)\n");
+    printf("[SS] Power off EXT LDO (SD card - mod_vfat_power en=0)\n");
     HAL_PRCM_SetEXTLDOMode(PRCM_EXTLDO_ALWAYS_OFF);
 
-    /* 3. 拉低 PA23 (关闭 SY8088 DC-DC) */
-    printf("[SS] Power off PA23 (SY8088 DC-DC)\n");
-    GPIO_InitParam param;
-    param.mode = GPIOx_Pn_F1_OUTPUT;
-    param.driving = GPIO_DRIVING_LEVEL_1;
-    param.pull = GPIO_PULL_NONE;
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_23, &param);
-    HAL_GPIO_WritePin(GPIO_PORT_A, GPIO_PIN_23, GPIO_PIN_LOW);
-
-    /* 4. 拉高 PA07 (关闭 EPD 供电 MOS) */
-    printf("[SS] Power off PA07 (EPD MOS)\n");
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_7, &param);
-    HAL_GPIO_WritePin(GPIO_PORT_A, GPIO_PIN_7, GPIO_PIN_HIGH);
-
-    /* 5. 配置 SPI GPIO 为输入模式 (防止漏电) */
-    printf("[SS] Configure SPI GPIOs to input mode\n");
-    param.mode = GPIOx_Pn_F0_INPUT;
-    param.driving = GPIO_DRIVING_LEVEL_1;
-    param.pull = GPIO_PULL_NONE;
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_0, &param);  // MOSI
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_1, &param);  // DC
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_2, &param);  // CLK
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_3, &param);  // CS
-
-    /* 6. 关闭 I2C 总线 (CHSC6540 触摸控制器) */
-    printf("[SS] Deinit I2C bus\n");
-    HAL_I2C_DeInit(I2C0_ID);
-
-    /* 7. 配置 I2C GPIO 为输入模式 */
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_19, &param);  // I2C0_SCL
-    HAL_GPIO_Init(GPIO_PORT_A, GPIO_PIN_20, &param);  // I2C0_SDA
-#endif
     /* ======================================== */
 
     /* 配置唤醒源:
