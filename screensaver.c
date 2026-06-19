@@ -137,8 +137,10 @@ static int screensaver_enter(int force)
     printf("[SS] Deinit SD controller (spi deinit)\n");
     HAL_SDC_Deinit(0);
 
+#if 0  /* 暂时注释: 怀疑 HAL_PRCM_SetEXTLDOMode 写 PRCM 寄存器干扰了 PA6 唤醒域 */
     printf("[SS] Power off EXT LDO (SD card - mod_vfat_power en=0)\n");
     HAL_PRCM_SetEXTLDOMode(PRCM_EXTLDO_ALWAYS_OFF);
+#endif
 
     /* ======================================== */
 
