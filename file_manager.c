@@ -566,6 +566,28 @@ void epd_disable_all_animations_recursive(lv_obj_t *obj)
     }
 }
 
+static void fm_apply_static_btn_style(lv_obj_t *btn, int border_width, int radius)
+{
+    if (!btn) return;
+
+    epd_disable_all_animations_recursive(btn);
+    lv_obj_set_style_bg_color(btn, lv_color_white(), LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_border_width(btn, border_width, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_border_color(btn, lv_color_black(), LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_radius(btn, radius, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+
+    uint32_t child_cnt = lv_obj_get_child_cnt(btn);
+    for (uint32_t i = 0; i < child_cnt; i++) {
+        lv_obj_t *child = lv_obj_get_child(btn, i);
+        if (child) {
+            lv_obj_set_style_text_color(child, lv_color_black(), LV_PART_MAIN | LV_STATE_ANY);
+        }
+    }
+}
+
 static const char* get_file_icon(const char *filename, uint8_t is_dir)
 {
     if (is_dir) return "[DIR]";
@@ -728,13 +750,7 @@ static void display_current_page(void)
          /* 处理返回按钮 */
          if (entry->is_dir == 0xFF) {
          lv_obj_t *btn = lv_list_add_btn(fm_list, NULL, entry->name);
-         epd_disable_all_animations_recursive(btn);
-         /* 只设置必要的边框样式，确保一致性 */
-         lv_obj_set_style_border_width(btn, 1, LV_STATE_PRESSED);
-         lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUSED);
-         lv_obj_set_style_border_width(btn, 1, LV_STATE_FOCUS_KEY);
-         lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUSED);
-         lv_obj_set_style_outline_width(btn, 0, LV_STATE_FOCUS_KEY);
+         fm_apply_static_btn_style(btn, 1, 0);
          /* FM列表强制使用内置字体，避免TTF字体导致高度变化 */
          lv_obj_t *lbl = lv_obj_get_child(btn, 0);
          if (lbl) lv_obj_set_style_text_font(lbl, &lv_font_misans_16, 0);
@@ -1130,7 +1146,7 @@ static void open_text_viewer(const char *filepath)
     lv_obj_t *back_btn = lv_btn_create(viewer_screen);
     lv_obj_set_size(back_btn, 60, 30);
     lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 5, 5);
-    epd_disable_all_animations_recursive(back_btn);
+    fm_apply_static_btn_style(back_btn, 1, 0);
     
     lv_obj_t *back_label = lv_label_create(back_btn);
     lv_label_set_text(back_label, "返回");

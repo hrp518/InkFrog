@@ -76,6 +76,31 @@ static void load_settings_from_ini(void);
 static void save_settings_to_ini(void);
 static void settings_screen_rebuild_main(void);
 
+static void settings_apply_static_btn_style(lv_obj_t *btn, int border_width, int radius)
+{
+    if (!btn) return;
+
+    lv_obj_set_style_transition(btn, NULL, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_anim_time(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_bg_color(btn, lv_color_white(), LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_border_width(btn, border_width, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_border_color(btn, lv_color_black(), LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_radius(btn, radius, LV_PART_MAIN | LV_STATE_ANY);
+
+    uint32_t child_cnt = lv_obj_get_child_cnt(btn);
+    for (uint32_t i = 0; i < child_cnt; i++) {
+        lv_obj_t *child = lv_obj_get_child(btn, i);
+        if (child) {
+            lv_obj_set_style_transition(child, NULL, LV_PART_ANY | LV_STATE_ANY);
+            lv_obj_set_style_anim_time(child, 0, LV_PART_ANY | LV_STATE_ANY);
+            lv_obj_set_style_text_color(child, lv_color_black(), LV_PART_MAIN | LV_STATE_ANY);
+        }
+    }
+}
+
 /* ===================================================
  * 公共接口
  * =================================================== */
@@ -328,10 +353,7 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
     lv_obj_t *btn_back = lv_btn_create(parent);
     lv_obj_set_size(btn_back, 70, 30);
     lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -3, 5);
-    lv_obj_set_style_bg_color(btn_back, lv_color_white(), 0);
-    lv_obj_set_style_border_width(btn_back, 2, 0);
-    lv_obj_set_style_border_color(btn_back, lv_color_black(), 0);
-    lv_obj_set_style_radius(btn_back, 0, 0);
+    settings_apply_static_btn_style(btn_back, 2, 0);
     lv_obj_add_event_cb(btn_back, wifi_back_cb, LV_EVENT_CLICKED, NULL);
 
     lv_obj_t *lbl_back = lv_label_create(btn_back);
@@ -414,10 +436,7 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
     g_wifi_scan_btn = lv_btn_create(parent);
     lv_obj_set_size(g_wifi_scan_btn, LV_HOR_RES - 20, 35);
     lv_obj_align(g_wifi_scan_btn, LV_ALIGN_BOTTOM_MID, 0, -5);
-    lv_obj_set_style_bg_color(g_wifi_scan_btn, lv_color_white(), 0);
-    lv_obj_set_style_border_width(g_wifi_scan_btn, 2, 0);
-    lv_obj_set_style_border_color(g_wifi_scan_btn, lv_color_black(), 0);
-    lv_obj_set_style_radius(g_wifi_scan_btn, 4, 0);
+    settings_apply_static_btn_style(g_wifi_scan_btn, 2, 4);
     lv_obj_add_event_cb(g_wifi_scan_btn, wifi_rescan_cb, LV_EVENT_CLICKED, NULL);
     
     g_wifi_scan_btn_label = lv_label_create(g_wifi_scan_btn);
@@ -855,10 +874,7 @@ static void create_wifi_password_input(const char *ssid, int is_encrypted)
     lv_obj_t *btn_back = lv_btn_create(scr);
     lv_obj_set_size(btn_back, LV_HOR_RES - 20, 25);
     lv_obj_align(btn_back, LV_ALIGN_TOP_MID, 0, 90);
-    lv_obj_set_style_bg_color(btn_back, lv_color_white(), 0);
-    lv_obj_set_style_border_width(btn_back, 1, 0);
-    lv_obj_set_style_border_color(btn_back, lv_color_black(), 0);
-    lv_obj_set_style_radius(btn_back, 3, 0);
+    settings_apply_static_btn_style(btn_back, 1, 3);
     lv_obj_add_event_cb(btn_back, wifi_pwd_back_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *label_back = lv_label_create(btn_back);
@@ -1072,10 +1088,7 @@ static void create_font_screen(lv_obj_t *parent)
     lv_obj_t *btn_back = lv_btn_create(parent);
     lv_obj_set_size(btn_back, LV_HOR_RES - 20, 35);
     lv_obj_align(btn_back, LV_ALIGN_BOTTOM_MID, 0, -5);
-    lv_obj_set_style_bg_color(btn_back, lv_color_white(), 0);
-    lv_obj_set_style_border_width(btn_back, 2, 0);
-    lv_obj_set_style_border_color(btn_back, lv_color_black(), 0);
-    lv_obj_set_style_radius(btn_back, 4, 0);
+    settings_apply_static_btn_style(btn_back, 2, 4);
     lv_obj_add_event_cb(btn_back, font_back_cb, LV_EVENT_CLICKED, NULL);
     
     lv_obj_t *label_back = lv_label_create(btn_back);

@@ -88,6 +88,31 @@ static lv_style_t style_sw;
 static lv_style_t style_tile;
 static lv_style_t style_tile_pressed;
 
+static void ui_apply_static_btn_style(lv_obj_t *btn, int border_width, int radius)
+{
+    if (!btn) return;
+
+    lv_obj_set_style_transition(btn, NULL, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_anim_time(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_shadow_width(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_outline_width(btn, 0, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_bg_color(btn, lv_color_white(), LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_border_width(btn, border_width, LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_border_color(btn, lv_color_make(0, 0, 0), LV_PART_MAIN | LV_STATE_ANY);
+    lv_obj_set_style_radius(btn, radius, LV_PART_MAIN | LV_STATE_ANY);
+
+    uint32_t child_cnt = lv_obj_get_child_cnt(btn);
+    for (uint32_t i = 0; i < child_cnt; i++) {
+        lv_obj_t *child = lv_obj_get_child(btn, i);
+        if (child) {
+            lv_obj_set_style_transition(child, NULL, LV_PART_ANY | LV_STATE_ANY);
+            lv_obj_set_style_anim_time(child, 0, LV_PART_ANY | LV_STATE_ANY);
+            lv_obj_set_style_text_color(child, lv_color_make(0, 0, 0), LV_PART_MAIN | LV_STATE_ANY);
+        }
+    }
+}
+
 /* platform_init声明 */
 extern void platform_init(void);
 
@@ -641,11 +666,7 @@ static void settings_btn_event_handler(lv_event_t * e) {
     lv_obj_t *btn_back = lv_btn_create(scr);
     lv_obj_set_size(btn_back, 60, 30);
     lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 10, 45);  /* Y=45，在标题下方 */
-    lv_obj_set_style_bg_color(btn_back, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_border_width(btn_back, 2, 0);
-    lv_obj_set_style_border_color(btn_back, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_radius(btn_back, 4, 0);
-    lv_obj_set_style_transition(btn_back, NULL, LV_PART_MAIN);
+    ui_apply_static_btn_style(btn_back, 2, 4);
     lv_obj_t *btn_back_label = lv_label_create(btn_back);
     lv_label_set_text(btn_back_label, "Back");
     lv_obj_set_style_text_font(btn_back_label, &lv_font_montserrat_12, 0);
