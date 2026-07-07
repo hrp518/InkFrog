@@ -45,9 +45,12 @@ static int g_scan_count = 0;
 /* WiFi界面的UI元素引用 */
 static lv_obj_t *g_wifi_list_cont = NULL;      /* AP列表容器 */
 static lv_obj_t *g_wifi_scan_btn = NULL;       /* 重新扫描按钮 */
+static lv_obj_t *g_wifi_scan_btn_label = NULL; /* 扫描按钮文字 */
 static lv_obj_t *g_wifi_screen = NULL;         /* WiFi界面screen */
 static lv_obj_t *g_wifi_switch = NULL;         /* 顶部开关 (手机式) */
 static lv_obj_t *g_wifi_switch_label = NULL;   /* 开关左侧的描述文字 */
+static int g_wifi_scan_in_progress = 0;
+static char g_wifi_connecting_hint[WLAN_MGR_MAX_SSID_LEN] = "";
 
 /* 字体文件信息 */
 typedef struct {
@@ -67,6 +70,7 @@ static void create_wifi_screen_ui(lv_obj_t *parent);
 static void wifi_start_scan(void);
 static void wifi_show_ap_list(int count, WLAN_ScanResult_t *results);
 static void create_wifi_password_input(const char *ssid, int is_encrypted);
+static void wifi_refresh_list_contents(void);
 static void create_font_screen(lv_obj_t *parent);
 static void load_settings_from_ini(void);
 static void save_settings_to_ini(void);
@@ -96,9 +100,13 @@ void settings_wifi_scan_open(lv_obj_t *return_screen)
     g_wifi_screen = scr;
     create_wifi_screen_ui(scr);
     lv_scr_load_anim(scr, LV_SCR_LOAD_ANIM_OVER_LEFT, 0, 0, false);
-    
-    /* 进入WiFi界面后自动开始异步扫描 */
-    wifi_start_scan();
+
+    if (g_wifi.enabled) {
+        /* 进入WiFi界面后自动开始异步扫描 */
+        wifi_start_scan();
+    } else {
+        wifi_refresh_list_contents();
+    }
 }
 
 void settings_font_select_open(lv_obj_t *return_screen)
@@ -161,8 +169,11 @@ static void wifi_back_cb(lv_event_t *e)
     g_wifi_screen = NULL;
     g_wifi_list_cont = NULL;
     g_wifi_scan_btn = NULL;
+    g_wifi_scan_btn_label = NULL;
     g_wifi_switch = NULL;
     g_wifi_switch_label = NULL;
+    g_wifi_scan_in_progress = 0;
+    g_wifi_connecting_hint[0] = '\0';
     /* 释放旧的扫描结果 */
     if (g_scan_results) {
         free(g_scan_results);
@@ -178,86 +189,126 @@ static void wifi_rescan_cb(lv_event_t *e)
     wifi_start_scan();
 }
 
-/* 用户在 WiFi 界面上的"Wi-Fi 总开关"意图状态
- * 与 g_wifi.phase 解耦: 进入 WiFi 界面默认 ON, 用户点过 OFF 才置 OFF.
- *  - WIFI_SWITCH_OFF: 用户已主动关闭 (调 disconnect 清空 INI)
- *  - WIFI_SWITCH_ON:  正在扫描 / 连接中 / 已连接
- *
- * 与 iPhone 行为一致: 进入 WiFi 页面 = 开关默认 ON, 扫描中也是 ON.
- */
-typedef enum {
-    WIFI_SWITCH_ON = 0,
-    WIFI_SWITCH_OFF
-} WifiSwitchIntent_t;
-static WifiSwitchIntent_t g_wifi_switch_intent = WIFI_SWITCH_ON;  /* 默认 ON */
+static void wifi_set_connecting_hint(const char *ssid)
+{
+    if (!ssid) ssid = "";
+    strncpy(g_wifi_connecting_hint, ssid, sizeof(g_wifi_connecting_hint) - 1);
+    g_wifi_connecting_hint[sizeof(g_wifi_connecting_hint) - 1] = '\0';
+}
 
-/* 更新开关左侧的描述文字 (iPhone 风格 - 简洁):
- *  - CONNECTED:    "On  SSID  IP"
- *  - CONNECTING:   "Connecting..."
- *  - 其他 (OFF/未配): "Wi-Fi"
- */
+static void wifi_clear_connecting_hint(void)
+{
+    g_wifi_connecting_hint[0] = '\0';
+}
+
+static void wifi_show_placeholder(const char *text)
+{
+    if (!g_wifi_list_cont) return;
+
+    lv_obj_clean(g_wifi_list_cont);
+
+    lv_obj_t *label = lv_label_create(g_wifi_list_cont);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, UI_FONT, 0);
+    lv_obj_set_style_text_color(label, lv_color_make(100, 100, 100), 0);
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+}
+
+static void wifi_update_scan_button(void)
+{
+    if (!g_wifi_scan_btn || !g_wifi_scan_btn_label) return;
+
+    if (!g_wifi.enabled) {
+        lv_label_set_text(g_wifi_scan_btn_label, "WiFi Off");
+        lv_obj_add_state(g_wifi_scan_btn, LV_STATE_DISABLED);
+    } else if (g_wifi_scan_in_progress) {
+        lv_label_set_text(g_wifi_scan_btn_label, "Scanning...");
+        lv_obj_add_state(g_wifi_scan_btn, LV_STATE_DISABLED);
+    } else {
+        lv_label_set_text(g_wifi_scan_btn_label, LV_SYMBOL_WIFI " Rescan");
+        lv_obj_clear_state(g_wifi_scan_btn, LV_STATE_DISABLED);
+    }
+
+    lv_obj_center(g_wifi_scan_btn_label);
+}
+
 static void wifi_update_switch_label(void)
 {
     if (!g_wifi_switch_label) return;
 
     char text[80];
-    switch (g_wifi.phase) {
-    case WLAN_PHASE_CONNECTED:
+    if (!g_wifi.enabled) {
+        snprintf(text, sizeof(text), "Wi-Fi Off");
+    } else if (g_wifi.phase == WLAN_PHASE_CONNECTED) {
         if (g_wifi.ip[0]) {
-            snprintf(text, sizeof(text), "On  %s  %s",
+            snprintf(text, sizeof(text), "%s  %s",
                      g_wifi.ssid[0] ? g_wifi.ssid : "(unknown)",
                      g_wifi.ip);
         } else {
-            snprintf(text, sizeof(text), "On  %s",
+            snprintf(text, sizeof(text), "%s",
                      g_wifi.ssid[0] ? g_wifi.ssid : "Connected");
         }
-        break;
-    case WLAN_PHASE_CONNECTING:
+    } else if (g_wifi_connecting_hint[0] != '\0') {
+        snprintf(text, sizeof(text), "Connecting to %s", g_wifi_connecting_hint);
+    } else if (g_wifi.phase == WLAN_PHASE_CONNECTING) {
         snprintf(text, sizeof(text), "Connecting...");
-        break;
-    case WLAN_PHASE_DISCONNECTED:
-    case WLAN_PHASE_NO_CONFIG:
-    default:
-        snprintf(text, sizeof(text), "Wi-Fi");
-        break;
+    } else if (g_wifi.ssid[0] != '\0') {
+        snprintf(text, sizeof(text), "Not Connected");
+    } else if (g_wifi_scan_in_progress) {
+        snprintf(text, sizeof(text), "Searching...");
+    } else {
+        snprintf(text, sizeof(text), "Choose a Network");
     }
     lv_label_set_text(g_wifi_switch_label, text);
 }
 
-/* 开关左侧描述点击: 等同于 tap 开关 ON */
 static void wifi_switch_label_click_cb(lv_event_t *e)
 {
     (void)e;
-    if (g_wifi_switch_intent == WIFI_SWITCH_OFF) {
-        /* OFF -> ON: 重试连接 */
+    if (!g_wifi.enabled) {
+        if (g_wifi_switch) {
+            lv_obj_add_state(g_wifi_switch, LV_STATE_CHECKED);
+        }
+        g_wifi.enabled = 1;
+        wifi_clear_connecting_hint();
+        wifi_update_switch_label();
+        wifi_update_scan_button();
+        wifi_controller_request_enable();
         wifi_controller_request_retry();
+        wifi_start_scan();
+    } else if (!g_wifi_scan_in_progress) {
+        wifi_start_scan();
     }
-    /* 已是 ON: 描述文字只是展示, 点击无效 (用底部 Rescan 按钮) */
 }
 
-/* WiFi 开关事件 - iPhone 风格 (二元开关):
- *  - tap OFF (intent=ON)   -> disconnect + 清空 INI + intent=OFF
- *  - tap ON  (intent=OFF)  -> retry + intent=ON
- *  - tap ON  (intent=ON)   -> noop
- */
 static void wifi_switch_event_handler(lv_event_t *e)
 {
     lv_obj_t *sw = lv_event_get_target(e);
     bool is_on = lv_obj_has_state(sw, LV_STATE_CHECKED);
 
     if (is_on) {
-        if (g_wifi_switch_intent == WIFI_SWITCH_OFF) {
-            SS_LOG("WiFi switched OFF -> ON, requesting retry");
-            g_wifi_switch_intent = WIFI_SWITCH_ON;
+        if (!g_wifi.enabled) {
+            SS_LOG("WiFi switched OFF -> ON");
+            g_wifi.enabled = 1;
+            wifi_clear_connecting_hint();
+            wifi_update_switch_label();
+            wifi_update_scan_button();
+            wifi_controller_request_enable();
             wifi_controller_request_retry();
+            wifi_start_scan();
         } else {
             SS_LOG("WiFi already ON, noop");
         }
     } else {
-        SS_LOG("WiFi switched ON -> OFF, requesting disconnect");
-        g_wifi_switch_intent = WIFI_SWITCH_OFF;
-        wifi_controller_request_disconnect();
+        SS_LOG("WiFi switched ON -> OFF");
+        g_wifi.enabled = 0;
+        g_wifi_scan_in_progress = 0;
+        wifi_clear_connecting_hint();
         wifi_update_switch_label();
+        wifi_update_scan_button();
+        wifi_refresh_list_contents();
+        wifi_controller_request_disable();
+        epd_mark_refresh_pending();
     }
 }
 
@@ -332,9 +383,7 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
     lv_obj_set_style_transition(g_wifi_switch, NULL, LV_PART_MAIN);
     lv_obj_set_style_transition(g_wifi_switch, NULL, LV_PART_KNOB);
 
-    /* 同步开关状态: CONNECTED 或 CONNECTING 时 CHECKED */
-    if (g_wifi.phase == WLAN_PHASE_CONNECTED ||
-        g_wifi.phase == WLAN_PHASE_CONNECTING) {
+    if (g_wifi.enabled) {
         lv_obj_add_state(g_wifi_switch, LV_STATE_CHECKED);
     }
     wifi_update_switch_label();
@@ -354,9 +403,9 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
     lv_obj_set_style_border_width(g_wifi_list_cont, 0, 0);
     lv_obj_set_style_pad_all(g_wifi_list_cont, 2, 0);
 
-    /* 默认显示"扫描中..." */
+    /* 默认占位，进入页面后会按当前状态刷新 */
     lv_obj_t *scanning_lbl = lv_label_create(g_wifi_list_cont);
-    lv_label_set_text(scanning_lbl, "Scanning...");
+    lv_label_set_text(scanning_lbl, "Loading...");
     lv_obj_set_style_text_font(scanning_lbl, UI_FONT, 0);
     lv_obj_set_style_text_color(scanning_lbl, lv_color_make(100, 100, 100), 0);
     lv_obj_align(scanning_lbl, LV_ALIGN_CENTER, 0, 0);
@@ -371,11 +420,13 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
     lv_obj_set_style_radius(g_wifi_scan_btn, 4, 0);
     lv_obj_add_event_cb(g_wifi_scan_btn, wifi_rescan_cb, LV_EVENT_CLICKED, NULL);
     
-    lv_obj_t *lbl_scan = lv_label_create(g_wifi_scan_btn);
-    lv_label_set_text(lbl_scan, LV_SYMBOL_WIFI " Rescan");
-    lv_obj_set_style_text_font(lbl_scan, UI_FONT, 0);
-    lv_obj_set_style_text_color(lbl_scan, lv_color_black(), 0);
-    lv_obj_center(lbl_scan);
+    g_wifi_scan_btn_label = lv_label_create(g_wifi_scan_btn);
+    lv_label_set_text(g_wifi_scan_btn_label, LV_SYMBOL_WIFI " Rescan");
+    lv_obj_set_style_text_font(g_wifi_scan_btn_label, UI_FONT, 0);
+    lv_obj_set_style_text_color(g_wifi_scan_btn_label, lv_color_black(), 0);
+    lv_obj_center(g_wifi_scan_btn_label);
+
+    wifi_update_scan_button();
 }
 
 /* ======== 异步扫描回调（在LVGL线程中执行） ======== */
@@ -388,6 +439,7 @@ static void wifi_scan_done_cb(int count, WLAN_ScanResult_t *results, void *user_
 {
     (void)user_data;
     SS_LOG("[SCAN_DONE] count=%d", count);
+    g_wifi_scan_in_progress = 0;
 
     /* 如果用户已经离开了WiFi界面，释放 results 避免泄漏 */
     if (!g_wifi_list_cont) {
@@ -404,9 +456,10 @@ static void wifi_scan_done_cb(int count, WLAN_ScanResult_t *results, void *user_
 
     /* 更新开关行描述 */
     wifi_update_switch_label();
+    wifi_update_scan_button();
 
     /* 显示扫描结果 */
-    wifi_show_ap_list(count, results);
+    wifi_refresh_list_contents();
 
     epd_mark_refresh_pending();
 }
@@ -415,20 +468,29 @@ static void wifi_scan_done_cb(int count, WLAN_ScanResult_t *results, void *user_
 static void wifi_start_scan(void)
 {
     if (!g_wifi_list_cont) return;
-    
+
+    if (!g_wifi.enabled) {
+        g_wifi_scan_in_progress = 0;
+        wifi_update_switch_label();
+        wifi_update_scan_button();
+        wifi_refresh_list_contents();
+        epd_mark_refresh_pending();
+        return;
+    }
+
+    if (g_wifi_scan_in_progress) return;
+
     SS_LOG("Starting async WiFi scan...");
-    
-    /* 清空列表，显示"扫描中..." */
-    lv_obj_clean(g_wifi_list_cont);
-    
-    lv_obj_t *scanning_lbl = lv_label_create(g_wifi_list_cont);
-    lv_label_set_text(scanning_lbl, "Scanning...");
-    lv_obj_set_style_text_font(scanning_lbl, UI_FONT, 0);
-    lv_obj_set_style_text_color(scanning_lbl, lv_color_make(100, 100, 100), 0);
-    lv_obj_align(scanning_lbl, LV_ALIGN_CENTER, 0, 0);
-    
+
+    g_wifi_scan_in_progress = 1;
+    wifi_update_switch_label();
+    wifi_update_scan_button();
+    if (!g_scan_results || g_scan_count <= 0) {
+        wifi_refresh_list_contents();
+    }
+
     epd_mark_refresh_pending();
-    
+
     /* 发起异步扫描 */
     wlan_manager_scan_async(wifi_scan_done_cb, NULL);
 }
@@ -447,13 +509,7 @@ static void wifi_ap_clicked_cb(lv_event_t *e)
                       strcmp(current_ssid, ap->ssid) == 0);
 
     if (is_current) {
-        /* 已连接的网络 → 断开并忘记 (委托给 controller, 它会清空 INI 并切到 NO_CONFIG) */
-        SS_LOG("Disconnecting from %s", ap->ssid);
-        wifi_controller_request_disconnect();
-        settings_set_string("wifi_ap", ap->ssid, "");  /* 从已知网络列表删除 */
-        wifi_update_switch_label();
-        wifi_show_ap_list(g_scan_count, g_scan_results);
-        epd_mark_refresh_pending();
+        SS_LOG("Current AP tapped: %s", ap->ssid);
     } else if (ap->is_encrypted) {
         /* 加密网络 → 弹密码输入 */
         create_wifi_password_input(ap->ssid, 1);
@@ -463,25 +519,37 @@ static void wifi_ap_clicked_cb(lv_event_t *e)
         settings_set_string("wifi", "ssid", ap->ssid);
         settings_set_string("wifi", "password", "");
         settings_set_string("wifi_ap", ap->ssid, "");  /* 记住开放网络 */
-
-        /* 立即重建 WiFi 列表页 (不卡在 "Connecting..." 死页) */
-        lv_obj_t *scr = lv_scr_act();
-        lv_obj_clean(scr);
-        g_wifi_screen = scr;
-        create_wifi_screen_ui(scr);
-
-        /* 恢复之前的 AP 列表 */
-        if (g_scan_results && g_scan_count > 0) {
-            wifi_show_ap_list(g_scan_count, g_scan_results);
-        }
-
-        g_wifi.phase = WLAN_PHASE_CONNECTING;
+        g_wifi.enabled = 1;
+        wifi_set_connecting_hint(ap->ssid);
         wifi_update_switch_label();
         if (g_wifi_switch) {
             lv_obj_add_state(g_wifi_switch, LV_STATE_CHECKED);
         }
+        wifi_update_scan_button();
+        wifi_controller_request_enable();
         wifi_controller_request_retry();
         epd_mark_refresh_pending();
+    }
+}
+
+static void wifi_refresh_list_contents(void)
+{
+    if (!g_wifi_list_cont) return;
+
+    if (!g_wifi.enabled) {
+        wifi_show_placeholder("Wi-Fi is Off");
+        return;
+    }
+
+    if (g_scan_results && g_scan_count > 0) {
+        wifi_show_ap_list(g_scan_count, g_scan_results);
+        return;
+    }
+
+    if (g_wifi_scan_in_progress) {
+        wifi_show_placeholder("Scanning...");
+    } else {
+        wifi_show_placeholder("No WiFi found");
     }
 }
 
@@ -509,9 +577,14 @@ static void wifi_show_ap_list(int count, WLAN_ScanResult_t *results)
     for (i = 0; i < count; i++) {
         char btn_text[80];
         int is_current = (strcmp(results[i].ssid, current_ssid) == 0);
+        int is_connecting = (g_wifi_connecting_hint[0] != '\0' &&
+                             strcmp(results[i].ssid, g_wifi_connecting_hint) == 0);
         
         if (is_current) {
             snprintf(btn_text, sizeof(btn_text), "> %s  %ddBm",
+                     results[i].ssid, results[i].rssi);
+        } else if (is_connecting) {
+            snprintf(btn_text, sizeof(btn_text), "... %s  %ddBm",
                      results[i].ssid, results[i].rssi);
         } else {
             snprintf(btn_text, sizeof(btn_text), "%s  %ddBm%s",
@@ -524,7 +597,7 @@ static void wifi_show_ap_list(int count, WLAN_ScanResult_t *results)
         lv_obj_set_size(btn, 228, 30);
         lv_obj_set_style_radius(btn, 2, 0);
         
-        if (is_current) {
+        if (is_current || is_connecting) {
             lv_obj_set_style_bg_color(btn, lv_color_black(), 0);
             lv_obj_set_style_border_width(btn, 0, 0);
         } else {
@@ -540,7 +613,7 @@ static void wifi_show_ap_list(int count, WLAN_ScanResult_t *results)
         lv_obj_t *label = lv_label_create(btn);
         lv_label_set_text(label, btn_text);
         lv_obj_set_style_text_font(label, UI_FONT, 0);
-        if (is_current) {
+        if (is_current || is_connecting) {
             lv_obj_set_style_text_color(label, lv_color_white(), 0);
         } else {
             lv_obj_set_style_text_color(label, lv_color_black(), 0);
@@ -596,14 +669,19 @@ static void wifi_connect_btn_cb(lv_event_t *e)
     /* 恢复之前的 AP 列表 (而不是显示 "Scanning...") */
     if (g_scan_results && g_scan_count > 0) {
         wifi_show_ap_list(g_scan_count, g_scan_results);
+    } else {
+        wifi_refresh_list_contents();
     }
 
     /* 委托 controller 异步连, phase 变化时自动更新开关行 */
-    g_wifi.phase = WLAN_PHASE_CONNECTING;
+    g_wifi.enabled = 1;
+    wifi_set_connecting_hint(g_connecting_ssid);
     wifi_update_switch_label();
     if (g_wifi_switch) {
         lv_obj_add_state(g_wifi_switch, LV_STATE_CHECKED);
     }
+    wifi_update_scan_button();
+    wifi_controller_request_enable();
     wifi_controller_request_retry();
     epd_mark_refresh_pending();
 }
@@ -618,7 +696,12 @@ static void wifi_pwd_back_cb(lv_event_t *e)
     g_wifi_screen = scr;
     g_wifi_list_cont = NULL;
     create_wifi_screen_ui(scr);
-    wifi_start_scan();
+    if (g_wifi.enabled) {
+        wifi_start_scan();
+    } else {
+        wifi_refresh_list_contents();
+        epd_mark_refresh_pending();
+    }
 }
 
 /* 键盘ready回调 */
@@ -830,14 +913,21 @@ static void create_wifi_password_input(const char *ssid, int is_encrypted)
 void settings_wifi_on_phase_change(WLAN_Phase_t phase)
 {
     if (!g_wifi_switch_label) return;  /* 不在 WiFi 界面 */
+
+    if (phase != WLAN_PHASE_CONNECTING) {
+        wifi_clear_connecting_hint();
+    }
+
     wifi_update_switch_label();
+    wifi_update_scan_button();
     if (g_wifi_switch) {
-        if (phase == WLAN_PHASE_CONNECTED) {
+        if (g_wifi.enabled) {
             lv_obj_add_state(g_wifi_switch, LV_STATE_CHECKED);
         } else {
             lv_obj_clear_state(g_wifi_switch, LV_STATE_CHECKED);
         }
     }
+    wifi_refresh_list_contents();
     epd_mark_refresh_pending();
 }
 

@@ -35,13 +35,43 @@ static OS_Thread_t g_wc_thread;
 static volatile int g_wc_running = 0;
 static volatile int g_wc_exited = 0;  /* 线程真正退出标志 (休眠同步用) */
 static volatile int g_wc_request_retry = 0;
+static volatile int g_wc_request_enable = 0;
+static volatile int g_wc_request_disable = 0;
 static volatile int g_wc_request_disconnect = 0;
 
-static void wc_load_credentials_from_ini(void)
+static int wc_has_pending_request(void)
 {
+    return g_wc_request_retry || g_wc_request_enable ||
+           g_wc_request_disable || g_wc_request_disconnect;
+}
+
+static void wc_sleep_interruptible(uint32_t sleep_ms)
+{
+    while (sleep_ms > 0 && g_wc_running && !wc_has_pending_request()) {
+        uint32_t slice_ms = (sleep_ms > 100) ? 100 : sleep_ms;
+        OS_MSleep(slice_ms);
+        sleep_ms -= slice_ms;
+    }
+}
+
+static void wc_save_enabled_to_ini(int enabled)
+{
+    settings_set_string("wifi", "enabled", enabled ? "1" : "0");
+}
+
+static void wc_load_config_from_ini(void)
+{
+    char enabled_buf[8] = "";
+
+    g_wifi.enabled = 1;
+    if (settings_get_string("wifi", "enabled", enabled_buf, sizeof(enabled_buf)) == 0) {
+        g_wifi.enabled = (enabled_buf[0] != '0');
+    }
+
     settings_get_string("wifi", "ssid", g_wifi.ssid, sizeof(g_wifi.ssid));
     settings_get_string("wifi", "password", g_wifi.password, sizeof(g_wifi.password));
-    WC_LOG("Loaded INI: ssid='%s' pwd_len=%d", g_wifi.ssid, (int)strlen(g_wifi.password));
+    WC_LOG("Loaded INI: enabled=%d ssid='%s' pwd_len=%d",
+           g_wifi.enabled, g_wifi.ssid, (int)strlen(g_wifi.password));
 }
 
 static void wc_set_phase(WLAN_Phase_t p)
@@ -61,6 +91,12 @@ static void wc_handle_link_lost(void)
 static void wc_try_connect(void)
 {
     WC_LOG("[TRACE] wc_try_connect enter");
+    if (!g_wifi.enabled) {
+        WC_LOG("WiFi is disabled, skip connect");
+        wc_set_phase(WLAN_PHASE_DISCONNECTED);
+        return;
+    }
+
     if (g_wifi.ssid[0] == '\0') {
         wc_set_phase(WLAN_PHASE_NO_CONFIG);
         return;
@@ -115,8 +151,10 @@ static void wc_task(void *arg)
     WC_LOG("Controller task started");
 
     /* 初始读 INI 决定 phase */
-    wc_load_credentials_from_ini();
-    if (g_wifi.ssid[0] == '\0') {
+    wc_load_config_from_ini();
+    if (!g_wifi.enabled) {
+        wc_set_phase(WLAN_PHASE_DISCONNECTED);
+    } else if (g_wifi.ssid[0] == '\0') {
         wc_set_phase(WLAN_PHASE_NO_CONFIG);
     } else {
         wc_set_phase(WLAN_PHASE_DISCONNECTED);
@@ -129,19 +167,49 @@ static void wc_task(void *arg)
     while (g_wc_running) {
         WC_LOG("[TRACE] wc_task loop top, phase=%d", (int)g_wifi.phase);
         /* 处理外部请求 */
+        if (g_wc_request_disable) {
+            g_wc_request_disable = 0;
+            WC_LOG("User request: disable WiFi");
+            g_wifi.enabled = 0;
+            wc_save_enabled_to_ini(0);
+            wlan_manager_cancel_connect();
+            wlan_manager_disconnect();
+            g_wifi.ip[0] = '\0';
+            g_wifi.retry_count = 0;
+            wc_set_phase(WLAN_PHASE_DISCONNECTED);
+            wc_sleep_interruptible(200);
+            continue;
+        }
+
+        if (g_wc_request_enable) {
+            g_wc_request_enable = 0;
+            WC_LOG("User request: enable WiFi");
+            g_wifi.enabled = 1;
+            wc_save_enabled_to_ini(1);
+            wc_load_config_from_ini();
+            g_wifi.retry_count = 0;
+            if (g_wifi.ssid[0] == '\0') {
+                wc_set_phase(WLAN_PHASE_NO_CONFIG);
+            } else {
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+            }
+            continue;
+        }
+
         if (g_wc_request_disconnect) {
             g_wc_request_disconnect = 0;
             WC_LOG("User request: disconnect");
             wlan_manager_disconnect();
             g_wifi.ip[0] = '\0';
-            /* 清空 INI, 让 phase 切到 NO_CONFIG */
-            settings_set_string("wifi", "ssid", "");
-            settings_set_string("wifi", "password", "");
-            g_wifi.ssid[0] = '\0';
-            g_wifi.password[0] = '\0';
             g_wifi.retry_count = 0;
-            wc_set_phase(WLAN_PHASE_NO_CONFIG);
-            OS_MSleep(2000);
+            if (!g_wifi.enabled) {
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+            } else if (g_wifi.ssid[0] == '\0') {
+                wc_set_phase(WLAN_PHASE_NO_CONFIG);
+            } else {
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+            }
+            wc_sleep_interruptible(200);
             continue;
         }
 
@@ -150,10 +218,12 @@ static void wc_task(void *arg)
             WC_LOG("User request: retry");
             g_wifi.retry_count = 0;
             wlan_manager_disconnect();
-            OS_MSleep(500);
+            wc_sleep_interruptible(200);
             /* 重新读 INI (可能用户在 settings 改了) */
-            wc_load_credentials_from_ini();
-            if (g_wifi.ssid[0] == '\0') {
+            wc_load_config_from_ini();
+            if (!g_wifi.enabled) {
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+            } else if (g_wifi.ssid[0] == '\0') {
                 wc_set_phase(WLAN_PHASE_NO_CONFIG);
             } else {
                 wc_set_phase(WLAN_PHASE_DISCONNECTED);
@@ -163,11 +233,12 @@ static void wc_task(void *arg)
 
         switch (g_wifi.phase) {
         case WLAN_PHASE_NO_CONFIG:
-            WC_LOG("[TRACE] branch=NO_CONFIG, sleeping 30s");
-            /* 等用户, 睡 30s 再检查 INI (用户可能通过 HTTP 配了网) */
-            OS_MSleep(30000);
-            wc_load_credentials_from_ini();
-            if (g_wifi.ssid[0] != '\0') {
+            WC_LOG("[TRACE] branch=NO_CONFIG, sleeping 1s");
+            wc_sleep_interruptible(1000);
+            wc_load_config_from_ini();
+            if (!g_wifi.enabled) {
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+            } else if (g_wifi.ssid[0] != '\0') {
                 WC_LOG("SSID appeared in INI, switching to DISCONNECTED");
                 g_wifi.retry_count = 0;
                 wc_set_phase(WLAN_PHASE_DISCONNECTED);
@@ -176,6 +247,10 @@ static void wc_task(void *arg)
 
         case WLAN_PHASE_DISCONNECTED:
             WC_LOG("[TRACE] branch=DISCONNECTED");
+            if (!g_wifi.enabled) {
+                wc_sleep_interruptible(1000);
+                break;
+            }
             if (g_wifi.ssid[0] == '\0') {
                 wc_set_phase(WLAN_PHASE_NO_CONFIG);
                 break;
@@ -183,20 +258,23 @@ static void wc_task(void *arg)
             /* XR872 修复: FM/EPUB 期间暂停重试, 避免 wc_task 抢 SRAM 触发 heap exhausted */
             if (g_wifi.fm_paused) {
                 WC_LOG("[TRACE] branch=DISCONNECTED, fm_paused=1, sleeping 1s");
-                OS_MSleep(1000);
+                wc_sleep_interruptible(1000);
                 break;
             }
             if (g_wifi.retry_count >= (int)BACKOFF_COUNT) {
                 WC_LOG("Max retries exhausted, staying DISCONNECTED. User must tap to retry.");
                 /* 停在这, 每 60s 打印一次, 等用户主动 retry */
-                OS_MSleep(60000);
+                wc_sleep_interruptible(60000);
                 break;
             }
             /* 退避 */
             {
                 uint32_t backoff = kBackoffMs[g_wifi.retry_count];
                 WC_LOG("Backoff %ums before retry %d", backoff, g_wifi.retry_count);
-                OS_MSleep(backoff);
+                wc_sleep_interruptible(backoff);
+                if (wc_has_pending_request() || !g_wifi.enabled) {
+                    break;
+                }
             }
             wc_try_connect();
             break;
@@ -204,7 +282,7 @@ static void wc_task(void *arg)
         case WLAN_PHASE_CONNECTING:
             WC_LOG("[TRACE] branch=CONNECTING, sleeping 1s");
             /* wait_for_ip 在 wc_try_connect 内部阻塞, 这里不应该停留 */
-            OS_MSleep(1000);
+            wc_sleep_interruptible(1000);
             break;
 
         case WLAN_PHASE_CONNECTED:
@@ -249,6 +327,7 @@ static void wc_task(void *arg)
 void wifi_controller_init(void)
 {
     memset(&g_wifi, 0, sizeof(g_wifi));
+    g_wifi.enabled = 1;
     g_wifi.phase = WLAN_PHASE_NO_CONFIG;
     g_wifi.retry_count = 0;
     g_wifi.http_running = 0;
@@ -299,6 +378,16 @@ void wifi_controller_register_cb(WLAN_PhaseCb_t cb, void *user_data)
 void wifi_controller_request_retry(void)
 {
     g_wc_request_retry = 1;
+}
+
+void wifi_controller_request_enable(void)
+{
+    g_wc_request_enable = 1;
+}
+
+void wifi_controller_request_disable(void)
+{
+    g_wc_request_disable = 1;
 }
 
 void wifi_controller_request_disconnect(void)

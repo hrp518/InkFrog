@@ -17,6 +17,7 @@
 
 /* 全局状态 - 取代散落的 g_wifi_connected/g_http_running/g_ip_text 等 */
 typedef struct {
+    int  enabled;         /* WiFi 总开关: 1=开启, 0=关闭 */
     WLAN_Phase_t phase;
     char ssid[WLAN_MGR_MAX_SSID_LEN];
     char password[65];
@@ -45,7 +46,13 @@ void wifi_controller_register_cb(WLAN_PhaseCb_t cb, void *user_data);
 /* 用户请求"立即重试" (从 settings scan 后调, 或 status bar 点击) */
 void wifi_controller_request_retry(void);
 
-/* 用户请求"断开" (从 settings 关 WiFi) - 会清空 INI 并切到 NO_CONFIG */
+/* 用户请求开启 WiFi 总开关 */
+void wifi_controller_request_enable(void);
+
+/* 用户请求关闭 WiFi 总开关 - 保留已保存的网络配置 */
+void wifi_controller_request_disable(void);
+
+/* 兼容旧接口: 用户请求"断开" */
 void wifi_controller_request_disconnect(void);
 
 /* HTTP 状态变更 (main.c 在 start/stop HTTP 时调) */
