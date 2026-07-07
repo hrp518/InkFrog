@@ -282,8 +282,7 @@ static FRESULT fatfs_scan_files(char *path)
                     printf("[FatFs WRN] Path stack full, skip dir: %s/%s\r\n", path, fno.fname);
                 }
             } else {
-                /* 是文件 - 直接输出 */
-                printf("  [FILE] %s/%s (size: %u bytes)\r\n", path, fno.fname, (unsigned int)fno.fsize);
+                /* 是文件 - 不再打印 (减少启动日志) */
             }
         }
         
@@ -386,13 +385,15 @@ static void fatfs_filesystem_test(void)
     }
     printf("\r\n");
     
-    /* 3. 创建Font目录（如果不存在） */
-    printf("[3/4] Creating /Font directory...\r\n");
+    /* 3. 创建目录（如果不存在） */
+    printf("[3/4] Creating directories...\r\n");
     res = f_mkdir("/Font");
     if (res == FR_OK || res == FR_EXIST) {
-        printf("[OK] /Font directory ready\r\n");
-    } else {
-        printf("[WRN] Failed to create /Font, res=%d\r\n", res);
+        printf("[OK] /Font ready\r\n");
+    }
+    res = f_mkdir("/Inkbook");
+    if (res == FR_OK || res == FR_EXIST) {
+        printf("[OK] /Inkbook ready\r\n");
     }
     printf("\r\n");
     
@@ -1148,9 +1149,10 @@ int main(void)
     printf("PA9 (RST)  = %d\r\n", HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_9));
     printf("PA23       = %d\r\n", HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_23));
     printf("============================\r\n\r\n");
-    /* 等待3秒确保EXT LDO电压稳定后再初始化SD卡 */
-    printf("[SD] Waiting 3s for EXT LDO to stabilize...\r\n");
-    OS_Sleep(3);
+    /* XR872 修复: 原 3s 等待过大, 改为 0.1s。
+     * EXT LDO 硬件稳定时间 <1ms, 只需给电容充电几 ms 即可。 */
+    printf("[SD] Waiting 100ms for EXT LDO to stabilize...\r\n");
+    OS_MSleep(100);
     
     /* 执行FatFs文件系统测试（FatFs内部会初始化SD卡） */
     fatfs_filesystem_test();
