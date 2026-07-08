@@ -1265,6 +1265,12 @@ static int ensure_reader_font_loaded(void)
             font_priority_loader_set_font(custom_ttf_font);
             int loaded = font_priority_loader_preload();
             printf("[FONT] Level1 preload completed: %d chars\n", loaded);
+            if (loaded <= 0) {
+                printf("[FONT] Level1 preload failed (%d), destroying TTF, using built-in\n", loaded);
+                lv_tiny_ttf_destroy(custom_ttf_font);
+                custom_ttf_font = NULL;
+                return -1;
+            }
             return 0;
         }
     }
