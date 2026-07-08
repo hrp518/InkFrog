@@ -1102,6 +1102,11 @@ int main(void)
     /* 平台初始化 */
     platform_init();
 
+    {
+        extern void epub_buffer_init(void);
+        epub_buffer_init();
+    }
+
     /* 检测唤醒来源 */
     {
         uint32_t wakeup_event = HAL_Wakeup_GetEvent();

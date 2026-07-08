@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <ctype.h>
 #include "third_party/miniz/miniz.h"
+#include <sys/dma_heap.h>
 #include "sys/sys_heap.h"
 #include "driver/chip/hal_dcache.h"
 #include "driver/chip/psram/psram.h"
@@ -26,6 +27,101 @@
 #define MZ_ZIP_LDH_EXTRA_LEN_OFS      28
 
 #define MAX_RAW_ENTRIES 256
+
+/* EPUB 解压专用 DMA 堆 bump 区（128KB），与 TTF psram_heap 隔离 */
+#define EPUB_DECOMP_BUF_SIZE  (128 * 1024)
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t size;
+} epub_alloc_hdr_t;
+
+#define EPUB_ALLOC_MAGIC 0xA55E5B5B
+
+static uint8_t * epub_decomp_buffer = NULL;
+static size_t epub_alloc_used = 0;
+static bool epub_buffer_initialized = false;
+
+void epub_buffer_init(void)
+{
+    if(epub_buffer_initialized) return;
+    epub_decomp_buffer = (uint8_t *)_dma_malloc(EPUB_DECOMP_BUF_SIZE, DMAHEAP_PSRAM);
+    if(!epub_decomp_buffer) {
+        EPUB_ERR("Failed to allocate DMA decompress buffer (%u bytes)\n", EPUB_DECOMP_BUF_SIZE);
+        return;
+    }
+    epub_alloc_used = 0;
+    epub_buffer_initialized = true;
+    EPUB_LOG("DMA decompress buffer at %p, size=%u\n", epub_decomp_buffer, EPUB_DECOMP_BUF_SIZE);
+}
+
+void epub_buffer_reset(void)
+{
+    if(!epub_buffer_initialized) return;
+    EPUB_LOG("Buffer reset, was %u/%u bytes\n", (unsigned)epub_alloc_used, EPUB_DECOMP_BUF_SIZE);
+    epub_alloc_used = 0;
+}
+
+static void * epub_buf_alloc(size_t size)
+{
+    if(!epub_buffer_initialized || !epub_decomp_buffer) return NULL;
+    size_t total = size + sizeof(epub_alloc_hdr_t);
+    if(epub_alloc_used + total > EPUB_DECOMP_BUF_SIZE) {
+        EPUB_ERR("Bump buffer exhausted: need %u, used %u/%u\n",
+                 (unsigned)total, (unsigned)epub_alloc_used, EPUB_DECOMP_BUF_SIZE);
+        return NULL;
+    }
+    epub_alloc_hdr_t * hdr = (epub_alloc_hdr_t *)(epub_decomp_buffer + epub_alloc_used);
+    hdr->magic = EPUB_ALLOC_MAGIC;
+    hdr->size = (uint32_t)total;
+    void * ptr = (uint8_t *)hdr + sizeof(epub_alloc_hdr_t);
+    epub_alloc_used += total;
+    return ptr;
+}
+
+static void * epub_dma_alloc(size_t size)
+{
+    void * p = _dma_malloc(size, DMAHEAP_PSRAM);
+    if(!p) EPUB_ERR("DMA alloc failed: %u bytes\n", (unsigned)size);
+    return p;
+}
+
+static void epub_dma_free(void * p)
+{
+    if(p) _dma_free(p, DMAHEAP_PSRAM);
+}
+
+static void * miniz_epub_alloc(void * opaque, size_t items, size_t size)
+{
+    (void)opaque;
+    return epub_buf_alloc(items * size);
+}
+
+static void miniz_epub_free(void * opaque, void * address)
+{
+    (void)opaque;
+    (void)address;
+}
+
+static void * miniz_epub_realloc(void * opaque, void * address, size_t items, size_t size)
+{
+    (void)opaque;
+    if(address == NULL) return miniz_epub_alloc(opaque, items, size);
+    if(items == 0 || size == 0) return NULL;
+
+    size_t new_data = items * size;
+    size_t new_total = new_data + sizeof(epub_alloc_hdr_t);
+    epub_alloc_hdr_t * old_hdr = (epub_alloc_hdr_t *)((uint8_t *)address - sizeof(epub_alloc_hdr_t));
+    if(old_hdr->magic != EPUB_ALLOC_MAGIC) return miniz_epub_alloc(opaque, items, size);
+    if(new_total <= old_hdr->size) return address;
+
+    void * newp = miniz_epub_alloc(opaque, items, size);
+    if(newp) {
+        size_t old_data = old_hdr->size - sizeof(epub_alloc_hdr_t);
+        memcpy(newp, address, old_data < new_data ? old_data : new_data);
+    }
+    return newp;
+}
 
 typedef struct {
     char name[256];
@@ -154,6 +250,9 @@ static bool extract_raw_deflate_psram(const uint8_t *comp_buf, size_t comp_size,
 
     EPUB_ERR("[INFLATE] FAILED: ret=%d (comp=%u buf=%u consumed=%u)\n",
              ret, comp_size, buf_size, (unsigned)(comp_size - in_consumed));
+    EPUB_ERR("[INFLATE] comp_head: ");
+    for(size_t i = 0; i < 16 && i < comp_size; i++) printf("%02x ", comp_buf[i]);
+    printf("\n");
     return false;
 }
 
@@ -186,11 +285,11 @@ static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *b
         return false;
     }
 
-    uint8_t *comp_buf = (uint8_t *)psram_malloc((size_t)comp_size);
+    uint8_t *comp_buf = (uint8_t *)epub_dma_alloc((size_t)comp_size);
     if (!comp_buf) return false;
 
     if (zip->m_pRead(zip->m_pIO_opaque, data_ofs, comp_buf, comp_size) != comp_size) {
-        psram_free(comp_buf);
+        epub_dma_free(comp_buf);
         return false;
     }
     HAL_Dcache_Flush((uint32_t)comp_buf, comp_size);
@@ -212,7 +311,7 @@ static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *b
         EPUB_ERR("extract_at_raw: unsupported compression method %u\n", (unsigned)comp_method);
     }
 
-    psram_free(comp_buf);
+    epub_dma_free(comp_buf);
     return ok;
 }
 
@@ -224,37 +323,38 @@ static size_t miniz_fatfs_read_cb(void *pOpaque, mz_uint64 file_ofs, void *pBuf,
         EPUB_ERR("fatfs_read: f_lseek to %u failed (%d)\n", (unsigned)file_ofs, (int)res);
         return 0;
     }
-    UINT br = 0;
-    res = f_read(fp, pBuf, (UINT)n, &br);
-    if (res != FR_OK) {
-        EPUB_ERR("fatfs_read: f_read %u at %u failed (%d)\n", (unsigned)n, (unsigned)file_ofs, (int)res);
-        return 0;
+
+    size_t total = 0;
+    char bounce[512];
+    while(n > 0) {
+        size_t chunk = (n > sizeof(bounce)) ? sizeof(bounce) : n;
+        UINT br = 0;
+        res = f_read(fp, bounce, (UINT)chunk, &br);
+        if (res != FR_OK || br == 0) {
+            EPUB_ERR("fatfs_read: f_read %u at %u failed (%d, br=%u)\n",
+                     (unsigned)chunk, (unsigned)(file_ofs + total), (int)res, (unsigned)br);
+            break;
+        }
+        memcpy((uint8_t *)pBuf + total, bounce, br);
+        total += br;
+        n -= br;
     }
-    if (br != (UINT)n) {
-        EPUB_ERR("fatfs_read: partial read at %u: want %u got %u\n",
-                 (unsigned)file_ofs, (unsigned)n, (unsigned)br);
-    }
-    return br;
+    return total;
 }
 
 static void *miniz_psram_alloc(void *opaque, size_t items, size_t size) {
     (void)opaque;
-    return psram_malloc(items * size);
+    return miniz_epub_alloc(opaque, items, size);
 }
 
 static void miniz_psram_free(void *opaque, void *address) {
     (void)opaque;
-    if (address) psram_free(address);
+    (void)address;
 }
 
 static void *miniz_psram_realloc(void *opaque, void *address, size_t items, size_t size) {
     (void)opaque;
-    void *newp = psram_malloc(items * size);
-    if (newp && address) {
-        memcpy(newp, address, items * size);
-        psram_free(address);
-    }
-    return newp;
+    return miniz_epub_realloc(opaque, address, items, size);
 }
 
 static int fuzzy_locate_file(mz_zip_archive *zip, const char *target, bool verbose) {
@@ -488,6 +588,7 @@ EpubReader* epub_reader_create(void) {
 
 bool epub_reader_open(EpubReader *reader, const char *filepath) {
     s_raw_built = false;
+    epub_buffer_reset();
     EPUB_LOG("Opening EPUB: %s\n", filepath);
     if (!reader || !filepath) return false;
 
@@ -633,6 +734,7 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
     }
 
     reader->loaded = true;
+    epub_buffer_reset();
     EPUB_LOG("EPUB opened successfully: %s\n", reader->book.title);
     return true;
 }
@@ -646,6 +748,7 @@ void epub_reader_close(EpubReader *reader) {
     }
     s_raw_built = false;
     s_raw_count = 0;
+    epub_buffer_reset();
 }
 
 void epub_reader_destroy(EpubReader *reader) {

@@ -83,6 +83,9 @@ typedef struct {
  *   函数接口
  *====================*/
 
+void epub_buffer_init(void);
+void epub_buffer_reset(void);
+
 EpubReader* epub_reader_create(void);
 bool epub_reader_open(EpubReader *reader, const char *filepath);
 void epub_reader_close(EpubReader *reader);

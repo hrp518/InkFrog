@@ -1321,6 +1321,10 @@ static void open_epub_viewer(const char *filepath)
         g_epub_reader = NULL;
         return;
     }
+
+    /* EPUB 元数据解析完毕，释放 DMA bump 区，给后续章节解压腾空间 */
+    extern void epub_buffer_reset(void);
+    epub_buffer_reset();
     
     printf("[FM] EPUB opened: %s, chapters: %d\n",
            epub_reader_get_title(g_epub_reader),
