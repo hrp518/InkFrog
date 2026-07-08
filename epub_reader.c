@@ -91,6 +91,25 @@ static void epub_dma_free(void * p)
     if(p) _dma_free(p, DMAHEAP_PSRAM);
 }
 
+static bool epub_ptr_in_bump(const void * p)
+{
+    if(!epub_decomp_buffer || !p) return false;
+    uintptr_t addr = (uintptr_t)p;
+    uintptr_t base = (uintptr_t)epub_decomp_buffer;
+    return addr >= base && addr < base + EPUB_DECOMP_BUF_SIZE;
+}
+
+static bool epub_ptr_in_psram(const void * p, size_t len)
+{
+    uintptr_t addr = (uintptr_t)p;
+    return (addr >= PSRAM_START_ADDR && addr + len <= PSRAM_END_ADDR + 1);
+}
+
+static void epub_sync_psram_write(const void * p, size_t len)
+{
+    if(p && len) HAL_Dcache_Clean((uint32_t)(uintptr_t)p, len);
+}
+
 static void * miniz_epub_alloc(void * opaque, size_t items, size_t size)
 {
     (void)opaque;
@@ -234,6 +253,8 @@ static bool extract_raw_deflate_psram(const uint8_t *comp_buf, size_t comp_size,
 
         if (is_psram) {
             HAL_Dcache_Clean(buf_addr, *out_size);
+        } else {
+            HAL_Dcache_Flush(buf_addr, *out_size);
         }
 
         {
@@ -285,11 +306,35 @@ static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *b
         return false;
     }
 
+    void * work_buf = buf;
+    uint8_t * stage_buf = NULL;
+    bool stage_is_dma = false;
+    if(!epub_ptr_in_bump(buf) && epub_ptr_in_psram(buf, uncomp_size)) {
+        stage_buf = (uint8_t *)epub_buf_alloc(uncomp_size);
+        if(!stage_buf) {
+            stage_buf = (uint8_t *)epub_dma_alloc(uncomp_size);
+            stage_is_dma = (stage_buf != NULL);
+        }
+        if(stage_buf) {
+            work_buf = stage_buf;
+            EPUB_LOG("extract_at_raw[%d]: stage uncomp via %p -> psram %p\n",
+                     raw_idx, work_buf, buf);
+        } else {
+            EPUB_ERR("extract_at_raw[%d]: failed to stage %u bytes for psram dst\n",
+                     raw_idx, (unsigned)uncomp_size);
+            return false;
+        }
+    }
+
     uint8_t *comp_buf = (uint8_t *)epub_dma_alloc((size_t)comp_size);
-    if (!comp_buf) return false;
+    if (!comp_buf) {
+        if(stage_is_dma) epub_dma_free(stage_buf);
+        return false;
+    }
 
     if (zip->m_pRead(zip->m_pIO_opaque, data_ofs, comp_buf, comp_size) != comp_size) {
         epub_dma_free(comp_buf);
+        if(stage_is_dma) epub_dma_free(stage_buf);
         return false;
     }
     HAL_Dcache_Flush((uint32_t)comp_buf, comp_size);
@@ -302,16 +347,24 @@ static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *b
 
     bool ok = false;
     if (comp_method == 0) {
-        memcpy(buf, comp_buf, uncomp_size);
+        memcpy(work_buf, comp_buf, uncomp_size);
         *out_size = uncomp_size;
         ok = true;
     } else if (comp_method == 8) {
-        ok = extract_raw_deflate_psram(comp_buf, (size_t)comp_size, buf, buf_size, out_size);
+        ok = extract_raw_deflate_psram(comp_buf, (size_t)comp_size, work_buf, buf_size, out_size);
     } else {
         EPUB_ERR("extract_at_raw: unsupported compression method %u\n", (unsigned)comp_method);
     }
 
+    if(ok && stage_buf) {
+        memcpy(buf, work_buf, *out_size);
+        epub_sync_psram_write(buf, *out_size);
+    } else if(ok && epub_ptr_in_psram(buf, *out_size) && !epub_ptr_in_bump(buf)) {
+        epub_sync_psram_write(buf, *out_size);
+    }
+
     epub_dma_free(comp_buf);
+    if(stage_is_dma) epub_dma_free(stage_buf);
     return ok;
 }
 
@@ -390,7 +443,7 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
     if (file_index < -1) {
         int raw_idx = -file_index - 2;
         RawZipEntry *e = &s_raw_entries[raw_idx];
-        char *buf = (char *)psram_malloc(e->uncomp_size + 1);
+        char *buf = (char *)epub_buf_alloc(e->uncomp_size + 1);
         if (!buf) {
             EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
                      filename, (unsigned)(e->uncomp_size + 1));
@@ -401,11 +454,11 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
         if (extract_file_at_raw_offset(&reader->zip_archive, raw_idx, buf, e->uncomp_size, &extracted_size)) {
             buf[extracted_size] = '\0';
             *out_size = extracted_size;
-            EPUB_LOG("Extracted '%s' via raw scan (%u bytes)\n", filename, (unsigned)extracted_size);
+            EPUB_LOG("Extracted '%s' via raw scan (%u bytes) buf=%p\n",
+                     filename, (unsigned)extracted_size, (void *)buf);
             return buf;
         }
         EPUB_ERR("Raw extraction failed for: %s\n", filename);
-        psram_free(buf);
         return NULL;
     }
 
@@ -415,7 +468,7 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
         EPUB_ERR("Failed to stat '%s' (mz idx %d)\n", filename, file_index);
         return NULL;
     }
-    char *buf = (char *)psram_malloc((size_t)stat.m_uncomp_size + 1);
+    char *buf = (char *)epub_buf_alloc((size_t)stat.m_uncomp_size + 1);
     if (!buf) {
         EPUB_ERR("Memory allocation failed for: %s (need %u bytes)\n",
                  filename, (unsigned)(stat.m_uncomp_size + 1));
@@ -423,12 +476,12 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
     }
     if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, buf, (size_t)stat.m_uncomp_size, 0)) {
         EPUB_ERR("mz extract failed for: %s\n", filename);
-        psram_free(buf);
         return NULL;
     }
     buf[stat.m_uncomp_size] = '\0';
     *out_size = (size_t)stat.m_uncomp_size;
-    EPUB_LOG("Extracted '%s' via mz API (%u bytes)\n", filename, (unsigned)stat.m_uncomp_size);
+    EPUB_LOG("Extracted '%s' via mz API (%u bytes) buf=%p\n",
+             filename, (unsigned)stat.m_uncomp_size, (void *)buf);
     return buf;
 }
 
@@ -662,12 +715,10 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
     if (!parse_container_xml_with_expat(container_data, container_size,
                                          content_opf_path, sizeof(content_opf_path))) {
         EPUB_ERR("Failed to parse container.xml\n");
-        psram_free(container_data);
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         return false;
     }
-    psram_free(container_data);
     EPUB_LOG("container.xml parsed, OPF path: %s\n", content_opf_path);
 
     strncpy(reader->book.base_path, content_opf_path, sizeof(reader->book.base_path) - 1);
@@ -686,12 +737,10 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
 
     if (!parse_opf_with_expat(opf_data, opf_size, reader)) {
         EPUB_ERR("Failed to parse OPF\n");
-        psram_free(opf_data);
         mz_zip_reader_end(&reader->zip_archive);
         f_close(&reader->archive_fp);
         return false;
     }
-    psram_free(opf_data);
 
     if (reader->spine_count == 0) {
         reader->spine_count = 1;
@@ -730,7 +779,6 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
             scan = np_start + 8;
         }
         EPUB_LOG("Parsed %d TOC entries from toc.ncx\n", reader->toc_count);
-        psram_free(toc_data);
     }
 
     reader->loaded = true;
@@ -769,6 +817,8 @@ int epub_reader_read_chapter(EpubReader *reader, int chapter_index, char *buffer
     EPUB_LOG("read_chapter called: index=%d, buffer_size=%d\n", chapter_index, buffer_size);
     if (!reader || !reader->loaded || !buffer || buffer_size <= 0) return -1;
     if (chapter_index < 0 || chapter_index >= reader->spine_count) return -1;
+
+    epub_buffer_reset();
 
     int file_index = fuzzy_locate_file(&reader->zip_archive, reader->spine[chapter_index].href, true);
     if (file_index == -1) {
@@ -811,6 +861,8 @@ int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *o
     EPUB_LOG("read_chapter_full: index=%d, buf_size=%d\n", chapter_index, buf_size);
     if (!reader || !reader->loaded || !out_buf || buf_size <= 0) return -1;
     if (chapter_index < 0 || chapter_index >= reader->spine_count) return -1;
+
+    epub_buffer_reset();
 
     int file_index = fuzzy_locate_file(&reader->zip_archive, reader->spine[chapter_index].href, false);
     if (file_index == -1) {

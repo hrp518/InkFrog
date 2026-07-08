@@ -35,6 +35,7 @@ void psram_heap_info(void) {
     printf("PSRAM Info:\r\n");
     printf("  PSRAM Base: 0x%08X\r\n", (unsigned)__PSRAM_BASE);
     printf("  PSRAM Size: %u bytes\r\n", (unsigned)__PSRAM_LENGTH);
+    printf("  psram_heap free: %u bytes\r\n", (unsigned)psram_GetFreeHeapSize());
 }
 
 /* DMA Heap信息 */
