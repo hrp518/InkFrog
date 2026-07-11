@@ -416,6 +416,7 @@ void epd_do_refresh(void) {
     EPD_3IN52_Display_DU();
     printf("[EPD] EPD_3IN52_Display_DU returned, resuming lvgl\n");
     vTaskResume(lvgl_thread.handle);
+    lv_timer_handler_unblock_after_suspend();
     printf("[EPD] lvgl resumed (call returned)\n");
 
     lv_disp_t * disp = lv_disp_get_default();

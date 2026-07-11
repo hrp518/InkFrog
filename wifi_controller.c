@@ -23,6 +23,16 @@
 #define WC_LOG(fmt, ...)
 #endif
 
+/* TRACE 默认关：wc_task 每秒多条 [TRACE] 会占满串口，拖死 TTF/EPUB 主流程 */
+#define WC_TRACE_DBG 0
+#if WC_TRACE_DBG
+#define WC_TRACE_LOG(fmt, ...) WC_LOG(fmt, ##__VA_ARGS__)
+#else
+#define WC_TRACE_LOG(fmt, ...) ((void)0)
+#endif
+
+#define WC_FM_PAUSE_SLEEP_MS  5000
+
 /* 重试退避 (ms) */
 static const uint32_t kBackoffMs[] = { 5000, 10000, 30000, 60000, 60000 };
 #define BACKOFF_COUNT  (sizeof(kBackoffMs)/sizeof(kBackoffMs[0]))
@@ -45,9 +55,15 @@ static int wc_has_pending_request(void)
            g_wc_request_disable || g_wc_request_disconnect;
 }
 
+static int wc_should_abort_sleep(void)
+{
+    return !g_wc_running || wc_has_pending_request() ||
+           g_wifi.fm_paused;
+}
+
 static void wc_sleep_interruptible(uint32_t sleep_ms)
 {
-    while (sleep_ms > 0 && g_wc_running && !wc_has_pending_request()) {
+    while (sleep_ms > 0 && !wc_should_abort_sleep()) {
         uint32_t slice_ms = (sleep_ms > 100) ? 100 : sleep_ms;
         OS_MSleep(slice_ms);
         sleep_ms -= slice_ms;
@@ -90,7 +106,14 @@ static void wc_handle_link_lost(void)
 
 static void wc_try_connect(void)
 {
-    WC_LOG("[TRACE] wc_try_connect enter");
+    WC_TRACE_LOG("[TRACE] wc_try_connect enter");
+    if (!g_wc_running) {
+        return;
+    }
+    if (g_wifi.fm_paused) {
+        wc_set_phase(WLAN_PHASE_DISCONNECTED);
+        return;
+    }
     if (!g_wifi.enabled) {
         WC_LOG("WiFi is disabled, skip connect");
         wc_set_phase(WLAN_PHASE_DISCONNECTED);
@@ -111,19 +134,22 @@ static void wc_try_connect(void)
         OS_MSleep(500);
     }
 
-    WC_LOG("[TRACE] calling wlan_manager_connect");
+    WC_TRACE_LOG("[TRACE] calling wlan_manager_connect");
     int ret = wlan_manager_connect(g_wifi.ssid, g_wifi.password);
-    WC_LOG("[TRACE] wlan_manager_connect returned ret=%d", ret);
+    WC_TRACE_LOG("[TRACE] wlan_manager_connect returned ret=%d", ret);
     if (ret != 0) {
         WC_LOG("wlan_manager_connect failed: %d", ret);
         g_wifi.retry_count++;
         wc_set_phase(WLAN_PHASE_DISCONNECTED);
         return;
     }
+    if (!g_wc_running || g_wifi.fm_paused) {
+        return;
+    }
 
-    WC_LOG("[TRACE] calling wlan_manager_wait_for_ip timeout=%d", CONNECT_TIMEOUT_MS);
+    WC_TRACE_LOG("[TRACE] calling wlan_manager_wait_for_ip timeout=%d", CONNECT_TIMEOUT_MS);
     int wait = wlan_manager_wait_for_ip(CONNECT_TIMEOUT_MS);
-    WC_LOG("[TRACE] wlan_manager_wait_for_ip returned wait=%d", wait);
+    WC_TRACE_LOG("[TRACE] wlan_manager_wait_for_ip returned wait=%d", wait);
     if (wait == 0) {
         WLAN_IPInfo_t info;
         if (wlan_manager_get_ip_info(&info) == 0) {
@@ -131,9 +157,9 @@ static void wc_try_connect(void)
             g_wifi.ip[sizeof(g_wifi.ip) - 1] = '\0';
             WC_LOG("Connected, IP: %s", g_wifi.ip);
             g_wifi.retry_count = 0;
-            WC_LOG("[TRACE] calling wc_set_phase(CONNECTED)");
+            WC_TRACE_LOG("[TRACE] calling wc_set_phase(CONNECTED)");
             wc_set_phase(WLAN_PHASE_CONNECTED);
-            WC_LOG("[TRACE] wc_set_phase(CONNECTED) returned");
+            WC_TRACE_LOG("[TRACE] wc_set_phase(CONNECTED) returned");
         } else {
             WC_LOG("No IP after wait");
             g_wifi.retry_count++;
@@ -165,7 +191,13 @@ static void wc_task(void *arg)
     g_wc_exited = 0;
 
     while (g_wc_running) {
-        WC_LOG("[TRACE] wc_task loop top, phase=%d", (int)g_wifi.phase);
+        /* FM/EPUB 阅读：静默休眠，零 TRACE 输出，把串口让给 TTF/EPUB */
+        if (g_wifi.fm_paused && !wc_has_pending_request()) {
+            wc_sleep_interruptible(WC_FM_PAUSE_SLEEP_MS);
+            continue;
+        }
+
+        WC_TRACE_LOG("[TRACE] wc_task loop top, phase=%d", (int)g_wifi.phase);
         /* 处理外部请求 */
         if (g_wc_request_disable) {
             g_wc_request_disable = 0;
@@ -233,7 +265,7 @@ static void wc_task(void *arg)
 
         switch (g_wifi.phase) {
         case WLAN_PHASE_NO_CONFIG:
-            WC_LOG("[TRACE] branch=NO_CONFIG, sleeping 1s");
+            WC_TRACE_LOG("[TRACE] branch=NO_CONFIG, sleeping 1s");
             wc_sleep_interruptible(1000);
             wc_load_config_from_ini();
             if (!g_wifi.enabled) {
@@ -246,7 +278,7 @@ static void wc_task(void *arg)
             break;
 
         case WLAN_PHASE_DISCONNECTED:
-            WC_LOG("[TRACE] branch=DISCONNECTED");
+            WC_TRACE_LOG("[TRACE] branch=DISCONNECTED");
             if (!g_wifi.enabled) {
                 wc_sleep_interruptible(1000);
                 break;
@@ -255,12 +287,7 @@ static void wc_task(void *arg)
                 wc_set_phase(WLAN_PHASE_NO_CONFIG);
                 break;
             }
-            /* XR872 修复: FM/EPUB 期间暂停重试, 避免 wc_task 抢 SRAM 触发 heap exhausted */
-            if (g_wifi.fm_paused) {
-                WC_LOG("[TRACE] branch=DISCONNECTED, fm_paused=1, sleeping 1s");
-                wc_sleep_interruptible(1000);
-                break;
-            }
+            /* fm_paused 在循环顶部统一静默处理 */
             if (g_wifi.retry_count >= (int)BACKOFF_COUNT) {
                 WC_LOG("Max retries exhausted, staying DISCONNECTED. User must tap to retry.");
                 /* 停在这, 每 60s 打印一次, 等用户主动 retry */
@@ -272,7 +299,8 @@ static void wc_task(void *arg)
                 uint32_t backoff = kBackoffMs[g_wifi.retry_count];
                 WC_LOG("Backoff %ums before retry %d", backoff, g_wifi.retry_count);
                 wc_sleep_interruptible(backoff);
-                if (wc_has_pending_request() || !g_wifi.enabled) {
+                if (!g_wc_running || wc_has_pending_request() || !g_wifi.enabled ||
+                    g_wifi.fm_paused) {
                     break;
                 }
             }
@@ -280,30 +308,45 @@ static void wc_task(void *arg)
             break;
 
         case WLAN_PHASE_CONNECTING:
-            WC_LOG("[TRACE] branch=CONNECTING, sleeping 1s");
+            if (g_wifi.fm_paused) {
+                wlan_manager_cancel_connect();
+                wlan_manager_disconnect();
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+                break;
+            }
+            WC_TRACE_LOG("[TRACE] branch=CONNECTING, sleeping 1s");
             /* wait_for_ip 在 wc_try_connect 内部阻塞, 这里不应该停留 */
             wc_sleep_interruptible(1000);
             break;
 
         case WLAN_PHASE_CONNECTED:
-            WC_LOG("[TRACE] branch=CONNECTED, polling link every 100ms (stop-responsive)");
+            if (g_wifi.fm_paused) {
+                wlan_manager_disconnect();
+                g_wifi.ip[0] = '\0';
+                wc_set_phase(WLAN_PHASE_DISCONNECTED);
+                break;
+            }
+            WC_TRACE_LOG("[TRACE] branch=CONNECTED, polling link every 100ms (stop-responsive)");
             /* 监控 link: 每 5s 检查一次，但以 100ms 粒度轮询以便快速响应停止请求。
              * XR872 修复: 原来用 OS_MSleep(5000) 会卡 5 秒不检测 g_wc_running，
              *   导致休眠时 wifi_controller_stop() 超时，wlan 驱动在 disconnect
              *   期间被本线程访问，触发 BUG at wsm_remove_key_request:1027 断言。 */
             for (int i = 0; i < (POLL_INTERVAL_MS / 100) && g_wc_running; i++) {
+                if (g_wifi.fm_paused) {
+                    break;
+                }
                 OS_MSleep(100);
             }
             if (!g_wc_running) {
-                WC_LOG("[TRACE] stop requested during CONNECTED poll, exiting loop");
+                WC_TRACE_LOG("[TRACE] stop requested during CONNECTED poll, exiting loop");
                 break;
             }
-            WC_LOG("[TRACE] CONNECTED woke, calling is_connected");
+            WC_TRACE_LOG("[TRACE] CONNECTED woke, calling is_connected");
             if (!wlan_manager_is_connected()) {
-                WC_LOG("[TRACE] link lost");
+                WC_TRACE_LOG("[TRACE] link lost");
                 wc_handle_link_lost();
             } else {
-                WC_LOG("[TRACE] link ok, checking IP");
+                WC_TRACE_LOG("[TRACE] link ok, checking IP");
                 /* 更新 IP (DHCP 可能续约) */
                 WLAN_IPInfo_t info;
                 if (wlan_manager_get_ip_info(&info) == 0) {
@@ -313,7 +356,7 @@ static void wc_task(void *arg)
                         WC_LOG("IP changed: %s", g_wifi.ip);
                     }
                 }
-                WC_LOG("[TRACE] CONNECTED branch end");
+                WC_TRACE_LOG("[TRACE] CONNECTED branch end");
             }
             break;
         }

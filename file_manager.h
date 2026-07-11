@@ -15,6 +15,9 @@
 
 #include "lvgl/lvgl.h"
 
+/* 阅读器正文字号默认值（与 epub_viewer 挡位表一致） */
+#define READER_FONT_SIZE_DEFAULT  18
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,7 +54,7 @@ int file_manager_prepare_reader_fonts(void);
 
 /**
  * @brief 切换阅读器字体大小
- * @param new_size 新的字体大小(像素高度)，如 12/14/16/18/20
+ * @param new_size 新的字体大小(像素高度)，如 14/16/18/20/22
  * @return 0 成功，-1 失败
  */
 int file_manager_set_reader_font_size(int new_size);

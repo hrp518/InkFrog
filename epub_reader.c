@@ -411,18 +411,24 @@ static void *miniz_psram_realloc(void *opaque, void *address, size_t items, size
 }
 
 static int fuzzy_locate_file(mz_zip_archive *zip, const char *target, bool verbose) {
-    int raw_idx = raw_scan_locate_file(zip, target);
-    if (raw_idx >= 0) {
-        EPUB_LOG("Located '%s' via raw scan at raw_idx %d\n", target, raw_idx);
-        return -2 - raw_idx;
-    }
-
-    /* Fallback: try miniz's central directory index (works if mz_zip_reader_init succeeded) */
+    /* Prefer miniz central directory: raw byte-scan can false-match and return wrong offsets */
     if (zip->m_zip_mode == MZ_ZIP_MODE_READING) {
         int mz_idx = mz_zip_reader_locate_file(zip, target, NULL, 0);
         if (mz_idx >= 0) {
             EPUB_LOG("Located '%s' via mz_zip_reader_locate_file at index %d\n", target, mz_idx);
             return mz_idx;
+        }
+    }
+
+    int raw_idx = raw_scan_locate_file(zip, target);
+    if (raw_idx >= 0) {
+        RawZipEntry *e = &s_raw_entries[raw_idx];
+        if (e->uncomp_size == 0 || e->local_header_ofs == 0) {
+            EPUB_ERR("raw scan match '%s' idx=%d looks invalid (ofs=0x%x uncomp=%u), skip\n",
+                     target, raw_idx, (unsigned)e->local_header_ofs, (unsigned)e->uncomp_size);
+        } else {
+            EPUB_LOG("Located '%s' via raw scan at raw_idx %d\n", target, raw_idx);
+            return -2 - raw_idx;
         }
     }
 
@@ -475,6 +481,19 @@ static char* read_file_from_zip(EpubReader *reader, const char *filename, size_t
         return NULL;
     }
     if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, buf, (size_t)stat.m_uncomp_size, 0)) {
+        EPUB_LOG("mz extract failed for '%s', trying raw scan fallback\n", filename);
+        int raw_idx = raw_scan_locate_file(&reader->zip_archive, filename);
+        if (raw_idx >= 0 && s_raw_entries[raw_idx].uncomp_size > 0) {
+            mz_uint extracted = 0;
+            if (extract_file_at_raw_offset(&reader->zip_archive, raw_idx, buf,
+                                            s_raw_entries[raw_idx].uncomp_size, &extracted)) {
+                buf[extracted] = '\0';
+                *out_size = extracted;
+                EPUB_LOG("Extracted '%s' via raw fallback (%u bytes) buf=%p\n",
+                         filename, (unsigned)extracted, (void *)buf);
+                return buf;
+            }
+        }
         EPUB_ERR("mz extract failed for: %s\n", filename);
         return NULL;
     }
@@ -873,12 +892,16 @@ int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *o
     if (file_index < -1) {
         int raw_idx = -file_index - 2;
         mz_uint uncomp_size = s_raw_entries[raw_idx].uncomp_size;
+        if (uncomp_size == 0) {
+            EPUB_ERR("raw entry[%d] uncomp_size=0 for %s\n", raw_idx, reader->spine[chapter_index].href);
+            return -1;
+        }
         if ((int)uncomp_size > buf_size) {
             EPUB_ERR("Chapter too large: %u > %d bytes (raw)\n", (unsigned)uncomp_size, buf_size);
             return -2;
         }
         mz_uint extracted = 0;
-        if (!extract_file_at_raw_offset(&reader->zip_archive, raw_idx, out_buf, uncomp_size, &extracted))
+        if (!extract_file_at_raw_offset(&reader->zip_archive, raw_idx, out_buf, (mz_uint)buf_size, &extracted))
             return -1;
         out_buf[extracted] = '\0';
         EPUB_LOG("Full chapter extracted: %u bytes (raw)\n", (unsigned)extracted);
@@ -897,6 +920,16 @@ int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *o
     }
 
     if (!mz_zip_reader_extract_to_mem(&reader->zip_archive, file_index, out_buf, stat.m_uncomp_size, 0)) {
+        EPUB_LOG("mz chapter extract failed, trying raw fallback for: %s\n", reader->spine[chapter_index].href);
+        int raw_idx = raw_scan_locate_file(&reader->zip_archive, reader->spine[chapter_index].href);
+        if (raw_idx >= 0 && s_raw_entries[raw_idx].uncomp_size > 0) {
+            mz_uint extracted = 0;
+            if (extract_file_at_raw_offset(&reader->zip_archive, raw_idx, out_buf, (mz_uint)buf_size, &extracted)) {
+                out_buf[extracted] = '\0';
+                EPUB_LOG("Full chapter extracted: %u bytes (raw fallback)\n", (unsigned)extracted);
+                return (int)extracted;
+            }
+        }
         EPUB_ERR("Failed to extract chapter\n");
         return -1;
     }

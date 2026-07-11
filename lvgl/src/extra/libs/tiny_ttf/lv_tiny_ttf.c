@@ -6,9 +6,11 @@
 #include <math.h>
 #include "../../../misc/lv_lru.h"
 #include "sys/sys_heap.h"
+#include <sys/dma_heap.h>
 
 extern void * psram_malloc(size_t size);
 extern void psram_free(void * ptr);
+extern size_t psram_GetFreeHeapSize(void);
 
 #define STB_RECT_PACK_IMPLEMENTATION
 #define STBRP_STATIC
@@ -22,6 +24,26 @@ extern void psram_free(void * ptr);
 #define TTF_MALLOC(x) (psram_malloc(x))
 #define TTF_FREE(x) (psram_free(x))
 
+static void * ttf_scratch_alloc(size_t size, int * is_dma)
+{
+    void * p = psram_malloc(size);
+    if(p) {
+        if(is_dma) *is_dma = 0;
+        return p;
+    }
+    p = _dma_malloc(size, DMAHEAP_PSRAM);
+    if(p && is_dma) *is_dma = 1;
+    return p;
+}
+
+static void ttf_scratch_free(void * p, int is_dma, size_t size)
+{
+    if(!p) return;
+    if(is_dma) _dma_free(p, DMAHEAP_PSRAM);
+    else psram_free(p);
+    (void)size;
+}
+
 #define CJK_METRICS_START 0x4E00u
 #define CJK_METRICS_END   0x9FFFu
 #define CJK_METRICS_COUNT (CJK_METRICS_END - CJK_METRICS_START + 1u)
@@ -31,6 +53,14 @@ extern void psram_free(void * ptr);
 #define ASCII_METRICS_COUNT (ASCII_METRICS_END - ASCII_METRICS_START + 1u)  /* 95 */
 
 #define LEVEL1_GLYPH_CACHE_SIZE 3600  /* 3500 CJK + 95 ASCII + 5 reserve */
+
+/* glyf 预加载保留的 psram 余量（防碎片/后续小分配） */
+#define TTF_GLYF_PSRAM_RESERVE   (48 * 1024)
+
+static int g_metrics_cache_is_dma = 0;
+static int g_ascii_metrics_cache_is_dma = 0;
+static int g_glyf_lookup_is_dma = 0;
+static int g_level1_glyphs_is_dma = 0;
 
 /* ===== Verbose debug logging switches (set to 0 to suppress, 1 to enable) =====
  * These macros control per-character verbose output during page rendering.
@@ -49,7 +79,7 @@ typedef struct {
     uint16_t box_w_raw;   // unscaled bbox width (xMax - xMin + 1)
     uint16_t box_h_raw;   // unscaled bbox height (yMax - yMin + 1)
     int16_t  ofs_x_raw;   // unscaled bbox x offset (xMin)
-    int16_t  ofs_y_raw;   // unscaled bbox y offset (-yMax)
+    int16_t  ofs_y_raw;   // stbtt bitmap box bottom at scale 1.0, negated (-iy1)
     uint16_t glyph_index; // glyph index in font
     uint8_t  valid;
 } ttf_metrics_entry_t;
@@ -204,6 +234,90 @@ static int compare_level1_by_glyph_index(const void *a, const void *b)
     return 0;
 }
 
+static int ttf_ensure_metrics_cache(ttf_font_desc_t * dsc)
+{
+    if(!dsc) return -1;
+    if(g_shared_metrics_cache) {
+        dsc->metrics_cache = g_shared_metrics_cache;
+    } else if(!dsc->metrics_cache) {
+        int is_dma = 0;
+        size_t sz = CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t);
+        dsc->metrics_cache = (ttf_metrics_entry_t *)ttf_scratch_alloc(sz, &is_dma);
+        if(!dsc->metrics_cache) return -1;
+        g_metrics_cache_is_dma = is_dma;
+        memset(dsc->metrics_cache, 0, sz);
+        printf("[TTF] metrics_cache %lu bytes on %s\n",
+               (unsigned long)sz, is_dma ? "DMA" : "psram");
+    }
+    if(g_shared_ascii_metrics_cache) {
+        dsc->ascii_metrics_cache = g_shared_ascii_metrics_cache;
+    } else if(!dsc->ascii_metrics_cache) {
+        int is_dma = 0;
+        size_t sz = ASCII_METRICS_COUNT * sizeof(ttf_metrics_entry_t);
+        dsc->ascii_metrics_cache = (ttf_metrics_entry_t *)ttf_scratch_alloc(sz, &is_dma);
+        if(!dsc->ascii_metrics_cache) return -1;
+        g_ascii_metrics_cache_is_dma = is_dma;
+        memset(dsc->ascii_metrics_cache, 0, sz);
+    }
+    return 0;
+}
+
+static void ttf_free_level1_glyphs(level1_glyph_info_t * glyphs)
+{
+    if(!glyphs) return;
+    if(g_level1_glyphs_is_dma) _dma_free(glyphs, DMAHEAP_PSRAM);
+    else psram_free(glyphs);
+}
+
+static uint32_t ttf_glyf_psram_budget(void)
+{
+    size_t free_bytes = psram_GetFreeHeapSize();
+    if(free_bytes <= TTF_GLYF_PSRAM_RESERVE) return 0;
+    /* 只用空闲的 85%，避免碎片导致「总量够但 malloc 失败」 */
+    size_t usable = (free_bytes - TTF_GLYF_PSRAM_RESERVE) * 85 / 100;
+    return (uint32_t)usable;
+}
+
+static uint16_t ttf_trim_glyphs_to_budget(level1_glyph_info_t * glyphs, uint16_t count,
+                                          uint32_t * inout_total, uint16_t * inout_valid)
+{
+    uint32_t budget = ttf_glyf_psram_budget();
+    uint32_t total = *inout_total;
+    uint16_t valid = *inout_valid;
+
+    if(total <= budget) return valid;
+
+    printf("[TTF] glyf need %lu bytes > budget %lu, trimming by priority order...\n",
+           (unsigned long)total, (unsigned long)budget);
+
+    total = 0;
+    valid = 0;
+    for(uint16_t i = 0; i < count; i++) {
+        if(!glyphs[i].cached) continue;
+        if(total + glyphs[i].glyf_size > budget) {
+            glyphs[i].cached = 0;
+            continue;
+        }
+        total += glyphs[i].glyf_size;
+        valid++;
+    }
+
+    *inout_total = total;
+    *inout_valid = valid;
+    printf("[TTF] glyf budget trim: loaded %u glyphs, %lu bytes (budget %lu)\n",
+           (unsigned)valid, (unsigned long)total, (unsigned long)budget);
+    return valid;
+}
+
+static uint16_t ttf_count_glyf_cached(const level1_glyph_info_t * glyphs, uint16_t count)
+{
+    uint16_t n = 0;
+    for(uint16_t i = 0; i < count; i++) {
+        if(glyphs[i].cached) n++;
+    }
+    return n;
+}
+
 static int ttf_stream_read_from_cache(ttf_font_desc_t *dsc, size_t pos, void *out, size_t to_read)
 {
     // 统计（仅用于偶发性调试，不在热路径上打印）
@@ -344,6 +458,91 @@ static uint8_t *read_table_from_memory(const uint8_t *ttf_data, uint32_t font_st
     if(!data) return NULL;
     lv_memcpy(data, ttf_data + offset, length);
     *out_size = length;
+    return data;
+}
+
+static int ttf_find_table(ttf_font_desc_t *dsc, const char *table_name, uint32_t *out_offset, uint32_t *out_length)
+{
+    const uint8_t *ttf_mem = (dsc->stream.data != NULL) ? (const uint8_t *)dsc->stream.data : NULL;
+    if(ttf_mem) {
+        return find_table_location_in_memory(ttf_mem, dsc->info.fontstart, table_name, out_offset, out_length);
+    }
+    if(dsc->file_path[0] != '\0') {
+        return find_table_location(&dsc->file, dsc->info.fontstart, table_name, out_offset, out_length);
+    }
+    return 0;
+}
+
+static int ttf_font_has_cff_outlines(ttf_font_desc_t *dsc)
+{
+    uint32_t off, len;
+    if(ttf_find_table(dsc, "CFF ", &off, &len)) return 1;
+    if(ttf_find_table(dsc, "CFF2", &off, &len)) return 1;
+    return 0;
+}
+
+static void ttf_list_tables(ttf_font_desc_t *dsc)
+{
+    const uint8_t *ttf_mem = (dsc->stream.data != NULL) ? (const uint8_t *)dsc->stream.data : NULL;
+    uint32_t font_start = dsc->info.fontstart;
+    uint16_t num_tables;
+    if(ttf_mem) {
+        num_tables = (ttf_mem[font_start + 4] << 8) | ttf_mem[font_start + 5];
+        printf("[TTF_DBG] tables in memory (count=%u):\n", (unsigned)num_tables);
+        for(int i = 0; i < num_tables && i < 32; i++) {
+            uint32_t entry_offs = font_start + 12 + (uint32_t)i * 16;
+            printf("  %c%c%c%c\n", ttf_mem[entry_offs], ttf_mem[entry_offs + 1],
+                   ttf_mem[entry_offs + 2], ttf_mem[entry_offs + 3]);
+        }
+        return;
+    }
+    if(dsc->file_path[0] == '\0') return;
+    lv_fs_seek(&dsc->file, font_start, LV_FS_SEEK_SET);
+    uint8_t buf[12];
+    uint32_t br;
+    lv_fs_read(&dsc->file, buf, 12, &br);
+    num_tables = (buf[4] << 8) | buf[5];
+    printf("[TTF_DBG] tables via dsc->file (count=%u, br=%u):\n", (unsigned)num_tables, (unsigned)br);
+    for(int i = 0; i < num_tables && i < 32; i++) {
+        uint8_t entry[16];
+        lv_fs_read(&dsc->file, entry, 16, &br);
+        printf("  %c%c%c%c\n", entry[0], entry[1], entry[2], entry[3]);
+    }
+}
+
+static uint8_t * ttf_read_table_alloc(ttf_font_desc_t *dsc, const char *table_name,
+                                      uint32_t *out_file_offset, uint32_t *out_size)
+{
+    const uint8_t *ttf_mem = (dsc->stream.data != NULL) ? (const uint8_t *)dsc->stream.data : NULL;
+    if(ttf_mem) {
+        uint32_t sz = 0;
+        uint8_t *data = read_table_from_memory(ttf_mem, dsc->info.fontstart, table_name, &sz);
+        if(data) {
+            if(out_size) *out_size = sz;
+            if(out_file_offset) ttf_find_table(dsc, table_name, out_file_offset, &sz);
+        }
+        return data;
+    }
+    uint32_t offset, length;
+    if(!ttf_find_table(dsc, table_name, &offset, &length)) return NULL;
+    if(out_file_offset) *out_file_offset = offset;
+    if(out_size) *out_size = length;
+    uint8_t *data = psram_malloc(length);
+    if(!data) return NULL;
+    lv_fs_seek(&dsc->file, offset, LV_FS_SEEK_SET);
+    uint32_t bytes_read = 0;
+    while(bytes_read < length) {
+        uint32_t to_read = length - bytes_read;
+        if(to_read > 4096) to_read = 4096;
+        uint32_t br;
+        lv_fs_read(&dsc->file, data + bytes_read, to_read, &br);
+        if(br == 0) break;
+        bytes_read += br;
+    }
+    if(bytes_read < length) {
+        psram_free(data);
+        return NULL;
+    }
     return data;
 }
 
@@ -502,6 +701,7 @@ static int batch_lookup_glyph_indices(ttf_font_desc_t *dsc,
     uint32_t cmap_size;
     uint32_t cmap_file_offset;
     uint8_t *cmap_data = NULL;
+    int cmap_is_dma = 0;
     
     // 优先从PSRAM内存数据读取，其次从文件读取
     if(dsc->stream.data != NULL) {
@@ -510,39 +710,31 @@ static int batch_lookup_glyph_indices(ttf_font_desc_t *dsc,
         if(!cmap_data) printf("[TTF_DBG] batch: read_table_from_memory FAILED\n");
     }
     if(!cmap_data) {
-        lv_fs_file_t temp_file;
-        printf("[TTF_DBG] batch: file path %s\n", dsc->file_path);
-        if(LV_FS_RES_OK != lv_fs_open(&temp_file, dsc->file_path, LV_FS_MODE_RD)) {
-            printf("[TTF_DBG] batch: lv_fs_open FAILED\n");
+        printf("[TTF_DBG] batch: file path %s (reuse dsc->file)\n", dsc->file_path);
+        if(!ttf_find_table(dsc, "cmap", &cmap_file_offset, &cmap_size)) {
+            printf("[TTF_DBG] batch: ttf_find_table(cmap) FAILED\n");
             return -1;
         }
-        printf("[TTF_DBG] batch: lv_fs_open OK\n");
-        if(!find_table_location(&temp_file, dsc->info.fontstart, "cmap", &cmap_file_offset, &cmap_size)) {
-            printf("[TTF_DBG] batch: find_table_location FAILED\n");
-            lv_fs_close(&temp_file);
-            return -1;
-        }
-        lv_fs_seek(&temp_file, cmap_file_offset, LV_FS_SEEK_SET);
         printf("[TTF_DBG] batch: cmap ofs=%lu sz=%lu\n", (unsigned long)cmap_file_offset, (unsigned long)cmap_size);
-        cmap_data = psram_malloc(cmap_size);
-        printf("[TTF_DBG] batch: psram_malloc(%lu)=%p\n", (unsigned long)cmap_size, (void*)cmap_data);
+        cmap_data = (uint8_t *)ttf_scratch_alloc(cmap_size, &cmap_is_dma);
+        printf("[TTF_DBG] batch: scratch_alloc(%lu)=%p dma=%d\n", (unsigned long)cmap_size, (void*)cmap_data, cmap_is_dma);
         if(cmap_data) {
+            lv_fs_seek(&dsc->file, cmap_file_offset, LV_FS_SEEK_SET);
             uint32_t bytes_read = 0;
             while(bytes_read < cmap_size) {
                 uint32_t to_read = cmap_size - bytes_read;
                 if(to_read > 4096) to_read = 4096;
                 uint32_t br;
-                lv_fs_read(&temp_file, cmap_data + bytes_read, to_read, &br);
+                lv_fs_read(&dsc->file, cmap_data + bytes_read, to_read, &br);
                 if(br == 0) { printf("[TTF_DBG] batch: read 0 at %lu/%lu\n", (unsigned long)bytes_read, (unsigned long)cmap_size); break; }
                 bytes_read += br;
             }
             if(bytes_read < cmap_size) {
                 printf("[TTF_DBG] batch: read incomplete %lu/%lu\n", (unsigned long)bytes_read, (unsigned long)cmap_size);
-                psram_free(cmap_data);
+                ttf_scratch_free(cmap_data, cmap_is_dma, cmap_size);
                 cmap_data = NULL;
             }
         }
-        lv_fs_close(&temp_file);
     }
     
     if(!cmap_data) {
@@ -608,7 +800,17 @@ static int batch_lookup_glyph_indices(ttf_font_desc_t *dsc,
     
     printf("[TTF] Found %d valid glyphs, %d not found\n", valid_count, not_found_count);
     
-    dsc->table_cache.cmap.data = cmap_data;
+    /* cmap 仅用于批量查索引，释放 scratch 缓冲以给 glyf 腾出 psram */
+    if(cmap_data) {
+        if(dsc->stream.data == NULL) {
+            ttf_scratch_free(cmap_data, cmap_is_dma, cmap_size);
+        } else {
+            psram_free(cmap_data);
+        }
+        cmap_data = NULL;
+    }
+    
+    dsc->table_cache.cmap.data = NULL;
     dsc->table_cache.cmap.file_offset = cmap_file_offset;
     dsc->table_cache.cmap.size = cmap_size;
     
@@ -639,62 +841,65 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
 {
     uint32_t loca_file_offset, loca_size;
     uint8_t *loca_data = NULL;
+    int loca_is_dma = 0;
+    int sort_is_dma = 0;
     uint32_t glyf_offset, glyf_size;
     const uint8_t *ttf_mem = (dsc->stream.data != NULL) ? (const uint8_t *)dsc->stream.data : NULL;
-    lv_fs_file_t temp_file;
-    int file_opened = 0;
+    int use_dsc_file = (!ttf_mem && dsc->file_path[0] != '\0');
     
     if(ttf_mem) {
         if(!find_table_location_in_memory(ttf_mem, dsc->info.fontstart, "loca", &loca_file_offset, &loca_size)) {
             printf("[TTF_DBG] batch: loca table not found in memory\n");
             return -1;
         }
-        loca_data = psram_malloc(loca_size);
+        loca_data = (uint8_t *)ttf_scratch_alloc(loca_size, &loca_is_dma);
         if(!loca_data) {
-            printf("[TTF_DBG] batch: psram_malloc(loca %lu) failed\n", (unsigned long)loca_size);
+            printf("[TTF_DBG] batch: scratch_alloc(loca %lu) failed\n", (unsigned long)loca_size);
             return -1;
         }
         lv_memcpy(loca_data, ttf_mem + loca_file_offset, loca_size);
         if(!find_table_location_in_memory(ttf_mem, dsc->info.fontstart, "glyf", &glyf_offset, &glyf_size)) {
-            psram_free(loca_data);
+            ttf_scratch_free(loca_data, loca_is_dma, loca_size);
             printf("[TTF_DBG] batch: glyf table not found in memory\n");
             return -1;
         }
-    } else {
-        if(LV_FS_RES_OK != lv_fs_open(&temp_file, dsc->file_path, LV_FS_MODE_RD)) {
-            printf("[TTF_DBG] batch: failed to open font file\n");
-            return -1;
-        }
-        file_opened = 1;
-        if(!find_table_location(&temp_file, dsc->info.fontstart, "loca", &loca_file_offset, &loca_size)) {
-            lv_fs_close(&temp_file);
-            printf("[TTF_DBG] batch: loca table not found in file\n");
-            return -1;
-        }
-        lv_fs_seek(&temp_file, loca_file_offset, LV_FS_SEEK_SET);
-        loca_data = psram_malloc(loca_size);
-        if(!loca_data) {
-            lv_fs_close(&temp_file);
-            printf("[TTF_DBG] batch: psram_malloc(loca %lu) failed\n", (unsigned long)loca_size);
-            return -1;
-        }
-        {
-            uint32_t bytes_read = 0;
-            while(bytes_read < loca_size) {
-                uint32_t to_read = loca_size - bytes_read;
-                if(to_read > 4096) to_read = 4096;
-                uint32_t br;
-                lv_fs_read(&temp_file, loca_data + bytes_read, to_read, &br);
-                if(br == 0) break;
-                bytes_read += br;
+    } else if(use_dsc_file) {
+        if(!ttf_find_table(dsc, "loca", &loca_file_offset, &loca_size)) {
+            printf("[TTF_DBG] batch: loca table not found via dsc->file\n");
+            ttf_list_tables(dsc);
+            if(ttf_font_has_cff_outlines(dsc)) {
+                printf("[TTF_DBG] batch: CFF outline font, glyf batch skipped\n");
             }
-        }
-        if(!find_table_location(&temp_file, dsc->info.fontstart, "glyf", &glyf_offset, &glyf_size)) {
-            psram_free(loca_data);
-            lv_fs_close(&temp_file);
-            printf("[TTF_DBG] batch: glyf table not found in file\n");
             return -1;
         }
+        loca_data = (uint8_t *)ttf_scratch_alloc(loca_size, &loca_is_dma);
+        if(!loca_data) {
+            printf("[TTF_DBG] batch: scratch_alloc(loca %lu) failed\n", (unsigned long)loca_size);
+            return -1;
+        }
+        lv_fs_seek(&dsc->file, loca_file_offset, LV_FS_SEEK_SET);
+        uint32_t bytes_read = 0;
+        while(bytes_read < loca_size) {
+            uint32_t to_read = loca_size - bytes_read;
+            if(to_read > 4096) to_read = 4096;
+            uint32_t br;
+            lv_fs_read(&dsc->file, loca_data + bytes_read, to_read, &br);
+            if(br == 0) break;
+            bytes_read += br;
+        }
+        if(bytes_read < loca_size) {
+            ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+            printf("[TTF_DBG] batch: read loca (%lu) failed\n", (unsigned long)loca_size);
+            return -1;
+        }
+        if(!ttf_find_table(dsc, "glyf", &glyf_offset, &glyf_size)) {
+            ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+            printf("[TTF_DBG] batch: glyf table not found via dsc->file\n");
+            return -1;
+        }
+    } else {
+        printf("[TTF_DBG] batch: no font data source\n");
+        return -1;
     }
     
     printf("[TTF] indexToLocFormat=%d (0=short, 1=long)\n", dsc->info.indexToLocFormat);
@@ -732,8 +937,7 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     }
     
     if(valid_count == 0) {
-        psram_free(loca_data);
-        if(file_opened) lv_fs_close(&temp_file);
+        ttf_scratch_free(loca_data, loca_is_dma, loca_size);
         return 0;
     }
     
@@ -751,21 +955,47 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
            (max_glyf_file - glyf_offset > 0) ? 
            (100 - total_glyf_size * 100 / (max_glyf_file - glyf_offset)) : 0);
     
+    /* loca 仅用于算偏移，释放后再申请 glyf 大块 */
+    ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+    loca_data = NULL;
+
+    ttf_trim_glyphs_to_budget(glyphs, count, &total_glyf_size, &valid_count);
+    if(valid_count == 0 || total_glyf_size == 0) {
+        printf("[TTF_DBG] batch: no glyf fits in psram budget\n");
+        return -1;
+    }
+
+    printf("[TTF_DBG] batch: psram_heap free before glyf=%lu need=%lu\n",
+           (unsigned long)psram_GetFreeHeapSize(), (unsigned long)total_glyf_size);
+
     uint8_t *glyf_data = psram_malloc(total_glyf_size);
+    while(!glyf_data && valid_count > 0) {
+        /* malloc 失败时再按列表顺序去掉最后一个 cached 字 */
+        for(int ri = (int)count - 1; ri >= 0; ri--) {
+            if(glyphs[ri].cached) {
+                total_glyf_size -= glyphs[ri].glyf_size;
+                glyphs[ri].cached = 0;
+                valid_count--;
+                printf("[TTF_DBG] batch: shrink glyf to %u glyphs / %lu bytes\n",
+                       (unsigned)valid_count, (unsigned long)total_glyf_size);
+                break;
+            }
+        }
+        if(valid_count == 0 || total_glyf_size == 0) break;
+        glyf_data = psram_malloc(total_glyf_size);
+    }
     if(!glyf_data) {
-        psram_free(loca_data);
-        if(file_opened) lv_fs_close(&temp_file);
-        printf("[TTF] Failed to allocate %lu bytes for compact glyf cache\n", total_glyf_size);
+        printf("[TTF_DBG] batch: psram_malloc(glyf %lu) failed, free=%lu (likely fragmented)\n",
+               (unsigned long)total_glyf_size, (unsigned long)psram_GetFreeHeapSize());
         return -1;
     }
     
     // 构建排序数组，按文件偏移排序以合并相邻读取
-    glyf_sort_entry_t *sort_entries = psram_malloc(valid_count * sizeof(glyf_sort_entry_t));
+    glyf_sort_entry_t *sort_entries = (glyf_sort_entry_t *)ttf_scratch_alloc(
+        valid_count * sizeof(glyf_sort_entry_t), &sort_is_dma);
     if(!sort_entries) {
         psram_free(glyf_data);
-        psram_free(loca_data);
-        if(file_opened) lv_fs_close(&temp_file);
-        printf("[TTF_DBG] batch: psram_malloc(sort_entries %u) failed\n", valid_count);
+        printf("[TTF_DBG] batch: scratch_alloc(sort_entries %u) failed\n", valid_count);
         return -1;
     }
     
@@ -808,9 +1038,9 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
         if(ttf_mem) {
             lv_memcpy(glyf_data + compact_pos, ttf_mem + merge_start, merge_len);
         } else {
-            lv_fs_seek(&temp_file, merge_start, LV_FS_SEEK_SET);
+            lv_fs_seek(&dsc->file, merge_start, LV_FS_SEEK_SET);
             uint32_t br;
-            lv_fs_read(&temp_file, glyf_data + compact_pos, merge_len, &br);
+            lv_fs_read(&dsc->file, glyf_data + compact_pos, merge_len, &br);
             read_ops++;
         }
         
@@ -829,12 +1059,12 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
            valid_count, read_ops, valid_count - (uint16_t)read_ops,
            (valid_count > 0) ? (valid_count - (uint16_t)read_ops) * 100 / valid_count : 0);
     
-    psram_free(sort_entries);
+    ttf_scratch_free(sort_entries, sort_is_dma, valid_count * sizeof(glyf_sort_entry_t));
     
     printf("[TTF] Glyf loaded: %u glyphs, %lu read ops, compact size=%lu\n",
            valid_count, read_ops, total_glyf_size);
     
-    dsc->table_cache.loca.data = loca_data;
+    dsc->table_cache.loca.data = NULL;
     dsc->table_cache.loca.file_offset = loca_file_offset;
     dsc->table_cache.loca.size = loca_size;
     
@@ -845,10 +1075,16 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     
     // 构建glyf查找表（全局共享，用于二分查找）
     if(g_glyf_lookup) {
-        psram_free(g_glyf_lookup);
+        ttf_scratch_free(g_glyf_lookup, g_glyf_lookup_is_dma,
+                         (size_t)g_glyf_lookup_count * sizeof(glyf_cache_entry_t));
         g_glyf_lookup = NULL;
     }
-    g_glyf_lookup = psram_malloc(valid_count * sizeof(glyf_cache_entry_t));
+    {
+        int lk_dma = 0;
+        g_glyf_lookup = (glyf_cache_entry_t *)ttf_scratch_alloc(
+            valid_count * sizeof(glyf_cache_entry_t), &lk_dma);
+        g_glyf_lookup_is_dma = lk_dma;
+    }
     if(g_glyf_lookup) {
         g_glyf_lookup_count = valid_count;
         g_glyf_table_file_offset = glyf_offset;  // glyf表的绝对文件偏移
@@ -871,8 +1107,6 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
         printf("[TTF] WARNING: Failed to allocate glyf lookup table, glyph cache disabled\n");
     }
     
-    if(file_opened) lv_fs_close(&temp_file);
-    
     *out_data = glyf_data;
     *out_size = total_glyf_size;
     return 1;
@@ -884,7 +1118,9 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
     
     // 释放旧数据
     if(dsc->level1_glyphs != NULL) {
-        psram_free(dsc->level1_glyphs);
+        if(dsc->level1_glyphs != g_shared_level1_glyphs) {
+            ttf_free_level1_glyphs(dsc->level1_glyphs);
+        }
         dsc->level1_glyphs = NULL;
     }
     if(dsc->level1_glyf_data != NULL) {
@@ -894,7 +1130,18 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
     
     // 步骤1：批量查找glyph index（使用优化的查找函数，只读一次cmap表）
     printf("[TTF] Step 1: Looking up glyph indices...\n");
-    level1_glyph_info_t *glyphs = psram_malloc(count * sizeof(level1_glyph_info_t));
+
+    if(ttf_ensure_metrics_cache(dsc) != 0) {
+        printf("[TTF] Warning: metrics_cache alloc failed, layout may use stbtt fallback\n");
+    }
+
+    int glyphs_is_dma = 0;
+    level1_glyph_info_t *glyphs = (level1_glyph_info_t *)ttf_scratch_alloc(
+        count * sizeof(level1_glyph_info_t), &glyphs_is_dma);
+    if(!glyphs) {
+        glyphs = (level1_glyph_info_t *)psram_malloc(count * sizeof(level1_glyph_info_t));
+        glyphs_is_dma = 0;
+    }
     if(!glyphs) {
         printf("[TTF] Failed to allocate glyph info array\n");
         return -1;
@@ -902,25 +1149,51 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
     
     int valid_count = batch_lookup_glyph_indices(dsc, unicode_list, count, glyphs);
     if(valid_count < 0) {
-        psram_free(glyphs);
+        ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
         return -1;
     }
     
     printf("[TTF] Found %d valid glyphs\n", valid_count);
-    
-    // 步骤2：批量读取glyf数据
+
+    // 步骤2：批量读取glyf数据（按 psram 预算裁剪字数）
     printf("[TTF] Step 2: Reading glyf data...\n");
     uint8_t *glyf_data = NULL;
     uint32_t glyf_size = 0;
     
     if(batch_read_glyf_data(dsc, glyphs, count, &glyf_data, &glyf_size) < 0) {
-        psram_free(glyphs);
+        ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
         return -1;
     }
     
     printf("[TTF] Loaded %lu bytes of glyf data\n", glyf_size);
 
-    printf("[TTF] Step 3: Pre-filling metrics_cache...\n");
+    uint16_t cached_glyphs = ttf_count_glyf_cached(glyphs, count);
+    if(cached_glyphs == 0) {
+        ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
+        psram_free(glyf_data);
+        return -1;
+    }
+
+    level1_glyph_info_t *glyphs_keep = (level1_glyph_info_t *)_dma_malloc(
+        count * sizeof(level1_glyph_info_t), DMAHEAP_PSRAM);
+    g_level1_glyphs_is_dma = 1;
+    if(!glyphs_keep) {
+        glyphs_keep = (level1_glyph_info_t *)psram_malloc(count * sizeof(level1_glyph_info_t));
+        g_level1_glyphs_is_dma = 0;
+    }
+    if(!glyphs_keep) {
+        printf("[TTF] Failed to allocate persistent glyph info (%u bytes)\n",
+               (unsigned)(count * sizeof(level1_glyph_info_t)));
+        ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
+        psram_free(glyf_data);
+        return -1;
+    }
+    lv_memcpy(glyphs_keep, glyphs, count * sizeof(level1_glyph_info_t));
+    ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
+    glyphs = glyphs_keep;
+
+    printf("[TTF] Step 3: Pre-filling metrics_cache (%u/%u glyphs in L1 glyf cache)...\n",
+           (unsigned)cached_glyphs, (unsigned)count);
 
     dsc->level1_glyf_data = glyf_data;
     dsc->level1_glyf_total_size = glyf_size;
@@ -948,16 +1221,12 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
                 if(dsc->table_cache.os2.data) { lv_memcpy(dsc->table_cache.os2.data, ttf_mem_cfg + tbl_off, tbl_sz); dsc->table_cache.os2.file_offset = tbl_off; dsc->table_cache.os2.size = tbl_sz; }
             }
         } else if(dsc->file_path[0]) {
-            lv_fs_file_t tbl_file;
-            if(LV_FS_RES_OK == lv_fs_open(&tbl_file, dsc->file_path, LV_FS_MODE_RD)) {
-                dsc->table_cache.head.data = read_table_to_psram(&tbl_file, dsc->info.fontstart, "head", &dsc->table_cache.head.size);
-                if(dsc->table_cache.head.data) find_table_location(&tbl_file, dsc->info.fontstart, "head", &dsc->table_cache.head.file_offset, &dsc->table_cache.head.size);
-                dsc->table_cache.hhea.data = read_table_to_psram(&tbl_file, dsc->info.fontstart, "hhea", &dsc->table_cache.hhea.size);
-                if(dsc->table_cache.hhea.data) find_table_location(&tbl_file, dsc->info.fontstart, "hhea", &dsc->table_cache.hhea.file_offset, &dsc->table_cache.hhea.size);
-                dsc->table_cache.os2.data = read_table_to_psram(&tbl_file, dsc->info.fontstart, "OS/2", &dsc->table_cache.os2.size);
-                if(dsc->table_cache.os2.data) find_table_location(&tbl_file, dsc->info.fontstart, "OS/2", &dsc->table_cache.os2.file_offset, &dsc->table_cache.os2.size);
-                lv_fs_close(&tbl_file);
-            }
+            dsc->table_cache.head.data = read_table_to_psram(&dsc->file, dsc->info.fontstart, "head", &dsc->table_cache.head.size);
+            if(dsc->table_cache.head.data) ttf_find_table(dsc, "head", &dsc->table_cache.head.file_offset, &dsc->table_cache.head.size);
+            dsc->table_cache.hhea.data = read_table_to_psram(&dsc->file, dsc->info.fontstart, "hhea", &dsc->table_cache.hhea.size);
+            if(dsc->table_cache.hhea.data) ttf_find_table(dsc, "hhea", &dsc->table_cache.hhea.file_offset, &dsc->table_cache.hhea.size);
+            dsc->table_cache.os2.data = read_table_to_psram(&dsc->file, dsc->info.fontstart, "OS/2", &dsc->table_cache.os2.size);
+            if(dsc->table_cache.os2.data) ttf_find_table(dsc, "OS/2", &dsc->table_cache.os2.file_offset, &dsc->table_cache.os2.size);
         }
     }
 
@@ -971,31 +1240,10 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
             find_table_location_in_memory(ttf_mem2, dsc->info.fontstart, "hmtx", &hmtx_file_offset, &hmtx_size);
         }
     } else {
-        lv_fs_file_t temp_file2;
-        if(LV_FS_RES_OK != lv_fs_open(&temp_file2, dsc->file_path, LV_FS_MODE_RD)) {
-            printf("[TTF] Failed to open file for hmtx read\n");
-            psram_free(glyphs);
-            psram_free(glyf_data);
-            return -1;
+        hmtx_data = ttf_read_table_alloc(dsc, "hmtx", &hmtx_file_offset, &hmtx_size);
+        if(!hmtx_data) {
+            printf("[TTF] Failed to read hmtx via dsc->file\n");
         }
-        if(!find_table_location(&temp_file2, dsc->info.fontstart, "hmtx", &hmtx_file_offset, &hmtx_size)) {
-            lv_fs_close(&temp_file2);
-        } else {
-            lv_fs_seek(&temp_file2, hmtx_file_offset, LV_FS_SEEK_SET);
-            hmtx_data = psram_malloc(hmtx_size);
-            if(hmtx_data) {
-                uint32_t bytes_read = 0;
-                while(bytes_read < hmtx_size) {
-                    uint32_t to_read = hmtx_size - bytes_read;
-                    if(to_read > 4096) to_read = 4096;
-                    uint32_t br;
-                    lv_fs_read(&temp_file2, hmtx_data + bytes_read, to_read, &br);
-                    if(br == 0) break;
-                    bytes_read += br;
-                }
-            }
-        }
-        lv_fs_close(&temp_file2);
     }
 
     if(hmtx_data) {
@@ -1081,6 +1329,7 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
             }
             if(glyph_idx > 0) {
                 if(glyphs[i].cached && glyphs[i].glyf_size >= 10) {
+                    /* L1 已缓存：直接读 glyf 头 bbox，O(1) 内存访问 */
                     uint8_t *gh = glyf_data + glyphs[i].compact_offset;
                     int16_t xMin = (int16_t)((gh[2] << 8) | gh[3]);
                     int16_t yMin = (int16_t)((gh[4] << 8) | gh[5]);
@@ -1091,10 +1340,13 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
                     entry->ofs_x_raw = xMin;
                     entry->ofs_y_raw = yMin;
                 } else {
-                    entry->box_w_raw = 0;
-                    entry->box_h_raw = 0;
-                    entry->ofs_x_raw = 0;
-                    entry->ofs_y_raw = 0;
+                    /* glyf 未进 L1 预算：stbtt 预填 bbox，避免 layout 得到 box=0 */
+                    int rx0, ry0, rx1, ry1;
+                    stbtt_GetGlyphBitmapBox(&dsc->info, glyph_idx, 1.0f, 1.0f, &rx0, &ry0, &rx1, &ry1);
+                    entry->box_w_raw = (uint16_t)((rx1 - rx0 + 1) > 0 ? (uint16_t)(rx1 - rx0 + 1) : 0);
+                    entry->box_h_raw = (uint16_t)((ry1 - ry0 + 1) > 0 ? (uint16_t)(ry1 - ry0 + 1) : 0);
+                    entry->ofs_x_raw = rx0;
+                    entry->ofs_y_raw = (int16_t)(-ry1);
                 }
                 entry->glyph_index = glyph_idx;
             }
@@ -1125,16 +1377,12 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
             if(dsc->table_cache.os2.data) { lv_memcpy(dsc->table_cache.os2.data, ttf_mem3 + tbl_off, tbl_sz); dsc->table_cache.os2.file_offset = tbl_off; dsc->table_cache.os2.size = tbl_sz; }
         }
     } else if(dsc->file_path[0]) {
-        lv_fs_file_t tbl_file;
-        if(LV_FS_RES_OK == lv_fs_open(&tbl_file, dsc->file_path, LV_FS_MODE_RD)) {
-            dsc->table_cache.head.data = read_table_to_psram(&tbl_file, dsc->info.fontstart, "head", &dsc->table_cache.head.size);
-            if(dsc->table_cache.head.data) find_table_location(&tbl_file, dsc->info.fontstart, "head", &dsc->table_cache.head.file_offset, &dsc->table_cache.head.size);
-            dsc->table_cache.hhea.data = read_table_to_psram(&tbl_file, dsc->info.fontstart, "hhea", &dsc->table_cache.hhea.size);
-            if(dsc->table_cache.hhea.data) find_table_location(&tbl_file, dsc->info.fontstart, "hhea", &dsc->table_cache.hhea.file_offset, &dsc->table_cache.hhea.size);
-            dsc->table_cache.os2.data = read_table_to_psram(&tbl_file, dsc->info.fontstart, "OS/2", &dsc->table_cache.os2.size);
-            if(dsc->table_cache.os2.data) find_table_location(&tbl_file, dsc->info.fontstart, "OS/2", &dsc->table_cache.os2.file_offset, &dsc->table_cache.os2.size);
-            lv_fs_close(&tbl_file);
-        }
+        dsc->table_cache.head.data = read_table_to_psram(&dsc->file, dsc->info.fontstart, "head", &dsc->table_cache.head.size);
+        if(dsc->table_cache.head.data) ttf_find_table(dsc, "head", &dsc->table_cache.head.file_offset, &dsc->table_cache.head.size);
+        dsc->table_cache.hhea.data = read_table_to_psram(&dsc->file, dsc->info.fontstart, "hhea", &dsc->table_cache.hhea.size);
+        if(dsc->table_cache.hhea.data) ttf_find_table(dsc, "hhea", &dsc->table_cache.hhea.file_offset, &dsc->table_cache.hhea.size);
+        dsc->table_cache.os2.data = read_table_to_psram(&dsc->file, dsc->info.fontstart, "OS/2", &dsc->table_cache.os2.size);
+        if(dsc->table_cache.os2.data) ttf_find_table(dsc, "OS/2", &dsc->table_cache.os2.file_offset, &dsc->table_cache.os2.size);
     }
 
     g_shared_table_cache = dsc->table_cache;
@@ -1154,7 +1402,9 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
     printf("[TTF] Level1 glyphs loaded and sorted by glyph_index, table_cache active (cmap=%luB loca=%luB hmtx=%luB glyf=%luB)\n",
            dsc->table_cache.cmap.size, dsc->table_cache.loca.size,
            dsc->table_cache.hmtx.size, dsc->table_cache.glyf.size);
-    return valid_count;
+    printf("[TTF] L1 preload result: %u/%u glyphs cached in psram (%lu bytes glyf)\n",
+           (unsigned)cached_glyphs, (unsigned)count, (unsigned long)glyf_size);
+    return (int)cached_glyphs;
 }
 
 static uint8_t * ttf_get_cached_glyph_data(ttf_font_desc_t *dsc, uint16_t glyph_index, uint32_t *out_size)
@@ -1249,7 +1499,8 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
     {
         uint32_t l2_hash = (unicode_letter ^ ((uint32_t)dsc >> 3)) % DSC_L2_CACHE_SIZE;
         dsc_l2_entry_t *e = &g_dsc_l2_cache[l2_hash];
-        if(e->valid && e->unicode == unicode_letter && e->font_dsc_ptr == (const void *)dsc) {
+        if(e->valid && e->unicode == unicode_letter && e->font_dsc_ptr == (const void *)dsc &&
+           e->dsc_result.box_w > 0 && e->dsc_result.box_h > 0) {
             g_dsc_l2_hits++;
             *dsc_out = e->dsc_result;
             return true;
@@ -1297,8 +1548,9 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
     if(unicode_letter >= CJK_METRICS_START && unicode_letter <= CJK_METRICS_END) {
         uint32_t idx = unicode_letter - CJK_METRICS_START;
 
-        // 所有字体共享同一份 metrics_cache，直接查
-        if(dsc->metrics_cache && dsc->metrics_cache[idx].valid == 1) {
+        // 所有字体共享同一份 metrics_cache，直接查（bbox 为 0 表示 glyf 未进 L1，走 stbtt）
+        if(dsc->metrics_cache && dsc->metrics_cache[idx].valid == 1 &&
+           (dsc->metrics_cache[idx].box_w_raw > 0 || dsc->metrics_cache[idx].box_h_raw > 0)) {
             g_dsc_cache_hits++;
             dsc_out->adv_w = (uint16_t)(dsc->metrics_cache[idx].adv_w_raw * dsc->scale);
             
@@ -1405,7 +1657,7 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
             cache_ptr[idx].box_w_raw = (uint16_t)((rx1 - rx0 + 1) > 0 ? (uint16_t)(rx1 - rx0 + 1) : 0);
             cache_ptr[idx].box_h_raw = (uint16_t)((ry1 - ry0 + 1) > 0 ? (uint16_t)(ry1 - ry0 + 1) : 0);
             cache_ptr[idx].ofs_x_raw = rx0;
-            cache_ptr[idx].ofs_y_raw = -ry1;
+            cache_ptr[idx].ofs_y_raw = (int16_t)(-ry1);
             cache_ptr[idx].glyph_index = (uint16_t)g1;
             cache_ptr[idx].valid = 1;
         }
@@ -1765,21 +2017,11 @@ lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size_t data
 
     if(g_shared_metrics_cache) {
         dsc->metrics_cache = g_shared_metrics_cache;
-    } else {
-        dsc->metrics_cache = (ttf_metrics_entry_t *)psram_malloc(CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t));
-        if(dsc->metrics_cache) {
-            memset(dsc->metrics_cache, 0, CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t));
-        }
     }
+    /* metrics_cache 推迟到 Level1 glyf 预加载之后分配，为 ~1.5MB glyf 块腾出 psram */
 
-    /* ASCII metrics cache (0x20-0x7E, 95 chars) */
     if(g_shared_ascii_metrics_cache) {
         dsc->ascii_metrics_cache = g_shared_ascii_metrics_cache;
-    } else {
-        dsc->ascii_metrics_cache = (ttf_metrics_entry_t *)psram_malloc(ASCII_METRICS_COUNT * sizeof(ttf_metrics_entry_t));
-        if(dsc->ascii_metrics_cache) {
-            memset(dsc->ascii_metrics_cache, 0, ASCII_METRICS_COUNT * sizeof(ttf_metrics_entry_t));
-        }
     }
 
     if(g_shared_level1_loaded) {
@@ -1861,7 +2103,7 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
             }
             if(dsc->level1_glyphs) {
                 if(dsc->level1_glyphs != g_shared_level1_glyphs) {
-                    psram_free(dsc->level1_glyphs);
+                    ttf_free_level1_glyphs(dsc->level1_glyphs);
                 }
                 dsc->level1_glyphs = NULL;
             }

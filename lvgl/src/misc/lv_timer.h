@@ -67,6 +67,12 @@ void _lv_timer_core_init(void);
  */
 uint32_t /* LV_ATTRIBUTE_TIMER_HANDLER */ lv_timer_handler(void);
 
+/**
+ * Clear lv_timer_handler reentrancy guard after vTaskResume().
+ * Required when lvgl_task was vTaskSuspend()'d mid lv_timer_handler().
+ */
+void lv_timer_handler_unblock_after_suspend(void);
+
 //! @endcond
 
 /**

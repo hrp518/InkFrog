@@ -65,7 +65,12 @@ int font_priority_loader_preload(void)
     free(combined);
     
     if (result > 0) {
-        printf("[FONT_LOADER] Level1+ASCII glyphs loaded: %d chars\n", result);
+        if (result < total_count) {
+            printf("[FONT_LOADER] Partial L1 preload: %d/%d glyphs cached (rest use stbtt streaming)\n",
+                   result, total_count);
+        } else {
+            printf("[FONT_LOADER] Level1+ASCII glyphs loaded: %d chars\n", result);
+        }
     } else {
         printf("[FONT_LOADER] Failed to load Level1+ASCII glyphs\n");
     }

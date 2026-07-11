@@ -75,9 +75,10 @@ static lv_obj_t *next_page_btn = NULL;    /* 下一页按钮 */
 
 #if LV_USE_TINY_TTF
 static lv_font_t *custom_ttf_font = NULL;     /* 动态加载的TTF字体 */
-static lv_font_t *custom_ttf_font_h1 = NULL;  /* TTF H1 标题字体 (22px) */
-static lv_font_t *custom_ttf_font_h2 = NULL;  /* TTF H2 标题字体 (20px) */
-static lv_font_t *custom_ttf_font_h3 = NULL;  /* TTF H3 标题字体 (18px) */
+static lv_font_t *custom_ttf_font_h1 = NULL;  /* TTF H1 标题字体 */
+static lv_font_t *custom_ttf_font_h2 = NULL;  /* TTF H2 标题字体 */
+static lv_font_t *custom_ttf_font_h3 = NULL;  /* TTF H3 标题字体 */
+static int s_current_font_size = READER_FONT_SIZE_DEFAULT;
 static bool ttf_load_attempted = false;
 static bool ttf_path_discovered = false;
 static char ttf_file_path[256] = {0};
@@ -1256,7 +1257,7 @@ static int ensure_reader_font_loaded(void)
     printf("[FONT] Attempting deferred TTF font load...\n");
     if (ensure_ttf_path_discovered() == 0) {
         print_memory_stats_internal("before_create_file_font");
-        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, 16);
+        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, READER_FONT_SIZE_DEFAULT);
         printf("[FONT] lv_tiny_ttf_create_file_ex returned: %p\n", custom_ttf_font);
         print_memory_stats_internal("after_create_file_font");
         if (custom_ttf_font != NULL) {
@@ -1266,10 +1267,8 @@ static int ensure_reader_font_loaded(void)
             int loaded = font_priority_loader_preload();
             printf("[FONT] Level1 preload completed: %d chars\n", loaded);
             if (loaded <= 0) {
-                printf("[FONT] Level1 preload failed (%d), destroying TTF, using built-in\n", loaded);
-                lv_tiny_ttf_destroy(custom_ttf_font);
-                custom_ttf_font = NULL;
-                return -1;
+                printf("[FONT] Level1 preload failed (%d), keep TTF for stbtt streaming\n", loaded);
+                return 0;
             }
             return 0;
         }
@@ -1294,6 +1293,7 @@ static void open_epub_viewer(const char *filepath)
     if (!g_wifi.fm_paused) {
         printf("[FM] Pausing WiFi controller (fm_paused=1) before EPUB to free SRAM\n");
         g_wifi.fm_paused = 1;
+        wlan_manager_cancel_connect();
         /* 强制停 STA 立即释放 SRAM, 不等 wc_task */
         wlan_manager_disconnect();
         /* 等 wc_task 看到 fm_paused (1s 内) 停止重试 */
@@ -1308,7 +1308,16 @@ static void open_epub_viewer(const char *filepath)
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
     }
+
+    /* TTF Level1 glyf 预加载需要 ~1.6MB 连续 psram；先加载字体再开 EPUB，避免 zip 元数据占用堆 */
+    file_manager_print_memory_stats("before_prepare_reader_fonts");
+    file_manager_prepare_reader_fonts();
+    file_manager_print_memory_stats("after_prepare_reader_fonts");
     
+    /* EPUB 元数据解析完毕，释放 DMA bump 区，给后续章节解压腾空间 */
+    extern void epub_buffer_reset(void);
+    epub_buffer_reset();
+
     g_epub_reader = epub_reader_create();
     if (!g_epub_reader) {
         printf("[FM] Failed to create EPUB reader\n");
@@ -1329,10 +1338,6 @@ static void open_epub_viewer(const char *filepath)
     printf("[FM] EPUB opened: %s, chapters: %d\n",
            epub_reader_get_title(g_epub_reader),
            epub_reader_get_chapter_count(g_epub_reader));
-
-    file_manager_print_memory_stats("before_prepare_reader_fonts");
-    file_manager_prepare_reader_fonts();
-    file_manager_print_memory_stats("after_prepare_reader_fonts");
     
     g_epub_viewer = epub_viewer_create(g_epub_reader);
     if (!g_epub_viewer) {
@@ -1664,7 +1669,6 @@ int file_manager_prepare_reader_fonts(void)
 #endif
 }
 
-/* H1 标题字体 (22px) */
 lv_font_t *get_reader_font_h1(void)
 {
     if (custom_ttf_font_h1 != NULL) {
@@ -1676,7 +1680,7 @@ lv_font_t *get_reader_font_h1(void)
     if (ttf_file_path[0] == '\0') {
         return &lv_font_misans_16;
     }
-    custom_ttf_font_h1 = create_ttf_font_at_size(22);
+    custom_ttf_font_h1 = create_ttf_font_at_size(s_current_font_size + 6);
     if (custom_ttf_font_h1 == NULL) {
         return &lv_font_misans_16;
     }
@@ -1694,7 +1698,7 @@ lv_font_t *get_reader_font_h2(void)
     if (ttf_file_path[0] == '\0') {
         return &lv_font_misans_16;
     }
-    custom_ttf_font_h2 = create_ttf_font_at_size(20);
+    custom_ttf_font_h2 = create_ttf_font_at_size(s_current_font_size + 4);
     if (custom_ttf_font_h2 == NULL) {
         return &lv_font_misans_16;
     }
@@ -1712,15 +1716,13 @@ lv_font_t *get_reader_font_h3(void)
     if (ttf_file_path[0] == '\0') {
         return &lv_font_misans_16;
     }
-    custom_ttf_font_h3 = create_ttf_font_at_size(18);
+    custom_ttf_font_h3 = create_ttf_font_at_size(s_current_font_size + 2);
     if (custom_ttf_font_h3 == NULL) {
         return &lv_font_misans_16;
     }
     return custom_ttf_font_h3;
 }
 
-/* 当前字体大小（像素高度） */
-static int s_current_font_size = 16;
 
 int file_manager_set_reader_font_size(int new_size)
 {
@@ -1760,11 +1762,12 @@ int file_manager_set_reader_font_size(int new_size)
     /* 创建新字号 body 字体 */
     custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, new_size);
     if (custom_ttf_font == NULL) {
-        printf("[FONT] Failed to create font at size %d, fallback to 16\n", new_size);
-        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, 16);
+        printf("[FONT] Failed to create font at size %d, fallback to %d\n",
+               new_size, READER_FONT_SIZE_DEFAULT);
+        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, READER_FONT_SIZE_DEFAULT);
         if (custom_ttf_font != NULL) {
             custom_ttf_font->fallback = &lv_font_misans_16;
-            s_current_font_size = 16;
+            s_current_font_size = READER_FONT_SIZE_DEFAULT;
         }
         return -1;
     }

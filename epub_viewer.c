@@ -55,14 +55,14 @@ typedef struct {
 } FontSizeConfig;
 
 static const FontSizeConfig g_font_sizes[FONT_SIZE_COUNT] = {
-    { 12, 16, 20, 22, 26 },  /* 挡位1: 极小 */
-    { 14, 19, 23, 26, 30 },  /* 挡位2: 小 */
-    { 16, 22, 26, 30, 34 },  /* 挡位3: 中（默认） */
-    { 18, 25, 29, 33, 37 },  /* 挡位4: 大 */
-    { 20, 28, 32, 36, 40 },  /* 挡位5: 极大 */
+    { 14, 19, 23, 26, 30 },  /* 挡位1: 极小（六月+2） */
+    { 16, 22, 26, 30, 34 },  /* 挡位2: 小 */
+    { 18, 25, 29, 33, 37 },  /* 挡位3: 中（默认，六月挡位4字号） */
+    { 20, 28, 32, 36, 40 },  /* 挡位4: 大（六月挡位5） */
+    { 22, 31, 35, 39, 43 },  /* 挡位5: 极大 */
 };
 
-/* 当前字体大小挡位索引（默认挡位3 = 16px） */
+/* 当前字体大小挡位索引（默认挡位3 = 18px） */
 static int g_font_size_index = 2;
 
 /* 偏移历史栈 */
@@ -74,11 +74,11 @@ static int g_font_size_index = 2;
 #define FONT_H2    get_reader_font_h2()
 #define FONT_H3    get_reader_font_h3()
 
-/* 行高 */
-#define LH_BODY    22
-#define LH_H3      26
-#define LH_H2      30
-#define LH_H1      34
+/* 行高（默认挡位3，与 g_font_sizes[2] 一致） */
+#define LH_BODY    25
+#define LH_H3      29
+#define LH_H2      33
+#define LH_H1      37
 
 /* 估算每页字节数（用于上一页回退估算） */
 #define ESTIMATED_PAGE_BYTES 3000
@@ -712,6 +712,7 @@ static void update_display(EpubViewer *viewer) {
 
     /* 标记渲染阶段 */
     lv_tiny_ttf_reset_dsc_stats();
+    lv_tiny_ttf_reset_dsc_l2_cache();
     lv_tiny_ttf_set_dsc_phase(2);
 
     /* 强制LVGL同步完成所有渲染（包括字形渲染），确保framebuffer内容完整

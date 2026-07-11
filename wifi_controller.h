@@ -25,6 +25,7 @@ typedef struct {
     int  retry_count;     /* 当前重试次数 */
     int  http_running;    /* HTTP 服务器是否在跑 (用于联动关闭) */
     int  fm_paused;       /* XR872 修复: FM/EPUB 期间 wc_task 暂停重试, 释放 SRAM 给 inflate */
+    int  settings_paused; /* Settings 界面期间暂停后台连 WiFi, 避免与 EPD 刷新竞态卡死 lvgl */
 } wifi_ctx_t;
 
 extern wifi_ctx_t g_wifi;
@@ -35,9 +36,8 @@ void wifi_controller_init(void);
 /* 启动状态机后台线程 */
 void wifi_controller_start(void);
 
-/* 停止控制器线程 (休眠前调用, 取消进行中的 WiFi 连接 + 等线程退出)
- * 必须在 screensaver_enter / hibernation 之前调用, 防止在活跃的 net
- * 子系统上做 teardown 导致 net_sys_onoff poweroff 崩溃。 */
+/* 停止控制器线程并 idle WLAN (休眠前调用)
+ * 取消连接 + 等 wc_task 退出 + wlan_sta_disable + net 栈沉淀。 */
 void wifi_controller_stop(void);
 
 /* 注册 phase 回调 (LVGL 线程中安全) - 通常 main.c 用来更新 status bar */

@@ -564,6 +564,8 @@ static void settings_http_btn_event_handler(lv_event_t * e) {
 /* Settings 返回按钮事件处理 */
 static void settings_back_btn_event_handler(lv_event_t * e) {
     printf("[Settings] Back to home\n");
+
+    g_wifi.settings_paused = 0;
     
     /* 使用 lv_obj_clean 清空内容，而不是 lv_obj_del 删除屏幕
      * 避免删除当前活动屏幕后 lv_scr_act() 返回无效指针
@@ -640,6 +642,12 @@ static void on_wifi_phase_change(WLAN_Phase_t phase, void *user_data)
 /* Settings 入口按钮事件处理 */
 static void settings_btn_event_handler(lv_event_t * e) {
     printf("[Settings] Entering Settings page\n");
+
+    /* 暂停后台 WiFi 连接, 避免 Settings 切页 EPD 刷新与 wlan_sta_enable 竞态卡死 lvgl/触摸 */
+    g_wifi.settings_paused = 1;
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
+        wlan_manager_cancel_connect();
+    }
     
     /* 【EPD优化】先暂停刷新，防止刷出半成品UI */
     epd_pause_refresh();

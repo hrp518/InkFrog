@@ -35,6 +35,7 @@ static bool lv_timer_run = false;
 static uint8_t idle_last = 0;
 static bool timer_deleted;
 static bool timer_created;
+static bool s_timer_handler_running = false;
 
 /**********************
  *      MACROS
@@ -69,15 +70,14 @@ uint32_t LV_ATTRIBUTE_TIMER_HANDLER lv_timer_handler(void)
     TIMER_TRACE("begin");
 
     /*Avoid concurrent running of the timer handler*/
-    static bool already_running = false;
-    if(already_running) {
+    if(s_timer_handler_running) {
         TIMER_TRACE("already running, concurrent calls are not allow, returning");
         return 1;
     }
-    already_running = true;
+    s_timer_handler_running = true;
 
     if(lv_timer_run == false) {
-        already_running = false; /*Release mutex*/
+        s_timer_handler_running = false;
         return 1;
     }
 
@@ -167,10 +167,21 @@ uint32_t LV_ATTRIBUTE_TIMER_HANDLER lv_timer_handler(void)
         idle_period_start = lv_tick_get();
     }
 
-    already_running = false; /*Release the mutex*/
+    s_timer_handler_running = false;
 
     TIMER_TRACE("finished (%d ms until the next timer call)", time_till_next);
     return time_till_next;
+}
+
+/*
+ * epd_do_refresh/screensaver 用 vTaskSuspend 挂起 lvgl_task 时,
+ * 若正好执行到 lv_timer_handler 中途, already_running 会永久为 true,
+ * 后续所有 timer(含 touch read_cb) 被跳过 -> 触摸"卡死".
+ * vTaskResume 后必须调用本函数清除重入标志.
+ */
+void lv_timer_handler_unblock_after_suspend(void)
+{
+    s_timer_handler_running = false;
 }
 
 /**

@@ -349,10 +349,10 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
     lv_obj_set_style_text_color(title, lv_color_black(), 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 12);
 
-    /* 返回按钮（右上角）- 70x30 大按钮, 电阻屏友好 */
+    /* 返回按钮（右上角）- 70x35 大按钮, 与顶边对齐 */
     lv_obj_t *btn_back = lv_btn_create(parent);
-    lv_obj_set_size(btn_back, 70, 30);
-    lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -3, 5);
+    lv_obj_set_size(btn_back, 70, 35);
+    lv_obj_align(btn_back, LV_ALIGN_TOP_RIGHT, -3, 0);
     settings_apply_static_btn_style(btn_back, 2, 0);
     lv_obj_add_event_cb(btn_back, wifi_back_cb, LV_EVENT_CLICKED, NULL);
 
@@ -427,7 +427,7 @@ static void create_wifi_screen_ui(lv_obj_t *parent)
 
     /* 默认占位，进入页面后会按当前状态刷新 */
     lv_obj_t *scanning_lbl = lv_label_create(g_wifi_list_cont);
-    lv_label_set_text(scanning_lbl, "Loading...");
+    lv_label_set_text(scanning_lbl, "Scanning WiFi...");
     lv_obj_set_style_text_font(scanning_lbl, UI_FONT, 0);
     lv_obj_set_style_text_color(scanning_lbl, lv_color_make(100, 100, 100), 0);
     lv_obj_align(scanning_lbl, LV_ALIGN_CENTER, 0, 0);
@@ -504,9 +504,8 @@ static void wifi_start_scan(void)
     g_wifi_scan_in_progress = 1;
     wifi_update_switch_label();
     wifi_update_scan_button();
-    if (!g_scan_results || g_scan_count <= 0) {
-        wifi_refresh_list_contents();
-    }
+    /* 始终刷新列表：有缓存结果则立即显示，无缓存则显示"Scanning..." */
+    wifi_refresh_list_contents();
 
     epd_mark_refresh_pending();
 

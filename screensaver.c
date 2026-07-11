@@ -93,12 +93,10 @@ static int screensaver_enter(int force)
 
     printf("[SS] entering hibernation (has_image=%d, force=%d)\n", has_image, force);
 
-    /* WiFi 处理: 关闭后台线程 + 解除 PM 的 wlan poweroff 回调
-     * net_sys_onoff(0) 在我们环境下稳定触发 wsm_remove_key_request:1027
-     * 断言崩溃 (wlan 闭源驱动)。pm_unregister 让 PM 跳过该回调,
-     * hibernation 内部 SetSys1SleepPowerFlags 直接硬断电 Sys3(WLAN CPU)。 */
-    wifi_controller_stop();          /* 停后台线程 */
-    pm_unregister_wlan_power_onoff();/* PM 内部不再调 net_sys_onoff(0) */
+    /* WiFi: wifi_controller_stop 停 wc_task + wlan_sta_disable;
+     * pm_unregister 跳过 net_sys_onoff(0) (该路径在活跃 net 上会断言崩溃)。 */
+    wifi_controller_stop();
+    pm_unregister_wlan_power_onoff();
 
     /* EPD deep sleep */
     EPD_3IN52_Init();
@@ -112,8 +110,7 @@ static int screensaver_enter(int force)
      * 原版顺序: EPD flush -> WakeupIO -> net_sys_onoff -> spi deinit
      *           -> mod_vfat_power:en=0 -> suspend devices -> nvic/WFE
      *
-     * WiFi: 跳过 net_sys_onoff (pm_unregister_wlan_power_onoff),
-     *       hibernation 的 SetSys1SleepPowerFlags 硬断电 WLAN CPU。
+     * WiFi: wifi_controller_stop 已 wlan_sta_disable; PM 跳过 net_sys_onoff。
      *
      * 原版【没有】的操作 (不在这里做!):
      *   - PA07/PA23/PA03 等 GPIO 操作
@@ -187,6 +184,7 @@ static void screensaver_exit(void)
     printf("[SS] EPD DU init done\n");
 
     vTaskResume(lvgl_thread.handle);
+    lv_timer_handler_unblock_after_suspend();
 
     /* 清理屏幕和创建新UI在LVGL线程运行时进行 */
     if (scr) {
