@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include "settings_screen.h"
 #include "settings_storage.h"
+#include "font_warm.h"
 #include "wlan_manager.h"
 #include "wifi_controller.h"
 #include "epd.h"
@@ -150,6 +151,10 @@ static void load_settings_from_ini(void)
 {
     char buf[256] = "";
     if (settings_get_string("font", "path", buf, sizeof(buf)) == 0) {
+        if(strncmp(buf, "0:Font/", 7) == 0) {
+            memmove(buf + 2, buf + 1, strlen(buf));
+            buf[1] = '/';
+        }
         strncpy(g_selected_font, buf, sizeof(g_selected_font) - 1);
         g_selected_font[sizeof(g_selected_font) - 1] = '\0';
         SS_LOG("Loaded font from ini: %s", g_selected_font);
@@ -979,7 +984,7 @@ static int scan_font_files(void)
                 
                 snprintf(g_font_files[g_font_count].path,
                          sizeof(g_font_files[g_font_count].path),
-                         "%s/%s", FONT_DIR_PATH, fno.fname);
+                         "0:/Font/%s", fno.fname);
                 strncpy(g_font_files[g_font_count].name,
                         fno.fname,
                         sizeof(g_font_files[g_font_count].name) - 1);
@@ -1008,6 +1013,7 @@ static void font_selected_cb(lv_event_t *e)
     g_selected_font[sizeof(g_selected_font) - 1] = '\0';
     
     save_settings_to_ini();
+    font_warm_request(g_selected_font);
     
     settings_screen_rebuild_main();
 }
@@ -1030,9 +1036,14 @@ static void create_font_screen(lv_obj_t *parent)
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 5);
     
     /* 当前字体 */
-    char cur_text[280];
+    char cur_text[320];
     const char *cur_font = g_selected_font[0] ? g_selected_font : "Default(smallest)";
-    snprintf(cur_text, sizeof(cur_text), "Now: %s", cur_font);
+    const char *cache_txt = "n/a";
+    if(g_selected_font[0]) {
+        cache_txt = font_warm_l1glyf_exists(g_selected_font) ? "l1glyf OK" :
+                    (font_warm_is_ready() ? "warm only" : "missing");
+    }
+    snprintf(cur_text, sizeof(cur_text), "Now: %s\nCache: %s", cur_font, cache_txt);
     
     lv_obj_t *cur_label = lv_label_create(parent);
     lv_label_set_text(cur_label, cur_text);

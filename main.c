@@ -40,6 +40,7 @@
 #include "coremark/coremark_runner.h"
 #include "font_priority_loader.h"
 #include "settings_screen.h"
+#include "font_warm.h"
 #include "settings_storage.h"
 
 extern const lv_font_t lv_font_montserrat_12;
@@ -1233,6 +1234,7 @@ int main(void)
     /* 创建主界面UI - 先显示UI，WiFi后台连接 */
     main_ui_create();
     screensaver_init();
+    font_warm_schedule_boot();
     
     printf("\r\n[OK] LVGL system initialized!\r\n");
     printf("[INFO] Controls: Files and Settings tiles\r\n");

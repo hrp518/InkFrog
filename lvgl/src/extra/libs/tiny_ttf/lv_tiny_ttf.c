@@ -1108,7 +1108,7 @@ static uint32_t ttf_read_le32(const uint8_t * p)
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static void ttf_l1glyf_path_from_ttf(const char * ttf_path, char * out, size_t out_sz)
+static void ttf_l1glyf_sidecar_path_from_ttf(const char * ttf_path, char * out, size_t out_sz)
 {
     if(!ttf_path || !out || out_sz == 0) return;
     strncpy(out, ttf_path, out_sz - 1);
@@ -1121,6 +1121,39 @@ static void ttf_l1glyf_path_from_ttf(const char * ttf_path, char * out, size_t o
     if(used + 8 < out_sz) {
         strcpy(out + used, ".l1glyf");
     }
+}
+
+static void ttf_l1glyf_hidden_path_from_ttf(const char * ttf_path, char * out, size_t out_sz)
+{
+    if(!ttf_path || !out || out_sz == 0) return;
+    const char * slash = strrchr(ttf_path, '/');
+    const char * base = slash ? (slash + 1) : ttf_path;
+    char stem[128];
+    strncpy(stem, base, sizeof(stem) - 1);
+    stem[sizeof(stem) - 1] = '\0';
+    char * dot = strrchr(stem, '.');
+    if(dot) *dot = '\0';
+    snprintf(out, out_sz, "0:/Font/.l1glyf/%s.l1glyf", stem);
+}
+
+static int ttf_open_l1glyf_cache_file(const char * ttf_path, char * opened_path, size_t opened_sz,
+                                      lv_fs_file_t * cache_file)
+{
+    char path_try[256];
+    ttf_l1glyf_hidden_path_from_ttf(ttf_path, path_try, sizeof(path_try));
+    if(lv_fs_open(cache_file, path_try, LV_FS_MODE_RD) == LV_FS_RES_OK) {
+        strncpy(opened_path, path_try, opened_sz - 1);
+        opened_path[opened_sz - 1] = '\0';
+        return 0;
+    }
+    ttf_l1glyf_sidecar_path_from_ttf(ttf_path, path_try, sizeof(path_try));
+    if(lv_fs_open(cache_file, path_try, LV_FS_MODE_RD) == LV_FS_RES_OK) {
+        strncpy(opened_path, path_try, opened_sz - 1);
+        opened_path[opened_sz - 1] = '\0';
+        return 0;
+    }
+    if(opened_path && opened_sz) opened_path[0] = '\0';
+    return -1;
 }
 
 static int compare_l1glyf_by_unicode(const void * a, const void * b)
@@ -1251,11 +1284,9 @@ static int ttf_try_load_l1glyf_cache(ttf_font_desc_t * dsc,
 
     uint32_t t0 = xTaskGetTickCount();
     char cache_path[256];
-    ttf_l1glyf_path_from_ttf(dsc->file_path, cache_path, sizeof(cache_path));
-
     lv_fs_file_t cache_file;
-    if(lv_fs_open(&cache_file, cache_path, LV_FS_MODE_RD) != LV_FS_RES_OK) {
-        printf("[L1GLYF] No cache file: %s\n", cache_path);
+    if(ttf_open_l1glyf_cache_file(dsc->file_path, cache_path, sizeof(cache_path), &cache_file) != 0) {
+        printf("[L1GLYF] No cache file for %s\n", dsc->file_path);
         return 0;
     }
 
@@ -2806,6 +2837,11 @@ void lv_tiny_ttf_release_reader_cache(void)
     lv_tiny_ttf_reset_dsc_stats();
     printf("[TTF] Reader shared cache released, psram_heap free=%lu\n",
            (unsigned long)psram_GetFreeHeapSize());
+}
+
+int lv_tiny_ttf_level1_ready(void)
+{
+    return g_shared_level1_loaded ? 1 : 0;
 }
 
 void lv_tiny_ttf_destroy(lv_font_t * font)

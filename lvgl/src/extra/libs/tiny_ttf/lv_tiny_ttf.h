@@ -76,6 +76,9 @@ int lv_tiny_ttf_get_l2_hits(void);
 /* Release shared L1/metrics/table caches after EPUB reader closes */
 void lv_tiny_ttf_release_reader_cache(void);
 
+/* Whether shared Level1 glyf cache is loaded in PSRAM */
+int lv_tiny_ttf_level1_ready(void);
+
 /**********************
  *      MACROS
  **********************/

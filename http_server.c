@@ -190,6 +190,42 @@ static int generate_screensaver_html(char *html_buf, int buf_size)
     return len;
 }
 
+static int generate_l1glyf_tool_html(char * html_buf, int buf_size)
+{
+    return snprintf(html_buf, buf_size,
+        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<title>L1 Glyf Cache</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
+        ".box{max-width:720px;margin:0 auto;background:#fff;padding:16px;border-radius:8px}"
+        "a.btn{display:inline-block;margin:6px 0;padding:8px 12px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px}"
+        "input[type=file]{margin:8px 0}button{padding:8px 16px;background:#16a34a;color:#fff;border:0;border-radius:6px}"
+        ".note{background:#eef6ff;padding:10px;border-radius:6px;font-size:14px;line-height:1.5}"
+        "</style></head><body><div class=\"box\">"
+        "<h1>L1 Glyf 缓存工具</h1>"
+        "<p class=\"note\">缓存文件保存到 <code>0:/Font/.l1glyf/</code>（隐藏目录）。"
+        "设备开机会自动预热；开书时不再读 TTF glyf。</p>"
+        "<h3>1. 上传 .l1glyf</h3>"
+        "<input type=\"file\" id=\"lf\" accept=\".l1glyf\">"
+        "<br><button type=\"button\" id=\"up\">上传到 .l1glyf/</button>"
+        "<p id=\"st\"></p>"
+        "<h3>2. 浏览器生成（下一步）</h3>"
+        "<p class=\"note\">后续在此页用 JS 从 TTF 生成 LGF1；当前可用 PC 脚本 "
+        "<code>tools/build_l1glyf_cache.py</code> 生成后上传。</p>"
+        "<a class=\"btn\" href=\"/\">返回文件管理</a>"
+        "<a class=\"btn\" href=\"/?path=/Font\">Font 目录</a>"
+        "</div><script>"
+        "document.getElementById('up').onclick=function(){"
+        "var f=document.getElementById('lf').files[0];"
+        "if(!f){document.getElementById('st').textContent='请选择 .l1glyf';return;}"
+        "var fd=new FormData();fd.append('path','0:/Font/.l1glyf');fd.append('file',f,f.name);"
+        "document.getElementById('st').textContent='上传中...';"
+        "fetch('/upload',{method:'POST',body:fd}).then(function(r){return r.text();}).then(function(t){"
+        "document.getElementById('st').textContent='完成: '+t;}).catch(function(e){"
+        "document.getElementById('st').textContent='失败: '+e;});};"
+        "</script></body></html>");
+}
+
 static int handle_screensaver_upload_raw(int sock, const char *initial_data, int initial_len)
 {
     char *body;
@@ -390,6 +426,7 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "<strong>当前目录:</strong> %s<br>\n"
         "<strong>说明:</strong> 点击文件夹名称进入目录。支持多文件上传，按顺序依次传输。<br>\n"
         "<a href=\"/screensaver\" style=\"display:inline-block;margin-top:8px;padding:8px 12px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;\">🖼️ 打开屏保编辑器</a>\n"
+        "<a href=\"/l1glyf\" style=\"display:inline-block;margin-top:8px;margin-left:8px;padding:8px 12px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px;\">⚡ L1 Glyf 缓存</a>\n"
         "</div>\n", dir_path);
     
     /* 返回上级目录按钮 */
@@ -1238,6 +1275,9 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                 if (strcmp(method, "GET") == 0) {
                     if (strcmp(path, "/screensaver") == 0) {
                         (void)generate_screensaver_html(g_http_response, HTTP_RESPONSE_SIZE);
+                        send_html_response(client_sock, g_http_response);
+                    } else if (strcmp(path, "/l1glyf") == 0) {
+                        (void)generate_l1glyf_tool_html(g_http_response, HTTP_RESPONSE_SIZE);
                         send_html_response(client_sock, g_http_response);
                     } else if (strcmp(path, "/screensaver/status") == 0) {
                         char status_json[256];

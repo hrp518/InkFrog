@@ -30,6 +30,7 @@
 #include "epub_viewer.h"
 #include "settings_storage.h"
 #include "font_priority_loader.h"
+#include "font_warm.h"
 #include "wifi_controller.h"
 #include "http_server.h"
 #include <sys/dma_heap.h>
@@ -1379,23 +1380,36 @@ static int ensure_reader_font_loaded(void)
     }
     ttf_load_attempted = true;
     printf("[FONT] Attempting deferred TTF font load...\n");
-    if (ensure_ttf_path_discovered() == 0) {
-        print_memory_stats_internal("before_create_file_font");
-        custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, READER_FONT_SIZE_DEFAULT);
-        printf("[FONT] lv_tiny_ttf_create_file_ex returned: %p\n", custom_ttf_font);
-        print_memory_stats_internal("after_create_file_font");
-        if (custom_ttf_font != NULL) {
-            custom_ttf_font->fallback = &lv_font_misans_16;
-            font_priority_loader_init();
-            font_priority_loader_set_font(custom_ttf_font);
+    if (font_warm_resolve_reader_path(ttf_file_path, sizeof(ttf_file_path)) != 0) {
+        if (ensure_ttf_path_discovered() != 0) {
+            printf("[FONT] Deferred TTF load failed, using built-in fallback\n");
+            return -1;
+        }
+    } else {
+        ttf_path_discovered = true;
+    }
+    if (ttf_file_path[0] == '\0') {
+        printf("[FONT] Deferred TTF load failed, using built-in fallback\n");
+        return -1;
+    }
+    print_memory_stats_internal("before_create_file_font");
+    custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, READER_FONT_SIZE_DEFAULT);
+    printf("[FONT] lv_tiny_ttf_create_file_ex returned: %p\n", custom_ttf_font);
+    print_memory_stats_internal("after_create_file_font");
+    if (custom_ttf_font != NULL) {
+        custom_ttf_font->fallback = &lv_font_misans_16;
+        font_priority_loader_init();
+        font_priority_loader_set_font(custom_ttf_font);
+        if (lv_tiny_ttf_level1_ready() && font_warm_path_matches(ttf_file_path)) {
+            printf("[FONT] Level1 already warm at boot, skip preload\n");
+        } else {
             int loaded = font_priority_loader_preload();
             printf("[FONT] Level1 preload completed: %d chars\n", loaded);
             if (loaded <= 0) {
                 printf("[FONT] Level1 preload failed (%d), keep TTF for stbtt streaming\n", loaded);
-                return 0;
             }
-            return 0;
         }
+        return 0;
     }
     printf("[FONT] Deferred TTF load failed, using built-in fallback\n");
     return -1;
@@ -1424,7 +1438,7 @@ static void release_reader_fonts(void)
         lv_tiny_ttf_destroy(custom_ttf_font);
         custom_ttf_font = NULL;
     }
-    lv_tiny_ttf_release_reader_cache();
+    /* 保留开机预热的共享 L1 缓存，下次开书不再读 SD */
     ttf_load_attempted = false;
     font_priority_loader_set_font(NULL);
     print_memory_stats_internal("after_release_reader_fonts");
