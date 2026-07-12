@@ -454,18 +454,18 @@ static void fatfs_filesystem_test(void)
 /* HTTP对话框停止按钮回调 */
 static void http_dialog_stop_cb(lv_event_t *e) {
     printf("[HTTP_DIALOG] Stop button clicked\n");
-    http_server_stop();
     g_wifi.http_running = 0;
     wifi_controller_set_http_running(0);
-    
-    /* 关闭对话框 */
+
+    /* 先关对话框，避免 stop 在等网络/线程时界面无响应 */
     if (g_http_dialog_bg) {
         lv_obj_del(g_http_dialog_bg);
         g_http_dialog_bg = NULL;
         g_http_dialog = NULL;
     }
-    
     epd_mark_refresh_pending();
+
+    http_server_stop();
 }
 
 /* 创建HTTP服务器信息对话框 */
@@ -537,7 +537,7 @@ static void settings_http_btn_event_handler(lv_event_t * e) {
         return;
     }
 
-    if (g_wifi.http_running) {
+    if (g_wifi.http_running || http_server_is_running()) {
         printf("[Settings] HTTP already running\n");
         return;
     }

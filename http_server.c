@@ -57,6 +57,11 @@ static volatile int g_client_sock = -1;  /* 客户端socket，用于stop时shutd
 static char *g_http_buffer = NULL;       /* 接收缓冲区(PSRAM) */
 static char *g_http_response = NULL;     /* 响应缓冲区(PSRAM) */
 
+static int http_server_thread_active(void)
+{
+    return OS_ThreadIsValid(&g_http_thread);
+}
+
 /* MIME类型表 */
 static const HTTP_MIME_Type g_mime_types[] = {
     {".html", "text/html"},
@@ -738,7 +743,7 @@ static int send_file_content(int sock, const char *filepath)
     }
     
     /* 分块读取并发送文件内容 */
-    while (1) {
+    while (g_http_running) {
         res = f_read(&fp, file_buf, HTTP_BUF_SIZE, &br);
         if (res != FR_OK || br == 0) {
             break;
@@ -1194,9 +1199,12 @@ static int parse_request(const char *req, char *method, char *path, char *versio
     while (g_http_running) {
         client_sock = accept(g_server_sock, (struct sockaddr *)&client_addr, &addr_len);
         if (client_sock < 0) {
-            if (g_http_running) {
-                HTTP_LOG("Accept failed");
-            }
+            break;
+        }
+
+        /* stop 期间 accept 可能仍返回已排队连接，直接丢弃 */
+        if (!g_http_running) {
+            closesocket(client_sock);
             break;
         }
         
@@ -1213,6 +1221,12 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         
         /* 接收请求 */
         recv_len = recv(client_sock, g_http_buffer, HTTP_BUF_SIZE - 1, 0);
+
+        if (!g_http_running) {
+            closesocket(client_sock);
+            g_client_sock = -1;
+            break;
+        }
         
         if (recv_len > 0) {
             g_http_buffer[recv_len] = '\0';
@@ -1267,7 +1281,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                             /* header不完整，需要继续接收 */
                             int total_received = recv_len;
                             HTTP_LOG("=== DEBUG: Header incomplete, trying to receive more... ===");
-                            while (!header_end && total_received < HTTP_BUF_SIZE - 1) {
+                            while (!header_end && total_received < HTTP_BUF_SIZE - 1 && g_http_running) {
                                 int more = recv(client_sock, g_http_buffer + total_received, HTTP_BUF_SIZE - total_received - 1, 0);
                                 if (more <= 0) {
                                     HTTP_LOG("=== DEBUG: recv returned %d, breaking ===", more);
@@ -1287,7 +1301,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                         
                         HTTP_LOG("=== DEBUG: After header scan, recv_len=%d, g_http_buffer len=%d ===", recv_len, (int)strlen(g_http_buffer));
                         
-                        if (header_end) {
+                        if (header_end && g_http_running) {
                             int header_total_len = header_end + 4 - g_http_buffer;
                             HTTP_LOG("=== DEBUG: header_end found, header_total_len=%d ===", header_total_len);
                             HTTP_LOG("=== DEBUG: Content-Length in header ===");
@@ -1434,17 +1448,24 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         
         closesocket(client_sock);
         g_client_sock = -1;
+
+        if (!g_http_running) {
+            break;
+        }
     }
      
-    closesocket(g_server_sock);
-    g_server_sock = -1;
+    if (g_server_sock >= 0) {
+        closesocket(g_server_sock);
+        g_server_sock = -1;
+    }
     
     /* 释放PSRAM缓冲区 */
     if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
     if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
     g_http_running = 0;
-    
-    HTTP_LOG("Server stopped");
+
+    HTTP_LOG("Server thread exiting");
+    OS_ThreadDelete(&g_http_thread);
 }
 
 /*
@@ -1471,7 +1492,7 @@ int http_server_start(void)
 {
     printf("[HTTP] start: ENTER, g_http_running=%d, handle=0x%08x\r\n", g_http_running, (unsigned int)g_http_thread.handle);
     
-    if (g_http_running) {
+    if (g_http_running || http_server_thread_active()) {
         HTTP_LOG("Server already running");
         return 0;
     }
@@ -1503,7 +1524,7 @@ int http_server_start(void)
  */
 void http_server_stop(void)
 {
-    if (!g_http_running) {
+    if (!g_http_running && !http_server_thread_active()) {
         return;
     }
 
@@ -1519,21 +1540,21 @@ void http_server_stop(void)
     
     /* 2. 关闭server socket使accept返回，触发线程退出 */
     if (g_server_sock >= 0) {
-        closesocket(g_server_sock);
+        int srv = g_server_sock;
         g_server_sock = -1;
+        shutdown(srv, SHUT_RDWR);
+        closesocket(srv);
     }
 
-    /* 3. 等待线程自行清理退出（最多等2秒） */
+    /* 3. 等待线程自行清理退出（最多等5秒） */
     int wait_count;
-    for (wait_count = 0; wait_count < 20 && g_http_running; wait_count++) {
+    for (wait_count = 0; wait_count < 50 && http_server_thread_active(); wait_count++) {
         OS_MSleep(100);
     }
-    if (g_http_running) {
+    if (http_server_thread_active()) {
         HTTP_LOG("Thread did not exit in time, force deleting");
+        OS_ThreadDelete(&g_http_thread);
     }
-    
-    /* 4. 强制删除线程（保底措施） */
-    OS_ThreadDelete(&g_http_thread);
     
     /* 5. 确保PSRAM缓冲区被释放（防止线程异常退出时泄漏） */
     if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
@@ -1553,7 +1574,7 @@ void http_server_stop(void)
  */
 int http_server_is_running(void)
 {
-    return g_http_running;
+    return g_http_running || http_server_thread_active();
 }
 
 /*

@@ -81,6 +81,39 @@ static void ttf_meta_free(void * p, int is_dma)
 /* 全量 L1 尝试后留给 psram_heap 的余量（loca 等已 alloc 后不再重复扣 pinned） */
 #define TTF_GLYF_POST_RESERVE    (96 * 1024)
 
+/* Phase1: glyf 批量读 — 跨小间隙合并 seek，减少 SD 随机读次数
+ * 实测 12KB/64KB: ops=163 physical=5.9MB 5.4s（空洞过多）
+ * 调参目标：降低 physical，ops 控制在 200~400 */
+#define GLYF_MERGE_GAP_MAX       (8U * 1024U)
+#define GLYF_READ_RUN_MAX        (128U * 1024U)
+#define GLYF_IO_BUFFER_SIZE      (128U * 1024U)
+
+/* .l1glyf offline compact glyf cache (see tools/build_l1glyf_cache.py) */
+#define L1GLYF_MAGIC             0x3146474Cu  /* "LGF1" */
+#define L1GLYF_VERSION           1U
+#define L1GLYF_HEADER_CORE_SIZE  32U
+#define L1GLYF_HEADER_TOTAL_SIZE (L1GLYF_HEADER_CORE_SIZE + 4U)
+
+typedef struct {
+    uint32_t unicode;
+    uint16_t glyph_index;
+    uint16_t pad;
+    uint32_t compact_offset;
+    uint32_t glyf_size;
+} l1glyf_entry_t;
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_size;
+    uint32_t ttf_size;
+    uint32_t ttf_crc32;
+    uint32_t lookup_count;
+    uint32_t glyf_data_size;
+    uint32_t lookup_offset;
+    uint32_t data_offset;
+} l1glyf_header_t;
+
 static int g_metrics_cache_is_dma = 0;
 static int g_ascii_metrics_cache_is_dma = 0;
 static int g_glyf_lookup_is_dma = 0;
@@ -991,8 +1024,9 @@ static int batch_lookup_glyph_indices(ttf_font_desc_t *dsc,
 typedef struct {
     uint16_t glyph_index;    // glyph索引
     uint16_t orig_index;     // 原数组索引
-    uint32_t file_offset;    // 文件中的偏移
+    uint32_t file_offset;    // 文件中的绝对偏移
     uint32_t size;           // 数据大小
+    uint32_t compact_offset; // 在紧凑 glyf_data 中的目标偏移
 } glyf_sort_entry_t;
 
 static int compare_glyf_entries(const void *a, const void *b)
@@ -1003,6 +1037,323 @@ static int compare_glyf_entries(const void *a, const void *b)
     if(ga->file_offset > gb->file_offset) return 1;
     return 0;
 }
+
+static int ttf_build_glyf_lookup_from_glyphs(ttf_font_desc_t * dsc,
+                                             level1_glyph_info_t * glyphs,
+                                             uint16_t count,
+                                             uint32_t glyf_table_file_offset,
+                                             uint32_t glyf_table_size)
+{
+    uint16_t valid_count = ttf_count_glyf_cached(glyphs, count);
+    if(valid_count == 0) return 0;
+
+    if(g_glyf_lookup) {
+        ttf_meta_free(g_glyf_lookup, g_glyf_lookup_is_dma);
+        g_glyf_lookup = NULL;
+    }
+    {
+        int lk_dma = 0;
+        g_glyf_lookup = (glyf_cache_entry_t *)ttf_meta_alloc(
+            valid_count * sizeof(glyf_cache_entry_t), &lk_dma);
+        g_glyf_lookup_is_dma = lk_dma;
+    }
+    if(!g_glyf_lookup) {
+        g_glyf_lookup_count = 0;
+        printf("[TTF] WARNING: Failed to allocate glyf lookup table\n");
+        return -1;
+    }
+
+    g_glyf_lookup_count = valid_count;
+    g_glyf_table_file_offset = glyf_table_file_offset;
+    g_glyf_table_size = glyf_table_size;
+
+    uint16_t lk_idx = 0;
+    for(uint16_t i = 0; i < count; i++) {
+        if(glyphs[i].cached) {
+            g_glyf_lookup[lk_idx].glyf_rel_offset = glyphs[i].file_glyf_offset;
+            g_glyf_lookup[lk_idx].compact_offset = glyphs[i].compact_offset;
+            g_glyf_lookup[lk_idx].glyf_size = glyphs[i].glyf_size;
+            lk_idx++;
+        }
+    }
+    qsort(g_glyf_lookup, valid_count, sizeof(glyf_cache_entry_t), compare_cache_entries);
+    ttf_glyf_lookup_fill_read_spans();
+    printf("[TTF] Glyf lookup table built: %u entries, %lu bytes\n",
+           valid_count, (uint32_t)(valid_count * sizeof(glyf_cache_entry_t)));
+
+    if(dsc) {
+        dsc->table_cache.glyf.file_offset = glyf_table_file_offset;
+        dsc->table_cache.glyf.size = glyf_table_size;
+        dsc->table_cache.glyf.data = NULL;
+    }
+    return 0;
+}
+
+#if LV_TINY_TTF_FILE_SUPPORT
+static int ttf_read_exact(lv_fs_file_t * file, uint8_t * dst, uint32_t size)
+{
+    uint32_t done = 0;
+    while(done < size) {
+        uint32_t br = 0;
+        if(lv_fs_read(file, dst + done, size - done, &br) != LV_FS_RES_OK || br == 0) {
+            return -1;
+        }
+        done += br;
+    }
+    return 0;
+}
+
+static uint32_t ttf_read_le32(const uint8_t * p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void ttf_l1glyf_path_from_ttf(const char * ttf_path, char * out, size_t out_sz)
+{
+    if(!ttf_path || !out || out_sz == 0) return;
+    strncpy(out, ttf_path, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    char * dot = strrchr(out, '.');
+    if(dot) {
+        *dot = '\0';
+    }
+    size_t used = strlen(out);
+    if(used + 8 < out_sz) {
+        strcpy(out + used, ".l1glyf");
+    }
+}
+
+static int compare_l1glyf_by_unicode(const void * a, const void * b)
+{
+    const l1glyf_entry_t * ea = (const l1glyf_entry_t *)a;
+    const l1glyf_entry_t * eb = (const l1glyf_entry_t *)b;
+    if(ea->unicode < eb->unicode) return -1;
+    if(ea->unicode > eb->unicode) return 1;
+    return 0;
+}
+
+static const l1glyf_entry_t * l1glyf_lookup_by_unicode(const l1glyf_entry_t * table, uint32_t count, uint32_t unicode)
+{
+    int lo = 0;
+    int hi = (int)count - 1;
+    while(lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if(table[mid].unicode < unicode) {
+            lo = mid + 1;
+        } else if(table[mid].unicode > unicode) {
+            hi = mid - 1;
+        } else {
+            return &table[mid];
+        }
+    }
+    return NULL;
+}
+
+static int ttf_pin_loca_and_fill_offsets(ttf_font_desc_t * dsc,
+                                         level1_glyph_info_t * glyphs,
+                                         uint16_t count,
+                                         uint32_t * out_glyf_offset,
+                                         uint32_t * out_glyf_size)
+{
+    uint32_t loca_file_offset = 0;
+    uint32_t loca_size = 0;
+    uint32_t glyf_offset = 0;
+    uint32_t glyf_size = 0;
+    uint8_t * loca_data = NULL;
+    int loca_is_dma = 0;
+    const uint8_t * ttf_mem = (dsc->stream.data != NULL) ? (const uint8_t *)dsc->stream.data : NULL;
+
+    if(dsc->table_cache.loca.data) {
+        loca_data = dsc->table_cache.loca.data;
+        loca_file_offset = dsc->table_cache.loca.file_offset;
+        loca_size = dsc->table_cache.loca.size;
+    } else if(ttf_mem) {
+        if(!find_table_location_in_memory(ttf_mem, dsc->info.fontstart, "loca", &loca_file_offset, &loca_size)) {
+            return -1;
+        }
+        loca_data = (uint8_t *)ttf_scratch_alloc(loca_size, &loca_is_dma);
+        if(!loca_data) return -1;
+        lv_memcpy(loca_data, ttf_mem + loca_file_offset, loca_size);
+        if(ttf_persist_table_cache(&dsc->table_cache.loca, loca_data, loca_file_offset, loca_size, "loca") != 0) {
+            ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+            return -1;
+        }
+        ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+        loca_data = dsc->table_cache.loca.data;
+    } else if(dsc->file_path[0]) {
+        if(!ttf_find_table(dsc, "loca", &loca_file_offset, &loca_size)) {
+            return -1;
+        }
+        loca_data = (uint8_t *)ttf_scratch_alloc(loca_size, &loca_is_dma);
+        if(!loca_data) return -1;
+        lv_fs_seek(&dsc->file, loca_file_offset, LV_FS_SEEK_SET);
+        if(ttf_read_exact(&dsc->file, loca_data, loca_size) != 0) {
+            ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+            return -1;
+        }
+        if(ttf_persist_table_cache(&dsc->table_cache.loca, loca_data, loca_file_offset, loca_size, "loca") != 0) {
+            ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+            return -1;
+        }
+        ttf_scratch_free(loca_data, loca_is_dma, loca_size);
+        loca_data = dsc->table_cache.loca.data;
+    } else {
+        return -1;
+    }
+
+    if(ttf_mem) {
+        if(!find_table_location_in_memory(ttf_mem, dsc->info.fontstart, "glyf", &glyf_offset, &glyf_size)) {
+            return -1;
+        }
+    } else if(!ttf_find_table(dsc, "glyf", &glyf_offset, &glyf_size)) {
+        return -1;
+    }
+
+    for(uint16_t i = 0; i < count; i++) {
+        if(!glyphs[i].cached || glyphs[i].glyph_index == 0) continue;
+        uint16_t idx = glyphs[i].glyph_index;
+        uint32_t g1 = 0;
+        uint32_t g2 = 0;
+        if(dsc->info.indexToLocFormat == 0) {
+            uint16_t off1 = (loca_data[idx * 2] << 8) | loca_data[idx * 2 + 1];
+            uint16_t off2 = (loca_data[(idx + 1) * 2] << 8) | loca_data[(idx + 1) * 2 + 1];
+            g1 = glyf_offset + off1 * 2;
+            g2 = glyf_offset + off2 * 2;
+        } else {
+            uint32_t off1 = (loca_data[idx * 4] << 24) | (loca_data[idx * 4 + 1] << 16) |
+                            (loca_data[idx * 4 + 2] << 8) | loca_data[idx * 4 + 3];
+            uint32_t off2 = (loca_data[(idx + 1) * 4] << 24) | (loca_data[(idx + 1) * 4 + 1] << 16) |
+                            (loca_data[(idx + 1) * 4 + 2] << 8) | loca_data[(idx + 1) * 4 + 3];
+            g1 = glyf_offset + off1;
+            g2 = glyf_offset + off2;
+        }
+        glyphs[i].file_glyf_offset = g1 - glyf_offset;
+        if(glyphs[i].glyf_size == 0) {
+            glyphs[i].glyf_size = (uint16_t)(g2 - g1);
+        }
+    }
+
+    if(out_glyf_offset) *out_glyf_offset = glyf_offset;
+    if(out_glyf_size) *out_glyf_size = glyf_size;
+    return 0;
+}
+
+/* 0=missing, 1=ok, -1=invalid */
+static int ttf_try_load_l1glyf_cache(ttf_font_desc_t * dsc,
+                                     level1_glyph_info_t * glyphs,
+                                     uint16_t count,
+                                     uint8_t ** out_data,
+                                     uint32_t * out_size)
+{
+    if(!dsc || dsc->file_path[0] == '\0' || dsc->stream.data != NULL) {
+        return 0;
+    }
+
+    uint32_t t0 = xTaskGetTickCount();
+    char cache_path[256];
+    ttf_l1glyf_path_from_ttf(dsc->file_path, cache_path, sizeof(cache_path));
+
+    lv_fs_file_t cache_file;
+    if(lv_fs_open(&cache_file, cache_path, LV_FS_MODE_RD) != LV_FS_RES_OK) {
+        printf("[L1GLYF] No cache file: %s\n", cache_path);
+        return 0;
+    }
+
+    uint8_t hdr_buf[L1GLYF_HEADER_TOTAL_SIZE];
+    if(ttf_read_exact(&cache_file, hdr_buf, L1GLYF_HEADER_TOTAL_SIZE) != 0) {
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] Read header failed: %s\n", cache_path);
+        return -1;
+    }
+
+    l1glyf_header_t hdr;
+    hdr.magic = ttf_read_le32(hdr_buf + 0);
+    hdr.version = (uint16_t)(hdr_buf[4] | (hdr_buf[5] << 8));
+    hdr.lookup_count = ttf_read_le32(hdr_buf + 16);
+    hdr.glyf_data_size = ttf_read_le32(hdr_buf + 20);
+
+    if(hdr.magic != L1GLYF_MAGIC || hdr.version != L1GLYF_VERSION) {
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] Bad file: %s\n", cache_path);
+        return -1;
+    }
+    if(hdr.lookup_count == 0 || hdr.glyf_data_size == 0) {
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] Empty cache: %s\n", cache_path);
+        return -1;
+    }
+
+    uint32_t lookup_bytes = hdr.lookup_count * (uint32_t)sizeof(l1glyf_entry_t);
+    uint32_t lookup_off = L1GLYF_HEADER_TOTAL_SIZE;
+    uint32_t data_off = lookup_off + lookup_bytes;
+
+    int lookup_is_dma = 0;
+    l1glyf_entry_t * lookup = (l1glyf_entry_t *)ttf_scratch_alloc(lookup_bytes, &lookup_is_dma);
+    if(!lookup) {
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] lookup alloc failed (%lu bytes)\n", (unsigned long)lookup_bytes);
+        return -1;
+    }
+
+    if(lv_fs_seek(&cache_file, lookup_off, LV_FS_SEEK_SET) != LV_FS_RES_OK ||
+       ttf_read_exact(&cache_file, (uint8_t *)lookup, lookup_bytes) != 0) {
+        ttf_scratch_free(lookup, lookup_is_dma, lookup_bytes);
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] Read lookup failed\n");
+        return -1;
+    }
+
+    qsort(lookup, hdr.lookup_count, sizeof(l1glyf_entry_t), compare_l1glyf_by_unicode);
+
+    uint16_t matched = 0;
+    for(uint16_t i = 0; i < count; i++) {
+        const l1glyf_entry_t * e = l1glyf_lookup_by_unicode(lookup, hdr.lookup_count, (uint32_t)glyphs[i].unicode);
+        if(!e || e->glyf_size == 0) {
+            continue;
+        }
+        glyphs[i].compact_offset = e->compact_offset;
+        glyphs[i].glyf_size = (uint16_t)e->glyf_size;
+        glyphs[i].cached = 1;
+        matched++;
+    }
+
+    uint8_t * glyf_data = psram_malloc(hdr.glyf_data_size);
+    if(!glyf_data) {
+        ttf_scratch_free(lookup, lookup_is_dma, lookup_bytes);
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] psram_malloc(%lu) failed\n", (unsigned long)hdr.glyf_data_size);
+        return -1;
+    }
+
+    if(lv_fs_seek(&cache_file, data_off, LV_FS_SEEK_SET) != LV_FS_RES_OK ||
+       ttf_read_exact(&cache_file, glyf_data, hdr.glyf_data_size) != 0) {
+        psram_free(glyf_data);
+        ttf_scratch_free(lookup, lookup_is_dma, lookup_bytes);
+        lv_fs_close(&cache_file);
+        printf("[L1GLYF] Read glyf_data failed\n");
+        return -1;
+    }
+    lv_fs_close(&cache_file);
+    ttf_scratch_free(lookup, lookup_is_dma, lookup_bytes);
+
+    uint32_t glyf_offset = 0;
+    uint32_t glyf_size = 0;
+    if(ttf_pin_loca_and_fill_offsets(dsc, glyphs, count, &glyf_offset, &glyf_size) == 0) {
+        ttf_build_glyf_lookup_from_glyphs(dsc, glyphs, count, glyf_offset, glyf_size);
+    } else {
+        printf("[L1GLYF] Warning: loca pin failed, stream glyf cache disabled\n");
+    }
+
+    printf("[L1GLYF] Loaded %s: glyf=%lu bytes mapped=%u/%u %lums\n",
+           cache_path, (unsigned long)hdr.glyf_data_size,
+           (unsigned)matched, (unsigned)count,
+           (unsigned long)(xTaskGetTickCount() - t0));
+
+    *out_data = glyf_data;
+    *out_size = hdr.glyf_data_size;
+    return 1;
+}
+#endif /* LV_TINY_TTF_FILE_SUPPORT */
 
 static int batch_read_glyf_data(ttf_font_desc_t *dsc,
                                 level1_glyph_info_t *glyphs,
@@ -1226,52 +1577,155 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     
     // 按文件偏移排序
     qsort(sort_entries, valid_count, sizeof(glyf_sort_entry_t), compare_glyf_entries);
-    
-    // 紧凑排列：按排序后合并相邻/重叠的glyph，批量读取减少IO次数
-    uint32_t compact_pos = 0;
+
+    /* 预分配每个 glyph 在紧凑缓冲中的目标位置 */
+    {
+        uint32_t compact_pos = 0;
+        for(uint16_t si = 0; si < valid_count; si++) {
+            sort_entries[si].compact_offset = compact_pos;
+            compact_pos += sort_entries[si].size;
+        }
+    }
+
     uint32_t read_ops = 0;
-    
+    uint32_t physical_bytes = 0;
+    uint32_t useful_bytes = 0;
+
+#if LV_TINY_TTF_FILE_SUPPORT
+    int io_buf_is_dma = 0;
+    uint32_t io_buf_size = 0;
+    uint8_t * io_buf = NULL;
+    if(!ttf_mem) {
+        io_buf = (uint8_t *)ttf_scratch_alloc(GLYF_IO_BUFFER_SIZE, &io_buf_is_dma);
+        if(io_buf) {
+            io_buf_size = GLYF_IO_BUFFER_SIZE;
+        } else {
+            io_buf = (uint8_t *)ttf_scratch_alloc(32U * 1024U, &io_buf_is_dma);
+            if(io_buf) {
+                io_buf_size = 32U * 1024U;
+            }
+        }
+        if(io_buf) {
+            printf("[TTF_IO] run buffer %lu bytes on %s (gap_max=%u run_max=%u)\n",
+                   (unsigned long)io_buf_size,
+                   io_buf_is_dma ? "DMA" : "psram",
+                   (unsigned)GLYF_MERGE_GAP_MAX, (unsigned)GLYF_READ_RUN_MAX);
+        }
+    }
+    uint32_t effective_run_max = io_buf_size ? io_buf_size : GLYF_READ_RUN_MAX;
+    if(effective_run_max > GLYF_READ_RUN_MAX) {
+        effective_run_max = GLYF_READ_RUN_MAX;
+    }
+#else
+    uint32_t effective_run_max = GLYF_READ_RUN_MAX;
+#endif
+
     uint16_t i = 0;
     while(i < valid_count) {
-        // 找出连续可合并的glyph区间
-        uint32_t merge_start = sort_entries[i].file_offset;
-        uint32_t merge_end = merge_start + sort_entries[i].size;
-        uint16_t j = i + 1;
-        while(j < valid_count) {
-            uint32_t next_start = sort_entries[j].file_offset;
-            uint32_t next_end = next_start + sort_entries[j].size;
-            // 如果下一个glyph与当前区间相邻或重叠（gap=0），合并
-            if(next_start > merge_end) break;  // 有gap，不能合并
-            if(next_end > merge_end) merge_end = next_end;
-            j++;
+        uint16_t run_first = i;
+        uint16_t run_last = i;
+        uint32_t run_start = sort_entries[i].file_offset;
+        uint32_t run_end = run_start + sort_entries[i].size;
+
+        while(run_last + 1 < valid_count) {
+            glyf_sort_entry_t * next = &sort_entries[run_last + 1];
+            uint32_t next_start = next->file_offset;
+            uint32_t next_end = next_start + next->size;
+            uint32_t gap = (next_start > run_end) ? (next_start - run_end) : 0;
+            uint32_t proposed_end = (next_end > run_end) ? next_end : run_end;
+            uint32_t proposed_size = proposed_end - run_start;
+
+            if(gap > GLYF_MERGE_GAP_MAX) {
+                break;
+            }
+            if(proposed_size > effective_run_max) {
+                break;
+            }
+
+            run_last++;
+            run_end = proposed_end;
         }
-        
-        uint32_t merge_len = merge_end - merge_start;
-        
-        // 一次性读取整个合并区间
+
+        uint32_t run_size = run_end - run_start;
+
         if(ttf_mem) {
-            lv_memcpy(glyf_data + compact_pos, ttf_mem + merge_start, merge_len);
-        } else {
-            lv_fs_seek(&dsc->file, merge_start, LV_FS_SEEK_SET);
-            uint32_t br;
-            lv_fs_read(&dsc->file, glyf_data + compact_pos, merge_len, &br);
+            for(uint16_t k = run_first; k <= run_last; k++) {
+                glyf_sort_entry_t * e = &sort_entries[k];
+                uint32_t src_off = e->file_offset - run_start;
+                lv_memcpy(glyf_data + e->compact_offset,
+                          ttf_mem + run_start + src_off, e->size);
+                glyphs[e->orig_index].compact_offset = e->compact_offset;
+                useful_bytes += e->size;
+            }
+            physical_bytes += run_size;
             read_ops++;
         }
-        
-        // 为区间内每个glyph设置compact_offset
-        for(uint16_t k = i; k < j; k++) {
-            uint16_t orig_i = sort_entries[k].orig_index;
-            uint32_t glyph_in_merge = sort_entries[k].file_offset - merge_start;
-            glyphs[orig_i].compact_offset = compact_pos + glyph_in_merge;
+#if LV_TINY_TTF_FILE_SUPPORT
+        else if(io_buf && run_size <= io_buf_size) {
+            if(lv_fs_seek(&dsc->file, run_start, LV_FS_SEEK_SET) != LV_FS_RES_OK) {
+                ttf_scratch_free(io_buf, io_buf_is_dma, io_buf_size);
+                psram_free(glyf_data);
+                ttf_scratch_free(sort_entries, sort_is_dma, valid_count * sizeof(glyf_sort_entry_t));
+                return -1;
+            }
+            if(ttf_read_exact(&dsc->file, io_buf, run_size) != 0) {
+                ttf_scratch_free(io_buf, io_buf_is_dma, io_buf_size);
+                psram_free(glyf_data);
+                ttf_scratch_free(sort_entries, sort_is_dma, valid_count * sizeof(glyf_sort_entry_t));
+                return -1;
+            }
+            read_ops++;
+            physical_bytes += run_size;
+            for(uint16_t k = run_first; k <= run_last; k++) {
+                glyf_sort_entry_t * e = &sort_entries[k];
+                uint32_t src_off = e->file_offset - run_start;
+                lv_memcpy(glyf_data + e->compact_offset, io_buf + src_off, e->size);
+                glyphs[e->orig_index].compact_offset = e->compact_offset;
+                useful_bytes += e->size;
+            }
         }
-        
-        compact_pos += merge_len;
-        i = j;
+#endif
+        else {
+            /* 无 IO 缓冲或 run 过大：逐 glyph 直读（退化路径） */
+            for(uint16_t k = run_first; k <= run_last; k++) {
+                glyf_sort_entry_t * e = &sort_entries[k];
+#if LV_TINY_TTF_FILE_SUPPORT
+                if(lv_fs_seek(&dsc->file, e->file_offset, LV_FS_SEEK_SET) != LV_FS_RES_OK) {
+                    if(io_buf) ttf_scratch_free(io_buf, io_buf_is_dma, io_buf_size);
+                    psram_free(glyf_data);
+                    ttf_scratch_free(sort_entries, sort_is_dma, valid_count * sizeof(glyf_sort_entry_t));
+                    return -1;
+                }
+                if(ttf_read_exact(&dsc->file, glyf_data + e->compact_offset, e->size) != 0) {
+                    if(io_buf) ttf_scratch_free(io_buf, io_buf_is_dma, io_buf_size);
+                    psram_free(glyf_data);
+                    ttf_scratch_free(sort_entries, sort_is_dma, valid_count * sizeof(glyf_sort_entry_t));
+                    return -1;
+                }
+                read_ops++;
+                physical_bytes += e->size;
+                useful_bytes += e->size;
+                glyphs[e->orig_index].compact_offset = e->compact_offset;
+#endif
+            }
+        }
+
+        i = run_last + 1;
     }
-    
+
+#if LV_TINY_TTF_FILE_SUPPORT
+    if(io_buf) {
+        ttf_scratch_free(io_buf, io_buf_is_dma, io_buf_size);
+    }
+#endif
+
     printf("[TTF] Merged %u glyph reads into %lu batch read ops (saved %u ops, %u%% reduction)\n",
            valid_count, read_ops, valid_count - (uint16_t)read_ops,
            (valid_count > 0) ? (valid_count - (uint16_t)read_ops) * 100 / valid_count : 0);
+    printf("[TTF_IO] ops=%lu physical=%lu useful=%lu overhead=%lu (gap_max=%u run_max=%u)\n",
+           (unsigned long)read_ops, (unsigned long)physical_bytes,
+           (unsigned long)useful_bytes, (unsigned long)(physical_bytes - useful_bytes),
+           (unsigned)GLYF_MERGE_GAP_MAX, (unsigned)GLYF_READ_RUN_MAX);
     
     ttf_scratch_free(sort_entries, sort_is_dma, valid_count * sizeof(glyf_sort_entry_t));
     
@@ -1284,43 +1738,7 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     }
     
     // glyf表缓存：存储真实的偏移和大小供全局查找表使用
-    dsc->table_cache.glyf.file_offset = glyf_offset;
-    dsc->table_cache.glyf.size = glyf_size;
-    dsc->table_cache.glyf.data = NULL;
-    
-    // 构建glyf查找表（全局共享，用于二分查找）
-    if(g_glyf_lookup) {
-        ttf_meta_free(g_glyf_lookup, g_glyf_lookup_is_dma);
-        g_glyf_lookup = NULL;
-    }
-    {
-        int lk_dma = 0;
-        g_glyf_lookup = (glyf_cache_entry_t *)ttf_meta_alloc(
-            valid_count * sizeof(glyf_cache_entry_t), &lk_dma);
-        g_glyf_lookup_is_dma = lk_dma;
-    }
-    if(g_glyf_lookup) {
-        g_glyf_lookup_count = valid_count;
-        g_glyf_table_file_offset = glyf_offset;  // glyf表的绝对文件偏移
-        g_glyf_table_size = glyf_size;           // glyf表总大小
-        
-        uint16_t lk_idx = 0;
-        for(uint16_t i = 0; i < count; i++) {
-            if(glyphs[i].cached) {
-                g_glyf_lookup[lk_idx].glyf_rel_offset = glyphs[i].file_glyf_offset;
-                g_glyf_lookup[lk_idx].compact_offset = glyphs[i].compact_offset;
-                g_glyf_lookup[lk_idx].glyf_size = glyphs[i].glyf_size;
-                lk_idx++;
-            }
-        }
-        // 按glyf_rel_offset排序，用于二分查找
-        qsort(g_glyf_lookup, valid_count, sizeof(glyf_cache_entry_t), compare_cache_entries);
-        ttf_glyf_lookup_fill_read_spans();
-        printf("[TTF] Glyf lookup table built: %u entries, %lu bytes\n", valid_count, (uint32_t)(valid_count * sizeof(glyf_cache_entry_t)));
-    } else {
-        g_glyf_lookup_count = 0;
-        printf("[TTF] WARNING: Failed to allocate glyf lookup table, glyph cache disabled\n");
-    }
+    ttf_build_glyf_lookup_from_glyphs(dsc, glyphs, count, glyf_offset, glyf_size);
     
     *out_data = glyf_data;
     *out_size = total_glyf_size;
@@ -1389,14 +1807,25 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
     
     printf("[TTF] Found %d valid glyphs\n", valid_count);
 
-    // 步骤2：批量读取glyf数据（按 psram 预算裁剪字数）
-    printf("[TTF] Step 2: Reading glyf data...\n");
+    // 步骤2：优先读 .l1glyf 缓存，失败则从 TTF 批量读 glyf
+    printf("[TTF] Step 2: Loading glyf data...\n");
     uint8_t *glyf_data = NULL;
     uint32_t glyf_size = 0;
-    
-    if(batch_read_glyf_data(dsc, glyphs, count, &glyf_data, &glyf_size) < 0) {
-        ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
-        return -1;
+    int glyf_src = 0;
+
+#if LV_TINY_TTF_FILE_SUPPORT
+    glyf_src = ttf_try_load_l1glyf_cache(dsc, glyphs, count, &glyf_data, &glyf_size);
+#endif
+    if(glyf_src <= 0) {
+        if(glyf_src < 0) {
+            printf("[L1GLYF] Cache invalid, fallback to TTF batch read\n");
+        }
+        if(batch_read_glyf_data(dsc, glyphs, count, &glyf_data, &glyf_size) < 0) {
+            ttf_scratch_free(glyphs, glyphs_is_dma, count * sizeof(level1_glyph_info_t));
+            return -1;
+        }
+    } else {
+        printf("[TTF] Step 2: glyf from .l1glyf cache (skipped TTF batch read)\n");
     }
     
     printf("[TTF] Loaded %lu bytes of glyf data\n", glyf_size);
