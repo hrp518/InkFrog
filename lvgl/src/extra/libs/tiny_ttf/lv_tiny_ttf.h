@@ -73,6 +73,9 @@ void lv_tiny_ttf_bitmap_page_end(void);
 void lv_tiny_ttf_reset_dsc_l2_cache(void);
 int lv_tiny_ttf_get_l2_hits(void);
 
+/* Release shared L1/metrics/table caches after EPUB reader closes */
+void lv_tiny_ttf_release_reader_cache(void);
+
 /**********************
  *      MACROS
  **********************/

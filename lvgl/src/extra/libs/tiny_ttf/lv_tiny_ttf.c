@@ -309,6 +309,28 @@ static void ttf_free_level1_glyphs(level1_glyph_info_t * glyphs)
     else psram_free(glyphs);
 }
 
+static void ttf_free_cached_table_slot(ttf_cached_table_t * slot)
+{
+    if(!slot || !slot->data) return;
+    psram_free(slot->data);
+    slot->data = NULL;
+    slot->size = 0;
+    slot->file_offset = 0;
+}
+
+static void ttf_free_table_cache(ttf_table_cache_t * tc)
+{
+    if(!tc) return;
+    ttf_free_cached_table_slot(&tc->cmap);
+    ttf_free_cached_table_slot(&tc->loca);
+    ttf_free_cached_table_slot(&tc->hmtx);
+    ttf_free_cached_table_slot(&tc->glyf);
+    ttf_free_cached_table_slot(&tc->head);
+    ttf_free_cached_table_slot(&tc->hhea);
+    ttf_free_cached_table_slot(&tc->os2);
+    tc->active = 0;
+}
+
 /* 全量 L1：free 已反映 loca 等已分配对象，只留 post reserve */
 static uint32_t ttf_glyf_psram_budget_full(void)
 {
@@ -2314,6 +2336,47 @@ void lv_tiny_ttf_set_size(lv_font_t * font, lv_coord_t line_height)
     if(font != NULL && font->dsc != NULL) {
         ttf_set_font_size_cb(font, line_height);
     }
+}
+
+void lv_tiny_ttf_release_reader_cache(void)
+{
+    if(g_shared_level1_glyf_data) {
+        psram_free(g_shared_level1_glyf_data);
+        g_shared_level1_glyf_data = NULL;
+        g_shared_level1_glyf_size = 0;
+    }
+    if(g_shared_level1_glyphs) {
+        ttf_free_level1_glyphs(g_shared_level1_glyphs);
+        g_shared_level1_glyphs = NULL;
+        g_shared_level1_glyph_count = 0;
+        g_level1_glyphs_is_dma = 0;
+    }
+    if(g_glyf_lookup) {
+        ttf_meta_free(g_glyf_lookup, g_glyf_lookup_is_dma);
+        g_glyf_lookup = NULL;
+        g_glyf_lookup_count = 0;
+        g_glyf_lookup_is_dma = 0;
+    }
+    if(g_shared_metrics_cache) {
+        ttf_meta_free(g_shared_metrics_cache, g_metrics_cache_is_dma);
+        g_shared_metrics_cache = NULL;
+        g_metrics_cache_is_dma = 0;
+    }
+    if(g_shared_ascii_metrics_cache) {
+        ttf_meta_free(g_shared_ascii_metrics_cache, g_ascii_metrics_cache_is_dma);
+        g_shared_ascii_metrics_cache = NULL;
+        g_ascii_metrics_cache_is_dma = 0;
+    }
+    if(g_shared_level1_loaded) {
+        ttf_free_table_cache(&g_shared_table_cache);
+        memset(&g_shared_table_cache, 0, sizeof(g_shared_table_cache));
+        g_shared_level1_loaded = 0;
+    }
+    lv_tiny_ttf_bitmap_cache_reset();
+    lv_tiny_ttf_reset_dsc_l2_cache();
+    lv_tiny_ttf_reset_dsc_stats();
+    printf("[TTF] Reader shared cache released, psram_heap free=%lu\n",
+           (unsigned long)psram_GetFreeHeapSize());
 }
 
 void lv_tiny_ttf_destroy(lv_font_t * font)

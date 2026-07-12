@@ -32,9 +32,11 @@
 #include "font_priority_loader.h"
 #include "wifi_controller.h"
 #include "http_server.h"
+#include <sys/dma_heap.h>
 #include "kernel/os/os.h"
 
 extern void main_ui_create(void);
+extern volatile int g_rendering_in_progress;
 
 /*====================
  *    全局变量
@@ -62,6 +64,8 @@ typedef struct {
 } FileEntry;
 
 static FileEntry *file_entries = NULL;  /* 文件条目数组 */
+static int file_entries_in_dma = 0;     /* file_entries 是否在 DMA heap */
+static FileEntry *file_entries_park = NULL; /* 开书时暂存到 DMA，退出后恢复 */
 static int total_file_count = 0;          /* 总文件数 */
 static int current_page = 0;              /* 当前页码 (从0开始) */
 static int total_pages = 0;               /* 总页数 */
@@ -125,6 +129,8 @@ static void async_open_epub_wrapper(void *arg);
 static int find_smallest_ttf_font(void);
 static int ensure_ttf_path_discovered(void);
 static int ensure_reader_font_loaded(void);
+static void release_reader_fonts(void);
+static uint8_t g_fm_show_pending = 0;
 void file_manager_show(void);
 
 /*====================
@@ -236,19 +242,9 @@ static void physical_back_btn_handler(void)
                 printf("[FM] Bookmark saved: ch=%d off=%d\n", ch, off);
             }
         }
-        /* 销毁viewer和reader（close_cb会调用file_manager_show，先置NULL避免递归） */
-        EpubViewer *v = g_epub_viewer;
-        EpubReader *r = g_epub_reader;
-        g_epub_viewer = NULL;
-        g_epub_reader = NULL;
-        epub_viewer_destroy(v);
-        epub_reader_destroy(r);
-        /* 恢复滑动回调 */
+        /* 保存书签后统一走 file_manager_show 恢复 FM */
         touch_register_swipe_callback(swipe_handler);
-        /* 重新加载文件管理器 */
-        lv_disp_load_scr(fm_screen);
-        refresh_file_list(current_path);
-        epd_mark_refresh_pending();
+        file_manager_show();
         return;
     }
 
@@ -611,14 +607,54 @@ static const char* get_file_icon(const char *filename, uint8_t is_dir)
  *====================*/
 
 /**
+ * @brief 释放 file_entries 存储（PSRAM 或 DMA）
+ */
+static void file_entries_free_storage(void)
+{
+    if(!file_entries) return;
+    if(file_entries_in_dma) {
+        _dma_free(file_entries, DMAHEAP_PSRAM);
+    } else {
+        psram_free(file_entries);
+    }
+    file_entries = NULL;
+    file_entries_in_dma = 0;
+}
+
+static void file_entries_park_free(void)
+{
+    if(file_entries_park) {
+        _dma_free(file_entries_park, DMAHEAP_PSRAM);
+        file_entries_park = NULL;
+    }
+}
+
+static bool file_entries_alloc_storage(void)
+{
+    size_t sz = (size_t)MAX_FILE_ENTRIES * sizeof(FileEntry);
+    file_entries = (FileEntry *)psram_malloc(sz);
+    if(file_entries) {
+        file_entries_in_dma = 0;
+        return true;
+    }
+    file_entries = (FileEntry *)_dma_malloc(sz, DMAHEAP_PSRAM);
+    if(file_entries) {
+        file_entries_in_dma = 1;
+        printf("[FM] file_entries on DMA heap (%u bytes)\n", (unsigned)sz);
+        return true;
+    }
+    return false;
+}
+
+/**
  * @brief 初始化分页系统
  */
 static void init_pagination(void)
 {
-    /* 分配文件条目数组（使用PSRAM） */
-    file_entries = (FileEntry *)psram_malloc(MAX_FILE_ENTRIES * sizeof(FileEntry));
-    if (!file_entries) {
-        printf("[FM] Failed to allocate file_entries array from PSRAM\n");
+    if(file_entries) return;
+
+    if(!file_entries_alloc_storage()) {
+        printf("[FM] Failed to allocate file_entries array from PSRAM/DMA\n");
         return;
     }
     
@@ -630,12 +666,11 @@ static void init_pagination(void)
     page_dots = (lv_obj_t **)malloc(5 * sizeof(lv_obj_t *));
     if (!page_dots) {
         printf("[FM] Failed to allocate page_dots array\n");
-        psram_free(file_entries);
-        file_entries = NULL;
+        file_entries_free_storage();
         return;
     }
     
-    printf("[FM] Pagination initialized (PSRAM)\n");
+    printf("[FM] Pagination initialized (%s)\n", file_entries_in_dma ? "DMA" : "PSRAM");
 }
 
 /**
@@ -643,10 +678,8 @@ static void init_pagination(void)
  */
 static void deinit_pagination(void)
 {
-    if (file_entries) {
-        psram_free(file_entries);
-        file_entries = NULL;
-    }
+    file_entries_free_storage();
+    file_entries_park_free();
     if (page_dots) {
         free(page_dots);
         page_dots = NULL;
@@ -672,9 +705,29 @@ static void fm_suspend_for_reader(void)
         return;
     }
     if(file_entries != NULL) {
-        deinit_pagination();
-        printf("[FM] Suspended pagination cache (~%u bytes psram_heap) for reader\n",
-               (unsigned)(MAX_FILE_ENTRIES * sizeof(FileEntry)));
+        size_t sz = (size_t)MAX_FILE_ENTRIES * sizeof(FileEntry);
+        if(!file_entries_park) {
+            file_entries_park = (FileEntry *)_dma_malloc(sz, DMAHEAP_PSRAM);
+        }
+        if(file_entries_park) {
+            memcpy(file_entries_park, file_entries, sz);
+            file_entries_free_storage();
+            if(page_indicator) {
+                lv_obj_clean(page_indicator);
+            }
+            if(page_dots) {
+                free(page_dots);
+                page_dots = NULL;
+            }
+            total_file_count = 0;
+            current_page = 0;
+            total_pages = 0;
+            printf("[FM] Parked file list to DMA (%u bytes), freed psram for reader\n",
+                   (unsigned)sz);
+        } else {
+            deinit_pagination();
+            printf("[FM] DMA park failed, dropped file list cache for reader\n");
+        }
     }
     g_fm_cache_suspended = true;
     print_memory_stats_internal("after_fm_suspend");
@@ -685,15 +738,43 @@ static bool fm_resume_after_reader(void)
     if(!g_fm_cache_suspended) {
         return true;
     }
-    init_pagination();
+
     if(file_entries == NULL) {
-        printf("[FM] Failed to restore pagination cache after reader\n");
-        g_fm_cache_suspended = false;
-        return false;
+        size_t sz = (size_t)MAX_FILE_ENTRIES * sizeof(FileEntry);
+        if(file_entries_park) {
+            file_entries = (FileEntry *)psram_malloc(sz);
+            if(file_entries) {
+                memcpy(file_entries, file_entries_park, sz);
+                file_entries_in_dma = 0;
+                _dma_free(file_entries_park, DMAHEAP_PSRAM);
+                file_entries_park = NULL;
+                printf("[FM] Restored file list from DMA park to PSRAM\n");
+            } else {
+                file_entries = file_entries_park;
+                file_entries_park = NULL;
+                file_entries_in_dma = 1;
+                printf("[FM] PSRAM tight: file list stays on DMA (%u bytes)\n",
+                       (unsigned)sz);
+            }
+        } else if(!file_entries_alloc_storage()) {
+            printf("[FM] Failed to restore pagination cache after reader\n");
+            g_fm_cache_suspended = false;
+            return false;
+        }
     }
+
+    if(!page_dots) {
+        page_dots = (lv_obj_t **)malloc(5 * sizeof(lv_obj_t *));
+        if(!page_dots) {
+            printf("[FM] Failed to restore page_dots after reader\n");
+            g_fm_cache_suspended = false;
+            return false;
+        }
+    }
+
     g_fm_cache_suspended = false;
-    refresh_file_list(current_path);
-    printf("[FM] Pagination cache restored after reader\n");
+    printf("[FM] Pagination cache restored after reader (%s)\n",
+           file_entries_in_dma ? "DMA" : "PSRAM");
     return true;
 }
 
@@ -898,13 +979,10 @@ static void create_page_indicator(void)
 static void update_page_indicator(void)
 {
     if (!page_indicator || !page_dots) return;
-    
-    /* 删除旧的圆点 */
+
+    lv_obj_clean(page_indicator);
     for (int i = 0; i < 5; i++) {
-        if (page_dots[i]) {
-            lv_obj_del(page_dots[i]);
-            page_dots[i] = NULL;
-        }
+        page_dots[i] = NULL;
     }
     
     if (total_pages <= 0) return;
@@ -1326,6 +1404,33 @@ static int ensure_reader_font_loaded(void)
 #endif
 }
 
+static void release_reader_fonts(void)
+{
+#if LV_USE_TINY_TTF
+    printf("[FONT] Releasing reader TTF fonts, FM back to built-in misans\n");
+    if (custom_ttf_font_h1 != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font_h1);
+        custom_ttf_font_h1 = NULL;
+    }
+    if (custom_ttf_font_h2 != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font_h2);
+        custom_ttf_font_h2 = NULL;
+    }
+    if (custom_ttf_font_h3 != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font_h3);
+        custom_ttf_font_h3 = NULL;
+    }
+    if (custom_ttf_font != NULL) {
+        lv_tiny_ttf_destroy(custom_ttf_font);
+        custom_ttf_font = NULL;
+    }
+    lv_tiny_ttf_release_reader_cache();
+    ttf_load_attempted = false;
+    font_priority_loader_set_font(NULL);
+    print_memory_stats_internal("after_release_reader_fonts");
+#endif
+}
+
 static void open_epub_viewer(const char *filepath)
 {
     printf("[FM] Opening EPUB: %s\n", filepath);
@@ -1477,50 +1582,68 @@ void file_manager_close(void)
  *   显示文件管理器（从EPUB返回时调用）
  *====================*/
 
-void file_manager_show(void)
+static void file_manager_show_async(void *user_data)
 {
+    (void)user_data;
+
     printf("[FM] Showing File Manager (return from EPUB)...\n");
-    
+
     if (!fm_screen) {
         printf("[FM] fm_screen is NULL, cannot show\n");
+        g_fm_show_pending = 0;
+        epd_resume_refresh();
         return;
     }
-    
-    /* 【重要修复】从EPUB返回时正确销毁资源，释放PSRAM内存 */
-    if (g_epub_viewer) {
-        printf("[FM] Destroying EPUB viewer (return from EPUB)\n");
-        /* 先置NULL防止close_cb递归调用file_manager_show */
-        EpubViewer *v = g_epub_viewer;
-        g_epub_viewer = NULL;
-        g_epub_reader = NULL;  /* 防止epub_viewer_close中的回调访问已释放的reader */
+
+    g_rendering_in_progress = 0;
+
+    EpubViewer *v = g_epub_viewer;
+    EpubReader *r = g_epub_reader;
+    g_epub_viewer = NULL;
+    g_epub_reader = NULL;
+
+    /* 先切回 FM 屏幕，避免 EPD 刷新仍显示 EPUB */
+    lv_disp_load_scr(fm_screen);
+
+    if (v) {
+        epub_viewer_set_close_cb(v, NULL);
         epub_viewer_destroy(v);
     }
-    if (g_epub_reader) {
+    if (r) {
         printf("[FM] Destroying EPUB reader (return from EPUB)\n");
-        EpubReader *r = g_epub_reader;
-        g_epub_reader = NULL;
         epub_reader_destroy(r);
     }
 
+    release_reader_fonts();
     fm_resume_after_reader();
-    
-    /* 重新加载文件管理器屏幕 */
-    lv_disp_load_scr(fm_screen);
-    
-    /* 强制重新计算布局和刷新文件列表 - 确保显示一致性 */
+    touch_register_swipe_callback(swipe_handler);
+
     refresh_file_list(current_path);
-    
-    /* 强制重新布局 - 解决显示行数不一致问题 */
+
     lv_obj_update_layout(fm_screen);
     if (fm_list) {
         lv_obj_update_layout(fm_list);
     }
-    
-    /* 不手动调用epd_mark_refresh_pending()，让LVGL完成渲染后由flush_cb自动触发刷新 */
-    /* 强制触发LVGL渲染，确保新界面被渲染到帧缓冲区 */
+
     lv_refr_now(NULL);
-    
+    epd_resume_refresh();
+    epd_mark_refresh_pending();
+
     printf("[FM] File Manager shown\n");
+    g_fm_show_pending = 0;
+}
+
+void file_manager_show(void)
+{
+    if (g_fm_show_pending) {
+        return;
+    }
+    g_fm_show_pending = 1;
+    epd_pause_refresh();
+
+    if (lv_async_call(file_manager_show_async, NULL) != LV_RES_OK) {
+        file_manager_show_async(NULL);
+    }
 }
 
 /*====================

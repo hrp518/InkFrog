@@ -1147,7 +1147,9 @@ void epub_viewer_close(EpubViewer *viewer) {
     viewer->progress_bar = NULL;
     viewer->progress_bg = NULL;
     viewer->toolbar = NULL;
-    if (viewer->close_cb) viewer->close_cb();
+    epub_close_callback_t cb = viewer->close_cb;
+    viewer->close_cb = NULL;
+    if (cb) cb();
 }
 
 void epub_viewer_destroy(EpubViewer *viewer) {
