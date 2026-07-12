@@ -31,6 +31,7 @@
 #include "settings_storage.h"
 #include "font_priority_loader.h"
 #include "wifi_controller.h"
+#include "http_server.h"
 #include "kernel/os/os.h"
 
 extern void main_ui_create(void);
@@ -68,6 +69,7 @@ static lv_obj_t *page_indicator = NULL;   /* 页码指示器容器 */
 static lv_obj_t **page_dots = NULL;       /* 页码圆点数组 */
 static lv_obj_t *prev_page_btn = NULL;    /* 上一页按钮 */
 static lv_obj_t *next_page_btn = NULL;    /* 下一页按钮 */
+static bool g_fm_cache_suspended = false; /* 开书前释放 file_entries 以腾 psram_heap */
 
 /*====================
  *   字体懒加载变量
@@ -109,6 +111,9 @@ void file_manager_close(void);
 
 static void init_pagination(void);
 static void deinit_pagination(void);
+static void fm_suspend_for_reader(void);
+static bool fm_resume_after_reader(void);
+static void reader_stop_http_if_running(void);
 static void load_file_entries(const char *dir_path);
 static void display_current_page(void);
 static void create_page_indicator(void);
@@ -649,6 +654,47 @@ static void deinit_pagination(void)
     total_file_count = 0;
     current_page = 0;
     total_pages = 0;
+}
+
+static void reader_stop_http_if_running(void)
+{
+    if(http_server_is_running()) {
+        printf("[FM] Stopping HTTP server before reader font preload (free DMA for font meta)\n");
+        http_server_stop();
+        g_wifi.http_running = 0;
+        wifi_controller_set_http_running(0);
+    }
+}
+
+static void fm_suspend_for_reader(void)
+{
+    if(g_fm_cache_suspended) {
+        return;
+    }
+    if(file_entries != NULL) {
+        deinit_pagination();
+        printf("[FM] Suspended pagination cache (~%u bytes psram_heap) for reader\n",
+               (unsigned)(MAX_FILE_ENTRIES * sizeof(FileEntry)));
+    }
+    g_fm_cache_suspended = true;
+    print_memory_stats_internal("after_fm_suspend");
+}
+
+static bool fm_resume_after_reader(void)
+{
+    if(!g_fm_cache_suspended) {
+        return true;
+    }
+    init_pagination();
+    if(file_entries == NULL) {
+        printf("[FM] Failed to restore pagination cache after reader\n");
+        g_fm_cache_suspended = false;
+        return false;
+    }
+    g_fm_cache_suspended = false;
+    refresh_file_list(current_path);
+    printf("[FM] Pagination cache restored after reader\n");
+    return true;
 }
 
 /**
@@ -1309,18 +1355,21 @@ static void open_epub_viewer(const char *filepath)
         g_epub_reader = NULL;
     }
 
-    /* TTF Level1 glyf 预加载需要 ~1.6MB 连续 psram；先加载字体再开 EPUB，避免 zip 元数据占用堆 */
+    /* 腾 psram_heap / DMA：停 HTTP、释放 FM 文件列表，再 L1 预加载 */
+    reader_stop_http_if_running();
+    fm_suspend_for_reader();
+
     file_manager_print_memory_stats("before_prepare_reader_fonts");
     file_manager_prepare_reader_fonts();
     file_manager_print_memory_stats("after_prepare_reader_fonts");
     
-    /* EPUB 元数据解析完毕，释放 DMA bump 区，给后续章节解压腾空间 */
     extern void epub_buffer_reset(void);
     epub_buffer_reset();
 
     g_epub_reader = epub_reader_create();
     if (!g_epub_reader) {
         printf("[FM] Failed to create EPUB reader\n");
+        fm_resume_after_reader();
         return;
     }
     
@@ -1328,6 +1377,7 @@ static void open_epub_viewer(const char *filepath)
         printf("[FM] Failed to open EPUB file\n");
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
+        fm_resume_after_reader();
         return;
     }
 
@@ -1344,6 +1394,7 @@ static void open_epub_viewer(const char *filepath)
         printf("[FM] Failed to create EPUB viewer\n");
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
+        fm_resume_after_reader();
         return;
     }
     
@@ -1404,6 +1455,7 @@ void file_manager_close(void)
     prev_page_btn = NULL;
     next_page_btn = NULL;
     deinit_pagination();
+    g_fm_cache_suspended = false;
     
     /* 【关键修复】使用 lv_obj_clean 清空 fm_screen 内容，而不是删除它
      * 避免删除屏幕后 lv_scr_act() 返回无效指针导致卡死
@@ -1449,6 +1501,8 @@ void file_manager_show(void)
         g_epub_reader = NULL;
         epub_reader_destroy(r);
     }
+
+    fm_resume_after_reader();
     
     /* 重新加载文件管理器屏幕 */
     lv_disp_load_scr(fm_screen);

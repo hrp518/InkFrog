@@ -44,6 +44,26 @@ static void ttf_scratch_free(void * p, int is_dma, size_t size)
     (void)size;
 }
 
+/* 持久字体元数据：优先 DMA heap，失败再 psram_heap（glyf 大块仍只用 psram） */
+static void * ttf_meta_alloc(size_t size, int * is_dma)
+{
+    void * p = _dma_malloc(size, DMAHEAP_PSRAM);
+    if(p) {
+        if(is_dma) *is_dma = 1;
+        return p;
+    }
+    p = psram_malloc(size);
+    if(p && is_dma) *is_dma = 0;
+    return p;
+}
+
+static void ttf_meta_free(void * p, int is_dma)
+{
+    if(!p) return;
+    if(is_dma) _dma_free(p, DMAHEAP_PSRAM);
+    else psram_free(p);
+}
+
 #define CJK_METRICS_START 0x4E00u
 #define CJK_METRICS_END   0x9FFFu
 #define CJK_METRICS_COUNT (CJK_METRICS_END - CJK_METRICS_START + 1u)
@@ -58,6 +78,8 @@ static void ttf_scratch_free(void * p, int is_dma, size_t size)
 #define TTF_GLYF_PSRAM_RESERVE   (48 * 1024)
 /* head/hhea/os2/glyf_lookup 等零碎常驻开销 */
 #define TTF_SMALL_TABLES_SLACK   (16 * 1024)
+/* 全量 L1 尝试后留给 psram_heap 的余量（loca 等已 alloc 后不再重复扣 pinned） */
+#define TTF_GLYF_POST_RESERVE    (96 * 1024)
 
 static int g_metrics_cache_is_dma = 0;
 static int g_ascii_metrics_cache_is_dma = 0;
@@ -260,7 +282,7 @@ static int ttf_ensure_metrics_cache(ttf_font_desc_t * dsc)
     } else if(!dsc->metrics_cache) {
         int is_dma = 0;
         size_t sz = CJK_METRICS_COUNT * sizeof(ttf_metrics_entry_t);
-        dsc->metrics_cache = (ttf_metrics_entry_t *)ttf_scratch_alloc(sz, &is_dma);
+        dsc->metrics_cache = (ttf_metrics_entry_t *)ttf_meta_alloc(sz, &is_dma);
         if(!dsc->metrics_cache) return -1;
         g_metrics_cache_is_dma = is_dma;
         memset(dsc->metrics_cache, 0, sz);
@@ -272,7 +294,7 @@ static int ttf_ensure_metrics_cache(ttf_font_desc_t * dsc)
     } else if(!dsc->ascii_metrics_cache) {
         int is_dma = 0;
         size_t sz = ASCII_METRICS_COUNT * sizeof(ttf_metrics_entry_t);
-        dsc->ascii_metrics_cache = (ttf_metrics_entry_t *)ttf_scratch_alloc(sz, &is_dma);
+        dsc->ascii_metrics_cache = (ttf_metrics_entry_t *)ttf_meta_alloc(sz, &is_dma);
         if(!dsc->ascii_metrics_cache) return -1;
         g_ascii_metrics_cache_is_dma = is_dma;
         memset(dsc->ascii_metrics_cache, 0, sz);
@@ -287,15 +309,21 @@ static void ttf_free_level1_glyphs(level1_glyph_info_t * glyphs)
     else psram_free(glyphs);
 }
 
-/* pinned_tables: 已决定常驻的 loca+hmtx+cmap 等，glyf 预算必须让出这部分 */
-static uint32_t ttf_glyf_psram_budget(uint32_t pinned_tables_bytes)
+/* 全量 L1：free 已反映 loca 等已分配对象，只留 post reserve */
+static uint32_t ttf_glyf_psram_budget_full(void)
 {
     size_t free_bytes = psram_GetFreeHeapSize();
-    uint32_t reserve = TTF_GLYF_PSRAM_RESERVE + pinned_tables_bytes + TTF_SMALL_TABLES_SLACK;
+    if(free_bytes <= TTF_GLYF_POST_RESERVE) return 0;
+    return (uint32_t)(free_bytes - TTF_GLYF_POST_RESERVE);
+}
+
+/* 部分 L1 fallback：仍为尚未分配的 hmtx/cmap 预留，并保留 85% 安全系数 */
+static uint32_t ttf_glyf_psram_budget_partial(uint32_t pending_pin_bytes)
+{
+    size_t free_bytes = psram_GetFreeHeapSize();
+    uint32_t reserve = TTF_GLYF_PSRAM_RESERVE + pending_pin_bytes + TTF_SMALL_TABLES_SLACK;
     if(free_bytes <= reserve) return 0;
-    /* 只用空闲的 85%，避免碎片导致「总量够但 malloc 失败」 */
-    size_t usable = (free_bytes - reserve) * 85 / 100;
-    return (uint32_t)usable;
+    return (uint32_t)((free_bytes - reserve) * 85 / 100);
 }
 
 /* 小表常驻 PSRAM：宁可裁 glyf 字数，也不释放 loca/hmtx/cmap */
@@ -362,16 +390,16 @@ static void ttf_sort_glyphs_for_budget(level1_glyph_info_t * glyphs, uint16_t co
 
 static uint16_t ttf_trim_glyphs_to_budget(level1_glyph_info_t * glyphs, uint16_t count,
                                           uint32_t * inout_total, uint16_t * inout_valid,
-                                          uint32_t pinned_tables_bytes)
+                                          uint32_t pending_pin_bytes)
 {
-    uint32_t budget = ttf_glyf_psram_budget(pinned_tables_bytes);
+    uint32_t budget = ttf_glyf_psram_budget_partial(pending_pin_bytes);
     uint32_t total = *inout_total;
     uint16_t valid = *inout_valid;
 
     if(total <= budget) return valid;
 
-    printf("[TTF] glyf need %lu bytes > budget %lu (pinned_tables=%lu), trimming glyf by priority...\n",
-           (unsigned long)total, (unsigned long)budget, (unsigned long)pinned_tables_bytes);
+    printf("[TTF] glyf need %lu bytes > partial budget %lu (pending_pin=%lu), trimming by priority...\n",
+           (unsigned long)total, (unsigned long)budget, (unsigned long)pending_pin_bytes);
 
     total = 0;
     valid = 0;
@@ -1086,41 +1114,72 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
 
     uint32_t hmtx_sz = 0, hmtx_off_dummy = 0;
     ttf_find_table(dsc, "hmtx", &hmtx_off_dummy, &hmtx_sz);
-    uint32_t pinned_tables = loca_size + hmtx_sz + dsc->table_cache.cmap.size;
-    printf("[TTF] pinned tables reserve: loca=%lu hmtx=%lu cmap=%lu total=%lu (glyf trims around this)\n",
+    uint32_t pending_pin = hmtx_sz + dsc->table_cache.cmap.size;
+    printf("[TTF] pinned tables: loca=%lu hmtx=%lu cmap=%lu (pending_pin=%lu for partial trim)\n",
            (unsigned long)loca_size, (unsigned long)hmtx_sz,
-           (unsigned long)dsc->table_cache.cmap.size, (unsigned long)pinned_tables);
+           (unsigned long)dsc->table_cache.cmap.size, (unsigned long)pending_pin);
 
-    ttf_sort_glyphs_for_budget(glyphs, count);
-    ttf_trim_glyphs_to_budget(glyphs, count, &total_glyf_size, &valid_count, pinned_tables);
-    if(valid_count == 0 || total_glyf_size == 0) {
-        printf("[TTF_DBG] batch: no glyf fits in psram budget\n");
-        return -1;
-    }
+    uint32_t full_glyf_size = total_glyf_size;
+    uint16_t full_valid = valid_count;
+    uint8_t l1_partial = 0;
 
-    printf("[TTF_DBG] batch: psram_heap free before glyf=%lu need=%lu\n",
-           (unsigned long)psram_GetFreeHeapSize(), (unsigned long)total_glyf_size);
+    printf("[TTF] L1 FULL try: glyphs=%u bytes=%lu free=%lu full_budget=%lu\n",
+           (unsigned)full_valid, (unsigned long)full_glyf_size,
+           (unsigned long)psram_GetFreeHeapSize(), (unsigned long)ttf_glyf_psram_budget_full());
 
-    uint8_t *glyf_data = psram_malloc(total_glyf_size);
-    while(!glyf_data && valid_count > 0) {
-        /* malloc 失败时再按列表顺序去掉最后一个 cached 字 */
-        for(int ri = (int)count - 1; ri >= 0; ri--) {
-            if(glyphs[ri].cached) {
-                total_glyf_size -= glyphs[ri].glyf_size;
-                glyphs[ri].cached = 0;
-                valid_count--;
-                printf("[TTF_DBG] batch: shrink glyf to %u glyphs / %lu bytes\n",
-                       (unsigned)valid_count, (unsigned long)total_glyf_size);
-                break;
-            }
-        }
-        if(valid_count == 0 || total_glyf_size == 0) break;
-        glyf_data = psram_malloc(total_glyf_size);
-    }
+    uint8_t *glyf_data = psram_malloc(full_glyf_size);
     if(!glyf_data) {
-        printf("[TTF_DBG] batch: psram_malloc(glyf %lu) failed, free=%lu (likely fragmented)\n",
-               (unsigned long)total_glyf_size, (unsigned long)psram_GetFreeHeapSize());
-        return -1;
+        glyf_data = psram_malloc(full_glyf_size);
+    }
+
+    if(glyf_data) {
+        total_glyf_size = full_glyf_size;
+        valid_count = full_valid;
+        printf("[TTF] L1 mode=FULL (%u glyphs, %lu bytes)\n",
+               (unsigned)valid_count, (unsigned long)total_glyf_size);
+    } else {
+        l1_partial = 1;
+        printf("[TTF] L1 FULL miss (malloc %lu), fallback PARTIAL trim...\n",
+               (unsigned long)full_glyf_size);
+        ttf_sort_glyphs_for_budget(glyphs, count);
+        total_glyf_size = full_glyf_size;
+        valid_count = full_valid;
+        ttf_trim_glyphs_to_budget(glyphs, count, &total_glyf_size, &valid_count, pending_pin);
+        if(valid_count == 0 || total_glyf_size == 0) {
+            printf("[TTF_DBG] batch: no glyf fits in psram budget\n");
+            return -1;
+        }
+
+        printf("[TTF_DBG] batch: psram_heap free before glyf=%lu need=%lu\n",
+               (unsigned long)psram_GetFreeHeapSize(), (unsigned long)total_glyf_size);
+
+        glyf_data = psram_malloc(total_glyf_size);
+        while(!glyf_data && valid_count > 0) {
+            for(int ri = (int)count - 1; ri >= 0; ri--) {
+                if(glyphs[ri].cached) {
+                    total_glyf_size -= glyphs[ri].glyf_size;
+                    glyphs[ri].cached = 0;
+                    valid_count--;
+                    printf("[TTF_DBG] batch: shrink glyf to %u glyphs / %lu bytes\n",
+                           (unsigned)valid_count, (unsigned long)total_glyf_size);
+                    break;
+                }
+            }
+            if(valid_count == 0 || total_glyf_size == 0) break;
+            glyf_data = psram_malloc(total_glyf_size);
+        }
+        if(!glyf_data) {
+            printf("[TTF_DBG] batch: psram_malloc(glyf %lu) failed, free=%lu (likely fragmented)\n",
+                   (unsigned long)total_glyf_size, (unsigned long)psram_GetFreeHeapSize());
+            return -1;
+        }
+        printf("[TTF] L1 mode=PARTIAL (%u/%u glyphs, %lu bytes)\n",
+               (unsigned)valid_count, (unsigned)full_valid, (unsigned long)total_glyf_size);
+    }
+
+    if(!l1_partial) {
+        printf("[TTF_DBG] batch: psram_heap free before glyf=%lu need=%lu\n",
+               (unsigned long)psram_GetFreeHeapSize(), (unsigned long)total_glyf_size);
     }
     
     // 构建排序数组，按文件偏移排序以合并相邻读取
@@ -1209,13 +1268,12 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     
     // 构建glyf查找表（全局共享，用于二分查找）
     if(g_glyf_lookup) {
-        ttf_scratch_free(g_glyf_lookup, g_glyf_lookup_is_dma,
-                         (size_t)g_glyf_lookup_count * sizeof(glyf_cache_entry_t));
+        ttf_meta_free(g_glyf_lookup, g_glyf_lookup_is_dma);
         g_glyf_lookup = NULL;
     }
     {
         int lk_dma = 0;
-        g_glyf_lookup = (glyf_cache_entry_t *)ttf_scratch_alloc(
+        g_glyf_lookup = (glyf_cache_entry_t *)ttf_meta_alloc(
             valid_count * sizeof(glyf_cache_entry_t), &lk_dma);
         g_glyf_lookup_is_dma = lk_dma;
     }
@@ -1245,6 +1303,25 @@ static int batch_read_glyf_data(ttf_font_desc_t *dsc,
     *out_data = glyf_data;
     *out_size = total_glyf_size;
     return 1;
+}
+
+static void ttf_verify_level1_glyphs(const level1_glyph_info_t * glyphs, uint16_t count)
+{
+    uint16_t need_glyf = 0;
+    uint16_t empty_glyf = 0;
+    uint16_t uncached = 0;
+
+    for(uint16_t i = 0; i < count; i++) {
+        if(glyphs[i].glyph_index == 0) continue;
+        if(glyphs[i].glyf_size == 0) {
+            empty_glyf++;
+            continue;
+        }
+        need_glyf++;
+        if(!glyphs[i].cached) uncached++;
+    }
+    printf("[TTF_VERIFY] listed=%u need_glyf=%u empty=%u uncached=%u\n",
+           (unsigned)count, (unsigned)need_glyf, (unsigned)empty_glyf, (unsigned)uncached);
 }
 
 static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_list, uint16_t count)
@@ -1309,13 +1386,8 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
         return -1;
     }
 
-    level1_glyph_info_t *glyphs_keep = (level1_glyph_info_t *)_dma_malloc(
-        count * sizeof(level1_glyph_info_t), DMAHEAP_PSRAM);
-    g_level1_glyphs_is_dma = 1;
-    if(!glyphs_keep) {
-        glyphs_keep = (level1_glyph_info_t *)psram_malloc(count * sizeof(level1_glyph_info_t));
-        g_level1_glyphs_is_dma = 0;
-    }
+    level1_glyph_info_t *glyphs_keep = (level1_glyph_info_t *)ttf_meta_alloc(
+        count * sizeof(level1_glyph_info_t), &g_level1_glyphs_is_dma);
     if(!glyphs_keep) {
         printf("[TTF] Failed to allocate persistent glyph info (%u bytes)\n",
                (unsigned)(count * sizeof(level1_glyph_info_t)));
@@ -1550,6 +1622,7 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
            dsc->table_cache.hmtx.size, dsc->table_cache.glyf.size);
     printf("[TTF] L1 preload result: %u/%u glyphs cached in psram (%lu bytes glyf)\n",
            (unsigned)cached_glyphs, (unsigned)count, (unsigned long)glyf_size);
+    ttf_verify_level1_glyphs(glyphs, count);
     return (int)cached_glyphs;
 }
 
@@ -2257,13 +2330,13 @@ void lv_tiny_ttf_destroy(lv_font_t * font)
              * Only detach pointers so the new font can reuse them. */
             if(dsc->metrics_cache) {
                 if(dsc->metrics_cache != g_shared_metrics_cache) {
-                    psram_free(dsc->metrics_cache);
+                    ttf_meta_free(dsc->metrics_cache, g_metrics_cache_is_dma);
                 }
                 dsc->metrics_cache = NULL;
             }
             if(dsc->ascii_metrics_cache) {
                 if(dsc->ascii_metrics_cache != g_shared_ascii_metrics_cache) {
-                    psram_free(dsc->ascii_metrics_cache);
+                    ttf_meta_free(dsc->ascii_metrics_cache, g_ascii_metrics_cache_is_dma);
                 }
                 dsc->ascii_metrics_cache = NULL;
             }
