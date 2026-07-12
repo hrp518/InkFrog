@@ -56,6 +56,10 @@ extern struct mmc_card *mmc_scan_init(uint16_t sd_id, uint16_t sdc_id, void *car
 /* 显示刷新任务周期 (ms) - 优化二：提高响应速度 */
 #define DISP_TASK_PERIOD     20
 
+/* 线程栈 — 全部从 SRAM 堆分配，须控制总量（堆约 95KB） */
+#define DISP_TASK_STACK_SIZE   (8 * 1024)
+#define LVGL_TASK_STACK_SIZE   (32 * 1024)
+
 /* LVGL线程句柄 - 用于刷新时挂起LVGL任务防止SPI冲突 */
 OS_Thread_t lvgl_thread;
 static OS_Thread_t disp_task_thread;
@@ -1230,6 +1234,14 @@ int main(void)
     
     /* 初始化设置模块（从INI加载字体选择等） */
     settings_screen_init();
+
+    /* HTTP / WiFi 工作线程须在 font warm 前预创建（warm 后 SRAM 堆几乎用尽） */
+    http_server_init(HTTP_SERVER_PORT);
+    if (http_server_reserve_thread() != 0) {
+        printf("[HTTP] WARNING: failed to reserve worker thread at boot\r\n");
+    }
+    wifi_controller_init();
+    wifi_controller_start();
     
     /* 创建主界面UI - 先显示UI，WiFi后台连接 */
     main_ui_create();
@@ -1241,24 +1253,25 @@ int main(void)
     printf("[INFO] WiFi connecting in background...\r\n\r\n");
 
     /* UI创建完毕，启动后台任务 */
-    printf("[Display] create disp_task stack=%d\r\n", 8192);
+    printf("[Display] create disp_task stack=%d lvgl stack=%d\r\n",
+           DISP_TASK_STACK_SIZE, LVGL_TASK_STACK_SIZE);
     print_heap_info();
     psram_heap_info();
     dma_heap_info();
     if (OS_ThreadCreate(&disp_task_thread, "disp_task", disp_task, NULL,
-                        OS_PRIORITY_NORMAL, 8192) != 0) {
+                        OS_PRIORITY_NORMAL, DISP_TASK_STACK_SIZE) != 0) {
         printf("[ERROR] Failed to create disp_task\r\n");
     }
+    print_heap_info();
     if (OS_ThreadCreate(&lvgl_thread, "lvgl_task", lvgl_task, NULL,
-                        OS_PRIORITY_NORMAL, 32768) != 0) {
+                        OS_PRIORITY_NORMAL, LVGL_TASK_STACK_SIZE) != 0) {
         printf("[ERROR] Failed to create lvgl_task\r\n");
     }
+    print_heap_info();
 
-    /* 启动 WiFi 状态机 (取代原来的 wifi_connect_task) */
-    printf("[WiFi] Initializing WiFi controller\r\n");
-    wifi_controller_init();
+    /* WiFi 状态机已在 font warm 前启动 */
+    printf("[WiFi] WiFi controller already started at boot\r\n");
     wifi_controller_register_cb(on_wifi_phase_change, NULL);
-    wifi_controller_start();
 
     // 初始化完成，恢复EPD刷新
     epd_resume_refresh();

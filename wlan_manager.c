@@ -18,6 +18,7 @@
 #include "lwip/netif.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "sys/sys_heap.h"
 
 /* 调试开关 */
 #define WLAN_DEBUG 1
@@ -367,7 +368,7 @@ int wlan_manager_scan(WLAN_ScanResult_t *results, int max_count)
     }
     
     /* 分配内存存放扫描结果 */
-    ap_list = (wlan_sta_ap_t *)malloc(num * sizeof(wlan_sta_ap_t));
+    ap_list = (wlan_sta_ap_t *)psram_malloc(num * sizeof(wlan_sta_ap_t));
     if (!ap_list) {
         WLAN_LOG("Failed to allocate scan results");
         return -1;
@@ -381,7 +382,7 @@ int wlan_manager_scan(WLAN_ScanResult_t *results, int max_count)
     ret = wlan_sta_scan_result(&scan_results);
     if (ret != 0) {
         WLAN_LOG("Failed to get scan results: %d", ret);
-        free(ap_list);
+        psram_free(ap_list);
         return -1;
     }
     
@@ -423,7 +424,7 @@ int wlan_manager_scan(WLAN_ScanResult_t *results, int max_count)
         continue;
     }
 
-    free(ap_list);
+    psram_free(ap_list);
     WLAN_LOG("Scan complete, %d results", out);
     return out;
 }
@@ -468,7 +469,7 @@ static void scan_async_task(void *arg)
     WLAN_LOG("[ASYNC_SCAN] Starting background scan...");
     
     /* 分配扫描结果缓冲区 */
-    WLAN_ScanResult_t *results = (WLAN_ScanResult_t *)malloc(
+    WLAN_ScanResult_t *results = (WLAN_ScanResult_t *)psram_malloc(
         WLAN_MAX_SCAN_RESULTS * sizeof(WLAN_ScanResult_t));
     if (!results) {
         WLAN_LOG("[ASYNC_SCAN] Failed to allocate results");
@@ -503,7 +504,7 @@ void wlan_manager_scan_async(WLAN_ScanDoneCb_t cb, void *user_data)
 
     if (cb == NULL) return;
 
-    ScanAsyncCtx_t *ctx = (ScanAsyncCtx_t *)malloc(sizeof(ScanAsyncCtx_t));
+    ScanAsyncCtx_t *ctx = (ScanAsyncCtx_t *)psram_malloc(sizeof(ScanAsyncCtx_t));
     if (!ctx) {
         WLAN_LOG("[ASYNC_SCAN] Failed to allocate context");
         return;
@@ -571,7 +572,7 @@ void wlan_manager_connect_async(const char *ssid, const char *passwd,
 {
     if (ssid == NULL || cb == NULL) return;
     
-    ConnectAsyncCtx_t *ctx = (ConnectAsyncCtx_t *)malloc(sizeof(ConnectAsyncCtx_t));
+    ConnectAsyncCtx_t *ctx = (ConnectAsyncCtx_t *)psram_malloc(sizeof(ConnectAsyncCtx_t));
     if (!ctx) {
         WLAN_LOG("[ASYNC_CONNECT] Failed to allocate context");
         return;
@@ -620,7 +621,7 @@ void wlan_manager_poll(void)
             ctx->cb(ctx->count, ctx->results, ctx->user_data);
         }
         if (ctx) {
-            free(ctx);
+            psram_free(ctx);
         }
     }
     
@@ -634,7 +635,7 @@ void wlan_manager_poll(void)
             ctx->cb(ctx->success, ctx->user_data);
         }
         if (ctx) {
-            free(ctx);
+            psram_free(ctx);
         }
     }
 }

@@ -218,7 +218,8 @@
       out[o + 2] = (v >> 16) & 0xff; out[o + 3] = (v >> 24) & 0xff;
     }
     function w16(o, v) {
-      out[o] = (v >> 8) & 0xff; out[o + 1] = v & 0xff;
+      out[o] = v & 0xff;
+      out[o + 1] = (v >> 8) & 0xff;
     }
 
     w32(0, L1GLYF_MAGIC);

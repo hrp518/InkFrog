@@ -32,6 +32,12 @@ typedef struct {
 int http_server_init(int port);
 
 /*
+ * 开机预创建工作线程（须在 font warm 之前调用，避免 SRAM 堆耗尽）
+ * @return 0成功, 其他失败
+ */
+int http_server_reserve_thread(void);
+
+/*
  * 启动HTTP服务器
  * @return 0成功, 其他失败
  */

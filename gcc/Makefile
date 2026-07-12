@@ -54,6 +54,11 @@ DIRS += $(PRJ_BOARD)
 
 SRCS := $(basename $(foreach dir,$(DIRS),$(wildcard $(dir)/*.[csS])))
 
+# Browser L1 glyf JS blob (Flash .rodata, zero runtime RAM)
+GEN_L1GLYF_JS := $(PRJ_ROOT_PATH)/http_l1glyf_js.c
+$(GEN_L1GLYF_JS): $(PRJ_ROOT_PATH)/web/l1glyf_builder.js $(PRJ_ROOT_PATH)/level1_data.c $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py
+	@python $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py 2>/dev/null || py -3 $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py
+
 OBJS := $(addsuffix .o,$(SRCS))
 
 # extra libraries searching path
@@ -79,7 +84,7 @@ include $(PRJ_MAKE_RULES)
 # ----------------------------------------------------------------------------
 # 覆盖project.mk中的链接规则，使用响应文件
 # ----------------------------------------------------------------------------
-$(PROJECT).$(ELF_EXT): $(OBJS) $(RESPONSE_FILE)
+$(PROJECT).$(ELF_EXT): $(GEN_L1GLYF_JS) $(OBJS) $(RESPONSE_FILE)
 	@echo "Linking $@..."
 ifeq ($(__CONFIG_ROM), y)
 	$(Q)$(CC) -E -P -CC $(CC_SYMBOLS) -o $(ROM_SYMBOL_NAME) - < $(ROM_SYMBOL_FILE)

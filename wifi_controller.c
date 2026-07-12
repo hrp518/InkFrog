@@ -378,6 +378,9 @@ void wifi_controller_init(void)
 
 void wifi_controller_start(void)
 {
+    if (OS_ThreadIsValid(&g_wc_thread)) {
+        return;
+    }
     if (OS_ThreadCreate(&g_wc_thread, "wifi_ctrl", wc_task, NULL,
                         OS_PRIORITY_NORMAL, 4096) != 0) {
         WC_LOG("Failed to create controller thread");

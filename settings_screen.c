@@ -23,6 +23,7 @@
 #include "lv_port_disp.h"  /* for epd_mark_refresh_pending */
 #include "fs/fatfs/ff.h"
 #include "kernel/os/os.h"
+#include "sys/sys_heap.h"
 
 #define SS_DBG 1
 #if SS_DBG
@@ -206,7 +207,7 @@ static void wifi_back_cb(lv_event_t *e)
     g_wifi_connecting_hint[0] = '\0';
     /* 释放旧的扫描结果 */
     if (g_scan_results) {
-        free(g_scan_results);
+        psram_free(g_scan_results);
         g_scan_results = NULL;
     }
     settings_screen_rebuild_main();
@@ -467,13 +468,13 @@ static void wifi_scan_done_cb(int count, WLAN_ScanResult_t *results, void *user_
 
     /* 如果用户已经离开了WiFi界面，释放 results 避免泄漏 */
     if (!g_wifi_list_cont) {
-        if (results) free(results);
+        if (results) psram_free(results);
         return;
     }
 
     /* 释放旧结果 */
     if (g_scan_results) {
-        free(g_scan_results);
+        psram_free(g_scan_results);
     }
     g_scan_results = results;
     g_scan_count = count;

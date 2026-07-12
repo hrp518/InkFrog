@@ -49,7 +49,7 @@ static lv_obj_t *fm_list = NULL;
 static lv_obj_t *path_label = NULL;
 static lv_obj_t *viewer_screen = NULL;
 static lv_obj_t *viewer_textarea = NULL;
-static char selected_filepath[512] = {0};
+static char selected_filepath[512] __attribute__((section(".psram_bss")));
 
 /*====================
  *    分页相关变量
@@ -384,7 +384,7 @@ static void action_btn_cb(lv_event_t *e)
 static lv_obj_t *rename_screen = NULL;
 static lv_obj_t *rename_ta = NULL;
 static lv_obj_t *rename_kb = NULL;
-static char rename_old_path[512] = {0};
+static char rename_old_path[512] __attribute__((section(".psram_bss")));
 
 /**
  * @brief 打印LVGL堆内存状态的Debug探针
@@ -1249,7 +1249,7 @@ static void open_text_viewer(const char *filepath)
     FRESULT res;
     FIL fp;
     UINT br;
-    static char text_content[2048];
+    static char text_content[2048] __attribute__((section(".psram_bss")));
     
     printf("[FONT] Attempting to open: '%s' (len=%d)\n", filepath, (int)strlen(filepath));
     res = f_open(&fp, filepath, FA_READ);

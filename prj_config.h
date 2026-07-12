@@ -73,8 +73,8 @@ extern "C" {
 /* sysinfo flash ID */
 #define PRJCONF_SYSINFO_FLASH           0
 
-/* sysinfo start address */
-#define PRJCONF_SYSINFO_ADDR            ((1024 - 4) * 1024)
+/* sysinfo start address — must be >= image max_size (1040K), after app area ends at 0x104000 */
+#define PRJCONF_SYSINFO_ADDR            (1040 * 1024)
 /* sysinfo size */
 #define PRJCONF_SYSINFO_SIZE            (4 * 1024)
 

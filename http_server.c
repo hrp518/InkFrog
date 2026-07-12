@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "http_server.h"
+#include "http_l1glyf_js.h"
 #include "screensaver.h"
 #include "epd.h"
 #include "fs/fatfs/ff.h"
@@ -30,7 +31,8 @@
 /* 常量定义 - 优化内存使用 */
 #define HTTP_BUF_SIZE 2048
 #define HTTP_MAX_PATH 256
-#define HTTP_RESPONSE_SIZE (32 * 1024)  /* 扩大到32KB，足以装下华丽的UI和长长的文件列表 */
+#define HTTP_RESPONSE_SIZE (16 * 1024)  /* PSRAM HTML 缓冲；文件列表过长时截断 */
+#define HTTP_THREAD_STACK_SIZE 4096     /* 开机预创建线程栈（SRAM），font warm 后无法再 alloc */
 
 /*
  * PSRAM接收缓冲区 - 用于大文件上传
@@ -46,8 +48,6 @@
 extern void *heap_calloc_trace(size_t nmemb, size_t size, const char *file, int line, const char *func);
 extern void heap_print_info(void);
 
-#define HTTP_LOG(fmt, ...) printf("[HTTP] " fmt "\r\n", ##__VA_ARGS__)
-
 /* 全局变量 */
 static OS_Thread_t g_http_thread;
 static volatile int g_http_running = 0;
@@ -56,6 +56,7 @@ static int g_server_sock = -1;           /* 服务器socket，用于stop时shutd
 static volatile int g_client_sock = -1;  /* 客户端socket，用于stop时shutdown中断recv */
 static char *g_http_buffer = NULL;       /* 接收缓冲区(PSRAM) */
 static char *g_http_response = NULL;     /* 响应缓冲区(PSRAM) */
+static volatile int g_http_serving = 0;  /* 1=正在 accept 服务中 */
 
 static int http_server_thread_active(void)
 {
@@ -190,42 +191,6 @@ static int generate_screensaver_html(char *html_buf, int buf_size)
     return len;
 }
 
-static int generate_l1glyf_tool_html(char * html_buf, int buf_size)
-{
-    return snprintf(html_buf, buf_size,
-        "<!DOCTYPE html><html><head><meta charset=\"UTF-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        "<title>L1 Glyf Cache</title>"
-        "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
-        ".box{max-width:720px;margin:0 auto;background:#fff;padding:16px;border-radius:8px}"
-        "a.btn{display:inline-block;margin:6px 0;padding:8px 12px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px}"
-        "input[type=file]{margin:8px 0}button{padding:8px 16px;background:#16a34a;color:#fff;border:0;border-radius:6px}"
-        ".note{background:#eef6ff;padding:10px;border-radius:6px;font-size:14px;line-height:1.5}"
-        "</style></head><body><div class=\"box\">"
-        "<h1>L1 Glyf 缓存工具</h1>"
-        "<p class=\"note\">缓存文件保存到 <code>0:/Font/.l1glyf/</code>（隐藏目录）。"
-        "设备开机会自动预热；开书时不再读 TTF glyf。</p>"
-        "<h3>1. 上传 .l1glyf</h3>"
-        "<input type=\"file\" id=\"lf\" accept=\".l1glyf\">"
-        "<br><button type=\"button\" id=\"up\">上传到 .l1glyf/</button>"
-        "<p id=\"st\"></p>"
-        "<h3>2. 浏览器生成（下一步）</h3>"
-        "<p class=\"note\">后续在此页用 JS 从 TTF 生成 LGF1；当前可用 PC 脚本 "
-        "<code>tools/build_l1glyf_cache.py</code> 生成后上传。</p>"
-        "<a class=\"btn\" href=\"/\">返回文件管理</a>"
-        "<a class=\"btn\" href=\"/?path=/Font\">Font 目录</a>"
-        "</div><script>"
-        "document.getElementById('up').onclick=function(){"
-        "var f=document.getElementById('lf').files[0];"
-        "if(!f){document.getElementById('st').textContent='请选择 .l1glyf';return;}"
-        "var fd=new FormData();fd.append('path','0:/Font/.l1glyf');fd.append('file',f,f.name);"
-        "document.getElementById('st').textContent='上传中...';"
-        "fetch('/upload',{method:'POST',body:fd}).then(function(r){return r.text();}).then(function(t){"
-        "document.getElementById('st').textContent='完成: '+t;}).catch(function(e){"
-        "document.getElementById('st').textContent='失败: '+e;});};"
-        "</script></body></html>");
-}
-
 static int handle_screensaver_upload_raw(int sock, const char *initial_data, int initial_len)
 {
     char *body;
@@ -344,6 +309,11 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
     int total_files = 0;
     int total_dirs = 0;
     char parent_path[HTTP_MAX_PATH] = {0};
+    int font_dir = (strcmp(dir_path, "/Font") == 0 || strcmp(dir_path, "0:/Font") == 0);
+    const char * script_tag = font_dir ? "<script src=\"/l1glyf.js\"></script>\n" : "";
+    const char * font_hint = font_dir
+        ? "<br><strong>Font:</strong> 选择 .ttf 后将自动：浏览器生成 .l1glyf → 上传缓存 → 上传字体（无需单独页面）。"
+        : "";
     
     /* 计算父目录路径 */
     if (strcmp(dir_path, "/") != 0) {
@@ -418,16 +388,17 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         ".btn-delete { background: #dc3545; color: white; }\n"
         ".btn-delete:hover { background: #c82333; }\n"
         "</style>\n"
+        "%s"
         "</head>\n"
         "<body>\n"
         "<div class=\"container\">\n"
         "<h1>📁 SD卡文件管理器</h1>\n"
         "<div class=\"info\">\n"
         "<strong>当前目录:</strong> %s<br>\n"
-        "<strong>说明:</strong> 点击文件夹名称进入目录。支持多文件上传，按顺序依次传输。<br>\n"
+        "<strong>说明:</strong> 点击文件夹名称进入目录。支持多文件上传，按顺序依次传输。"
+        "%s<br>\n"
         "<a href=\"/screensaver\" style=\"display:inline-block;margin-top:8px;padding:8px 12px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;\">🖼️ 打开屏保编辑器</a>\n"
-        "<a href=\"/l1glyf\" style=\"display:inline-block;margin-top:8px;margin-left:8px;padding:8px 12px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px;\">⚡ L1 Glyf 缓存</a>\n"
-        "</div>\n", dir_path);
+        "</div>\n", script_tag, dir_path, font_hint);
     
     /* 返回上级目录按钮 */
     if (strcmp(dir_path, "/") != 0) {
@@ -467,6 +438,11 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "        chip.innerHTML = file.name + ' (' + formatSize(file.size) + ')<span class=\"remove\" onclick=\"removeFile(' + index + ')\">x</span>';\n"
         "        display.appendChild(chip);\n"
         "    });\n"
+        "    var currentPath = document.querySelector('input[name=\"path\"]').value;\n"
+        "    if (!isUploading && isFontDir(currentPath) && selectedFiles.length > 0 &&\n"
+        "        selectedFiles.every(function(f){return isTtfFile(f.name);}) && window.L1GlyfBuilder) {\n"
+        "        setTimeout(startUpload, 80);\n"
+        "    }\n"
         "}\n"
         "function removeFile(index) {\n"
         "    selectedFiles.splice(index, 1);\n"
@@ -490,8 +466,29 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "        });\n"
         "}\n");
 
-    /* 3. 渲染 JS 脚本 - 上传控制逻辑 */
+    /* 3. 渲染 JS 脚本 - 上传控制逻辑（Font 目录 TTF 走 L1GlyfBuilder） */
     len += snprintf(html_buf + len, buf_size - len,
+        "function isFontDir(p){return p&&(p==='/Font'||p==='0:/Font');}\n"
+        "function isTtfFile(n){return/\\.ttf$/i.test(n);}\n"
+        "function setItemProgress(itemId,loaded,total){\n"
+        "    var percent=total?Math.round(loaded*100/total):0;\n"
+        "    var bar=document.getElementById(itemId+'-bar');\n"
+        "    var text=document.getElementById(itemId+'-text');\n"
+        "    if(bar){bar.style.width=percent+String.fromCharCode(37);bar.innerHTML=percent+String.fromCharCode(37);}\n"
+        "    if(text&&total)text.textContent=formatSize(loaded)+' / '+formatSize(total);}\n"
+        "function setItemStatus(itemId,cls,msg){\n"
+        "    var s=document.querySelector('#'+itemId+' .upload-item-status');\n"
+        "    if(s){s.className='upload-item-status '+cls;s.textContent=msg;}}\n"
+        "function uploadOneXHR(file,path,itemId,done){\n"
+        "    var fd=new FormData();fd.append('path',path);fd.append('file',file);\n"
+        "    var xhr=new XMLHttpRequest();\n"
+        "    xhr.upload.addEventListener('progress',function(e){\n"
+        "        if(e.lengthComputable)setItemProgress(itemId,e.loaded,e.total);},false);\n"
+        "    xhr.addEventListener('load',function(){\n"
+        "        if(xhr.status===200){setItemStatus(itemId,'completed','OK');setItemProgress(itemId,1,1);}\n"
+        "        else setItemStatus(itemId,'error','Failed');done();},false);\n"
+        "    xhr.addEventListener('error',function(){setItemStatus(itemId,'error','Error');done();},false);\n"
+        "    xhr.open('POST','/upload',true);xhr.send(fd);}\n"
         "function startUpload() {\n"
         "    if (selectedFiles.length === 0) {\n"
         "        alert('\\u8BF7\\u5148\\u9009\\u62E9\\u6587\\u4EF6\\uFF01');\n"
@@ -519,14 +516,12 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    }\n"
         "    var file = selectedFiles[currentUploadIndex];\n"
         "    var progressDiv = document.getElementById('uploadProgress');\n"
-        "    var itemId = 'upload-item-' + currentUploadIndex;\n");
-
-    /* 4. 渲染 JS 脚本 - XHR与UI生成 */
-    len += snprintf(html_buf + len, buf_size - len,
+        "    var itemId = 'upload-item-' + currentUploadIndex;\n"
+        "    var currentPath = document.querySelector('input[name=\"path\"]').value;\n"
         "    var itemHtml = '<div class=\"upload-item\" id=\"' + itemId + '\">' +\n"
         "        '<div class=\"upload-item-header\">' +\n"
         "            '<span class=\"upload-item-name\">' + file.name + '</span>' +\n"
-        "            '<span class=\"upload-item-status uploading\">Uploading...</span>' +\n"
+        "            '<span class=\"upload-item-status uploading\">Pending...</span>' +\n"
         "        '</div>' +\n"
         "        '<div class=\"progress-bar-bg\">' +\n"
         "            '<div class=\"progress-bar-fill\" id=\"' + itemId + '-bar\">0' + String.fromCharCode(37) + '</div>' +\n"
@@ -535,41 +530,20 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    '</div>';\n"
         "    if (currentUploadIndex === 0) progressDiv.innerHTML = '<h4>Progress</h4>' + itemHtml;\n"
         "    else progressDiv.innerHTML += itemHtml;\n"
-        "    var formData = new FormData();\n"
-        "    var currentPath = document.querySelector('input[name=\"path\"]').value;\n"
-        "    formData.append('path', currentPath);\n"
-        "    formData.append('file', file);\n"
-        "    var xhr = new XMLHttpRequest();\n");
-
-    /* 5. 渲染 JS 脚本 - 事件监听及收尾 */
-    len += snprintf(html_buf + len, buf_size - len,
-        "    xhr.upload.addEventListener('progress', function(e) {\n"
-        "        if (e.lengthComputable) {\n"
-        "            var percent = Math.round((e.loaded / e.total) * 100);\n"
-        "            var bar = document.getElementById(itemId + '-bar');\n"
-        "            var text = document.getElementById(itemId + '-text');\n"
-        "            if (bar) { bar.style.width = percent + String.fromCharCode(37); bar.innerHTML = percent + String.fromCharCode(37); }\n"
-        "            if (text) text.textContent = formatSize(e.loaded) + ' / ' + formatSize(e.total);\n"
-        "        }\n"
-        "    }, false);\n"
-        "    xhr.addEventListener('load', function() {\n"
-        "        var status = document.querySelector('#' + itemId + ' .upload-item-status');\n"
-        "        var bar = document.getElementById(itemId + '-bar');\n"
-        "        if (xhr.status === 200) {\n"
-        "            if (status) { status.className = 'upload-item-status completed'; status.textContent = 'OK'; }\n"
-        "            if (bar) { bar.style.width = '100' + String.fromCharCode(37); bar.innerHTML = '100' + String.fromCharCode(37); }\n"
-        "        } else {\n"
-        "            if (status) { status.className = 'upload-item-status error'; status.textContent = 'Failed'; }\n"
-        "        }\n"
-        "        currentUploadIndex++; setTimeout(uploadNextFile, 500);\n"
-        "    }, false);\n"
-        "    xhr.addEventListener('error', function() {\n"
-        "        var status = document.querySelector('#' + itemId + ' .upload-item-status');\n"
-        "        if (status) { status.className = 'upload-item-status error'; status.textContent = 'Error'; }\n"
-        "        currentUploadIndex++; setTimeout(uploadNextFile, 500);\n"
-        "    }, false);\n"
-        "    xhr.open('POST', '/upload', true);\n"
-        "    xhr.send(formData);\n"
+        "    var advance = function(){currentUploadIndex++;setTimeout(uploadNextFile,500);};\n"
+        "    if (isFontDir(currentPath) && isTtfFile(file.name) && window.L1GlyfBuilder) {\n"
+        "        setItemStatus(itemId,'uploading','Build L1...');\n"
+        "        L1GlyfBuilder.uploadTtfWithCache(file,currentPath,{\n"
+        "            onBuilt:function(st){var t=document.getElementById(itemId+'-text');\n"
+        "                if(t)t.textContent='cache '+st.cached+' glyphs, '+formatSize(st.totalBytes);},\n"
+        "            onPhase:function(ph,nm){setItemStatus(itemId,'uploading',ph==='l1glyf'?'Up '+nm:'Up '+nm);},\n"
+        "            onProgress:function(l,t){setItemProgress(itemId,l,t);}\n"
+        "        }).then(function(){setItemStatus(itemId,'completed','OK+cache');advance();})\n"
+        "          .catch(function(e){setItemStatus(itemId,'error',String(e));advance();});\n"
+        "        return;\n"
+        "    }\n"
+        "    setItemStatus(itemId,'uploading','Uploading...');\n"
+        "    uploadOneXHR(file,currentPath,itemId,advance);\n"
         "}\n"
         "</script>\n"
         "<h3>File List</h3>\n"
@@ -690,6 +664,40 @@ static int send_response(int sock, const char *status, const char *content_type,
         send(sock, body, body_len, 0);
     }
     
+    return 0;
+}
+
+/*
+ * 发送 Flash 中的静态资源（分块 send，不占用大 RAM）
+ */
+static int send_static_buffer(int sock, const char * content_type,
+                              const unsigned char * data, unsigned int len)
+{
+    char header[256];
+    int header_len;
+    unsigned int sent;
+    unsigned int chunk;
+
+    header_len = snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %u\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "Cache-Control: public, max-age=3600\r\n"
+        "\r\n",
+        content_type, len);
+    send(sock, header, header_len, 0);
+
+    sent = 0;
+    while (sent < len) {
+        chunk = len - sent;
+        if (chunk > (unsigned int)HTTP_BUF_SIZE) {
+            chunk = (unsigned int)HTTP_BUF_SIZE;
+        }
+        send(sock, data + sent, (int)chunk, 0);
+        sent += chunk;
+    }
     return 0;
 }
 
@@ -1171,25 +1179,51 @@ static int parse_request(const char *req, char *method, char *path, char *versio
 /*
  * HTTP服务器线程
  */
+static int http_server_alloc_buffers(void)
+{
+    if (!g_http_buffer) {
+        g_http_buffer = (char *)_dma_malloc(HTTP_BUF_SIZE, DMAHEAP_PSRAM);
+    }
+    if (!g_http_response) {
+        g_http_response = (char *)_dma_malloc(HTTP_RESPONSE_SIZE, DMAHEAP_PSRAM);
+    }
+    if (!g_http_buffer || !g_http_response) {
+        HTTP_LOG("PSRAM buffer alloc failed buf=%p resp=%p", g_http_buffer, g_http_response);
+        if (g_http_buffer) {
+            _dma_free(g_http_buffer, 0);
+            g_http_buffer = NULL;
+        }
+        if (g_http_response) {
+            _dma_free(g_http_response, 0);
+            g_http_response = NULL;
+        }
+        return -1;
+    }
+    return 0;
+}
+
  static void http_server_thread(void *arg)
  {
      int client_sock;
      struct sockaddr_in server_addr, client_addr;
      socklen_t addr_len = sizeof(client_addr);
-     /* 使用全局PSRAM缓冲区，以便stop时可以释放 */
-     g_http_buffer = (char *)_dma_malloc(HTTP_BUF_SIZE, DMAHEAP_PSRAM);
      int recv_len;
      char method[32], path[256], version[16];
-     /* g_http_response 缓冲区 - 使用全局指针 */
-     g_http_response = (char *)_dma_malloc(HTTP_RESPONSE_SIZE, DMAHEAP_PSRAM);
-    
-     if (!g_http_buffer || !g_http_response) {
-         printf("[HTTP ERR] Failed to allocate PSRAM buffers! g_http_buffer=%p, g_http_response=%p\r\n", g_http_buffer, g_http_response);
-         if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
-         if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
-         g_http_running = 0;
-         return;
-     }
+
+     (void)arg;
+     HTTP_LOG("Worker thread ready (idle until start)");
+
+     for (;;) {
+         while (!g_http_running) {
+             OS_MSleep(50);
+         }
+
+         if (http_server_alloc_buffers() != 0) {
+             g_http_running = 0;
+             continue;
+         }
+
+         g_http_serving = 1;
     
     HTTP_LOG("Server starting on port %d...", g_http_port);
     
@@ -1197,9 +1231,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
     g_server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (g_server_sock < 0) {
         HTTP_LOG("Failed to create socket");
-        if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
-        if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
-        return;
+        goto serve_cleanup;
     }
     
     /* 设置地址重用 */
@@ -1216,9 +1248,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         HTTP_LOG("Failed to bind socket");
         closesocket(g_server_sock);
         g_server_sock = -1;
-        if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
-        if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
-        return;
+        goto serve_cleanup;
     }
     
     /* 监听 */
@@ -1226,9 +1256,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         HTTP_LOG("Failed to listen");
         closesocket(g_server_sock);
         g_server_sock = -1;
-        if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
-        if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
-        return;
+        goto serve_cleanup;
     }
     
     HTTP_LOG("Server listening on port %d", g_http_port);
@@ -1276,9 +1304,9 @@ static int parse_request(const char *req, char *method, char *path, char *versio
                     if (strcmp(path, "/screensaver") == 0) {
                         (void)generate_screensaver_html(g_http_response, HTTP_RESPONSE_SIZE);
                         send_html_response(client_sock, g_http_response);
-                    } else if (strcmp(path, "/l1glyf") == 0) {
-                        (void)generate_l1glyf_tool_html(g_http_response, HTTP_RESPONSE_SIZE);
-                        send_html_response(client_sock, g_http_response);
+                    } else if (strcmp(path, "/l1glyf.js") == 0) {
+                        send_static_buffer(client_sock, "application/javascript; charset=utf-8",
+                                           http_l1glyf_js, http_l1glyf_js_len);
                     } else if (strcmp(path, "/screensaver/status") == 0) {
                         char status_json[256];
                         screensaver_get_status_json(status_json, sizeof(status_json));
@@ -1494,19 +1522,19 @@ static int parse_request(const char *req, char *method, char *path, char *versio
         }
     }
      
+serve_cleanup:
     if (g_server_sock >= 0) {
         closesocket(g_server_sock);
         g_server_sock = -1;
     }
-    
-    /* 释放PSRAM缓冲区 */
+
     if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
     if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
-    g_http_running = 0;
 
-    HTTP_LOG("Server thread exiting");
-    OS_ThreadDelete(&g_http_thread);
-}
+    g_http_serving = 0;
+    /* 保留工作线程，回到 idle 等待下次 start */
+     }
+ }
 
 /*
  * 初始化HTTP服务器
@@ -1515,13 +1543,29 @@ int http_server_init(int port)
 {
     g_http_port = port > 0 ? port : HTTP_SERVER_PORT;
     g_http_running = 0;
-    printf("[HTTP] init: BEFORE SetInvalid, handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
-    OS_ThreadSetInvalid(&g_http_thread);
-    printf("[HTTP] init: AFTER SetInvalid, handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
-    
-    /* SD卡已在main.c中挂载，保持挂载状态 */
-    
     HTTP_LOG("HTTP server initialized (port=%d)", g_http_port);
+    return 0;
+}
+
+/*
+ * 开机预创建工作线程（font warm 前 SRAM 尚充足时调用一次）
+ */
+int http_server_reserve_thread(void)
+{
+    if (http_server_thread_active()) {
+        HTTP_LOG("Worker thread already reserved");
+        return 0;
+    }
+
+    HTTP_LOG("Reserving worker thread (stack=%d bytes SRAM)...", HTTP_THREAD_STACK_SIZE);
+    if (OS_ThreadCreate(&g_http_thread, "http_server",
+                        http_server_thread, NULL,
+                        OS_PRIORITY_NORMAL, HTTP_THREAD_STACK_SIZE) != 0) {
+        HTTP_LOG("Failed to reserve worker thread");
+        return -1;
+    }
+
+    HTTP_LOG("Worker thread reserved, handle=0x%08x", (unsigned int)g_http_thread.handle);
     return 0;
 }
 
@@ -1530,32 +1574,21 @@ int http_server_init(int port)
  */
 int http_server_start(void)
 {
-    printf("[HTTP] start: ENTER, g_http_running=%d, handle=0x%08x\r\n", g_http_running, (unsigned int)g_http_thread.handle);
-    
-    if (g_http_running || http_server_thread_active()) {
+    HTTP_LOG("start: running=%d serving=%d handle=0x%08x",
+             g_http_running, g_http_serving, (unsigned int)g_http_thread.handle);
+
+    if (!http_server_thread_active()) {
+        HTTP_LOG("Worker thread not reserved; call http_server_reserve_thread() at boot");
+        return -1;
+    }
+
+    if (g_http_running || g_http_serving) {
         HTTP_LOG("Server already running");
         return 0;
     }
-    
+
     g_http_running = 1;
-    
-    /* 打印调试信息 */
-    printf("[HTTP] Starting HTTP server...\r\n");
-    printf("[HTTP] HTTP_RESPONSE_SIZE = %d bytes\r\n", HTTP_RESPONSE_SIZE);
-    printf("[HTTP] HTTP_BUF_SIZE = %d bytes\r\n", HTTP_BUF_SIZE);
-    printf("[HTTP] HTTP_MAX_PATH = %d bytes\r\n", HTTP_MAX_PATH);
-    printf("[HTTP] Thread stack size = 6144 bytes\r\n");
-    printf("[HTTP] g_http_thread.handle = 0x%08x\r\n", (unsigned int)g_http_thread.handle);
-    /* Fix: 增大线程栈到6144，为避免栈溢出同时节省SRAM空间 */
-    if (OS_ThreadCreate(&g_http_thread, "http_server",
-                        http_server_thread, NULL,
-                        OS_PRIORITY_NORMAL, 6144) != 0) {
-        HTTP_LOG("Failed to create thread");
-        g_http_running = 0;
-        return -1;
-    }
-    
-    HTTP_LOG("HTTP server started");
+    HTTP_LOG("HTTP server start requested (worker will bind port %d)", g_http_port);
     return 0;
 }
 
@@ -1564,43 +1597,31 @@ int http_server_start(void)
  */
 void http_server_stop(void)
 {
-    if (!g_http_running && !http_server_thread_active()) {
+    if (!g_http_running && !g_http_serving) {
         return;
     }
 
     HTTP_LOG("Stopping HTTP server...");
     g_http_running = 0;
-    
-    /* 1. 先shutdown client socket，中断正在进行的recv() */
+
     if (g_client_sock >= 0) {
-        HTTP_LOG("Shutting down client socket %d", g_client_sock);
         shutdown(g_client_sock, SHUT_RDWR);
-        /* 不在这里closesocket，让HTTP线程自己关闭 */
-    }
-    
-    /* 2. 关闭server socket使accept返回，触发线程退出 */
-    if (g_server_sock >= 0) {
-        int srv = g_server_sock;
-        g_server_sock = -1;
-        shutdown(srv, SHUT_RDWR);
-        closesocket(srv);
     }
 
-    /* 3. 等待线程自行清理退出（最多等5秒） */
-    int wait_count;
-    for (wait_count = 0; wait_count < 50 && http_server_thread_active(); wait_count++) {
+    if (g_server_sock >= 0) {
+        int srv = g_server_sock;
+        shutdown(srv, SHUT_RDWR);
+        closesocket(srv);
+        g_server_sock = -1;
+    }
+
+    for (int wait_count = 0; wait_count < 50 && g_http_serving; wait_count++) {
         OS_MSleep(100);
     }
-    if (http_server_thread_active()) {
-        HTTP_LOG("Thread did not exit in time, force deleting");
-        OS_ThreadDelete(&g_http_thread);
+    if (g_http_serving) {
+        HTTP_LOG("Worker still serving after timeout");
     }
-    
-    /* 5. 确保PSRAM缓冲区被释放（防止线程异常退出时泄漏） */
-    if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
-    if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
-    
-    /* 6. 清理残留的client socket */
+
     if (g_client_sock >= 0) {
         closesocket(g_client_sock);
         g_client_sock = -1;
@@ -1614,7 +1635,7 @@ void http_server_stop(void)
  */
 int http_server_is_running(void)
 {
-    return g_http_running || http_server_thread_active();
+    return g_http_running || g_http_serving;
 }
 
 /*

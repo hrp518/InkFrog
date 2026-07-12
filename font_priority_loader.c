@@ -26,6 +26,11 @@ static const uint32_t g_prio_ascii_punct[] = {
 
 static int g_initialized = 0;
 
+/* 3500 CJK + 95 ASCII + 标点余量 */
+#define PRELOAD_COMBINED_CAP 3700
+static uint32_t s_preload_combined[PRELOAD_COMBINED_CAP]
+    __attribute__((section(".psram_bss")));
+
 static int combined_has(const uint32_t *arr, int n, uint32_t cp)
 {
     for(int i = 0; i < n; i++) {
@@ -71,12 +76,8 @@ int font_priority_loader_preload(void)
     }
     
     /* 按优先级合并字表：数字/符号最先，Level1 汉字最后（预算裁剪时从尾部丢） */
-    int cap = level1_chars_count + ASCII_COUNT + (int)(sizeof(g_prio_cjk_punct) / sizeof(g_prio_cjk_punct[0])) + 16;
-    uint32_t *combined = (uint32_t *)malloc((size_t)cap * sizeof(uint32_t));
-    if (!combined) {
-        printf("[FONT_LOADER] Warning: malloc failed, loading CJK only\n");
-        return lv_tiny_ttf_load_level1_glyphs(g_ttf_font, level1_chars, level1_chars_count);
-    }
+    int cap = PRELOAD_COMBINED_CAP;
+    uint32_t * combined = s_preload_combined;
 
     int n = 0;
     int prio_digits = 0, prio_punct = 0;
@@ -109,7 +110,6 @@ int font_priority_loader_preload(void)
     printf("[FONT_LOADER] Loading glyphs to PSRAM (digits/symbols first)...\n");
     
     int result = lv_tiny_ttf_load_level1_glyphs(g_ttf_font, combined, total_count);
-    free(combined);
     
     if (result > 0) {
         if (result < total_count) {
