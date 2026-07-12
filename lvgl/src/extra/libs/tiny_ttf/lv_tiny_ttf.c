@@ -1281,7 +1281,7 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
             printf("NULL\n");
         }
         
-        uint16_t filled = 0, ascii_filled = 0, not_found = 0;
+        uint16_t filled = 0, ascii_filled = 0, not_found = 0, bbox_cached = 0, bbox_lazy = 0;
         static int debug_prefill_count = 0;
         for(uint16_t i = 0; i < count; i++) {
             uint32_t unicode = unicode_list[i];
@@ -1328,6 +1328,7 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
                 }
             }
             if(glyph_idx > 0) {
+                entry->glyph_index = glyph_idx;
                 if(glyphs[i].cached && glyphs[i].glyf_size >= 10) {
                     /* L1 已缓存：直接读 glyf 头 bbox，O(1) 内存访问 */
                     uint8_t *gh = glyf_data + glyphs[i].compact_offset;
@@ -1339,22 +1340,22 @@ static int ttf_load_level1_glyphs(ttf_font_desc_t *dsc, const uint32_t *unicode_
                     entry->box_h_raw = (uint16_t)((yMax - yMin + 1) > 0 ? (yMax - yMin + 1) : 0);
                     entry->ofs_x_raw = xMin;
                     entry->ofs_y_raw = yMin;
+                    bbox_cached++;
                 } else {
-                    /* glyf 未进 L1 预算：stbtt 预填 bbox，避免 layout 得到 box=0 */
-                    int rx0, ry0, rx1, ry1;
-                    stbtt_GetGlyphBitmapBox(&dsc->info, glyph_idx, 1.0f, 1.0f, &rx0, &ry0, &rx1, &ry1);
-                    entry->box_w_raw = (uint16_t)((rx1 - rx0 + 1) > 0 ? (uint16_t)(rx1 - rx0 + 1) : 0);
-                    entry->box_h_raw = (uint16_t)((ry1 - ry0 + 1) > 0 ? (uint16_t)(ry1 - ry0 + 1) : 0);
-                    entry->ofs_x_raw = rx0;
-                    entry->ofs_y_raw = (int16_t)(-ry1);
+                    /* glyf 未进 L1：仅 adv 预填，bbox 遇字时由 get_glyph_dsc stbtt 懒填 */
+                    entry->box_w_raw = 0;
+                    entry->box_h_raw = 0;
+                    entry->ofs_x_raw = 0;
+                    entry->ofs_y_raw = 0;
+                    bbox_lazy++;
                 }
-                entry->glyph_index = glyph_idx;
             }
             entry->valid = 1;
             if(is_ascii) ascii_filled++;
             else filled++;
         }
-        printf("[TTF] Metrics pre-filled: CJK=%u ASCII=%u not_found=%u\n", filled, ascii_filled, not_found);
+        printf("[TTF] Metrics pre-filled: CJK=%u ASCII=%u not_found=%u bbox_cached=%u bbox_lazy=%u\n",
+               filled, ascii_filled, not_found, bbox_cached, bbox_lazy);
         dsc->table_cache.hmtx.data = hmtx_data;
         dsc->table_cache.hmtx.file_offset = hmtx_file_offset;
         dsc->table_cache.hmtx.size = hmtx_size;
@@ -1512,7 +1513,8 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
         ttf_metrics_entry_t *amc = dsc->ascii_metrics_cache ? dsc->ascii_metrics_cache : g_shared_ascii_metrics_cache;
         if(amc) {
             uint32_t aidx = unicode_letter - ASCII_METRICS_START;
-            if(amc[aidx].valid == 1) {
+            if(amc[aidx].valid == 1 &&
+               (amc[aidx].box_w_raw > 0 || amc[aidx].box_h_raw > 0)) {
                 g_dsc_cache_hits++;
                 dsc_out->adv_w = (uint16_t)(amc[aidx].adv_w_raw * dsc->scale);
                 int raw_x0 = amc[aidx].ofs_x_raw;
@@ -1647,19 +1649,33 @@ static bool ttf_get_glyph_dsc_cb(const lv_font_t * font, lv_font_glyph_dsc_t * d
     dsc_out->is_placeholder = false;
 
     // 填充缓存（存储未缩放的 raw 值，与预填充路径一致）
-    if(unicode_letter >= CJK_METRICS_START && unicode_letter <= CJK_METRICS_END) {
-        ttf_metrics_entry_t *cache_ptr = dsc->metrics_cache ? dsc->metrics_cache : g_shared_metrics_cache;
-        if(cache_ptr) {
-            uint32_t idx = unicode_letter - CJK_METRICS_START;
-            int rx0, ry0, rx1, ry1;
-            stbtt_GetGlyphBitmapBox(&dsc->info, g1, 1.0f, 1.0f, &rx0, &ry0, &rx1, &ry1);
-            cache_ptr[idx].adv_w_raw = (uint16_t)(advw + k);
-            cache_ptr[idx].box_w_raw = (uint16_t)((rx1 - rx0 + 1) > 0 ? (uint16_t)(rx1 - rx0 + 1) : 0);
-            cache_ptr[idx].box_h_raw = (uint16_t)((ry1 - ry0 + 1) > 0 ? (uint16_t)(ry1 - ry0 + 1) : 0);
-            cache_ptr[idx].ofs_x_raw = rx0;
-            cache_ptr[idx].ofs_y_raw = (int16_t)(-ry1);
-            cache_ptr[idx].glyph_index = (uint16_t)g1;
-            cache_ptr[idx].valid = 1;
+    {
+        int rx0, ry0, rx1, ry1;
+        stbtt_GetGlyphBitmapBox(&dsc->info, g1, 1.0f, 1.0f, &rx0, &ry0, &rx1, &ry1);
+        if(unicode_letter >= CJK_METRICS_START && unicode_letter <= CJK_METRICS_END) {
+            ttf_metrics_entry_t *cache_ptr = dsc->metrics_cache ? dsc->metrics_cache : g_shared_metrics_cache;
+            if(cache_ptr) {
+                uint32_t idx = unicode_letter - CJK_METRICS_START;
+                cache_ptr[idx].adv_w_raw = (uint16_t)(advw + k);
+                cache_ptr[idx].box_w_raw = (uint16_t)((rx1 - rx0 + 1) > 0 ? (uint16_t)(rx1 - rx0 + 1) : 0);
+                cache_ptr[idx].box_h_raw = (uint16_t)((ry1 - ry0 + 1) > 0 ? (uint16_t)(ry1 - ry0 + 1) : 0);
+                cache_ptr[idx].ofs_x_raw = rx0;
+                cache_ptr[idx].ofs_y_raw = (int16_t)(-ry1);
+                cache_ptr[idx].glyph_index = (uint16_t)g1;
+                cache_ptr[idx].valid = 1;
+            }
+        } else if(unicode_letter >= ASCII_METRICS_START && unicode_letter <= ASCII_METRICS_END) {
+            ttf_metrics_entry_t *amc = dsc->ascii_metrics_cache ? dsc->ascii_metrics_cache : g_shared_ascii_metrics_cache;
+            if(amc) {
+                uint32_t aidx = unicode_letter - ASCII_METRICS_START;
+                amc[aidx].adv_w_raw = (uint16_t)(advw + k);
+                amc[aidx].box_w_raw = (uint16_t)((rx1 - rx0 + 1) > 0 ? (uint16_t)(rx1 - rx0 + 1) : 0);
+                amc[aidx].box_h_raw = (uint16_t)((ry1 - ry0 + 1) > 0 ? (uint16_t)(ry1 - ry0 + 1) : 0);
+                amc[aidx].ofs_x_raw = rx0;
+                amc[aidx].ofs_y_raw = (int16_t)(-ry1);
+                amc[aidx].glyph_index = (uint16_t)g1;
+                amc[aidx].valid = 1;
+            }
         }
     }
 
