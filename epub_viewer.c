@@ -457,6 +457,16 @@ volatile int g_rendering_in_progress = 0;
 static int g_render_label_count = 0;
 static int g_render_char_count = 0;
 
+/* 计算字形位图超出字体行框顶部的像素数（用于防首行顶部裁切） */
+static int get_glyph_top_overflow(const lv_font_t *font) {
+    if (!font) return 4;
+    lv_font_glyph_dsc_t g;
+    if (!lv_font_get_glyph_dsc(font, &g, 0x4E2D, 0) || g.box_h == 0) return 4;
+    int asc = (int)lv_font_get_line_height(font) - (int)font->base_line;
+    int above = (int)g.box_h + (int)g.ofs_y - asc;
+    return above > 0 ? above : 0;
+}
+
 /* Create a single-line label (no LVGL wrapping) at given y offset */
 static void create_line_label(EpubViewer *viewer, const char *text, int len,
                                lv_font_t *font, int *y_offset) {
@@ -468,6 +478,8 @@ static void create_line_label(EpubViewer *viewer, const char *text, int len,
     lv_obj_t *label = lv_label_create(viewer->content_container);
     lv_obj_set_style_text_font(label, font, 0);
     lv_obj_set_style_text_color(label, lv_color_black(), 0);
+    /* 位图可高于 line_height，允许向上绘制避免顶部裁切 */
+    lv_obj_add_flag(label, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 0, *y_offset);
     lv_label_set_text(label, buf);
     g_render_label_count++;
@@ -530,7 +542,7 @@ static void update_display(EpubViewer *viewer) {
 
     /* 从配置表获取当前挡位的动态行高 */
     const FontSizeConfig *fsz_cfg = &g_font_sizes[g_font_size_index];
-    int y_offset = 2;  /* +2px offset to prevent glyph top clipping (CJK ofs=-2) */
+    int y_offset = get_glyph_top_overflow(FONT);
     lv_font_t *current_font = FONT;
     int current_lh = fsz_cfg->lh_body;
 
@@ -1093,6 +1105,7 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_set_style_bg_color(viewer->content_container, lv_color_white(), 0);
     lv_obj_set_style_border_width(viewer->content_container, 0, 0);
     lv_obj_set_style_pad_all(viewer->content_container, 0, 0);
+    lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
     lv_obj_clear_flag(viewer->content_container, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
                       LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
     /* content_container必须同时具备CLICKABLE和EVENT_BUBBLE：
