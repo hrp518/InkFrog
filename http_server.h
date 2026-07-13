@@ -46,6 +46,11 @@ int http_server_start(void);
 /*
  * 停止HTTP服务器
  */
+void http_server_request_stop(void);
+
+/*
+ * 停止HTTP服务器并等待工作线程退出（开书等路径用；UI 请用 request_stop）
+ */
 void http_server_stop(void);
 
 /*

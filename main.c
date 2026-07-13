@@ -462,15 +462,17 @@ static void http_dialog_stop_cb(lv_event_t *e) {
     g_wifi.http_running = 0;
     wifi_controller_set_http_running(0);
 
-    /* 先关对话框，避免 stop 在等网络/线程时界面无响应 */
     if (g_http_dialog_bg) {
         lv_obj_del(g_http_dialog_bg);
         g_http_dialog_bg = NULL;
         g_http_dialog = NULL;
     }
-    epd_mark_refresh_pending();
 
-    http_server_stop();
+    /* 先重绘底层设置页，再刷新 EPD（勿在回调里阻塞等 HTTP 线程） */
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(NULL);
+    http_server_request_stop();
+    epd_mark_refresh_pending();
 }
 
 /* 创建HTTP服务器信息对话框 */

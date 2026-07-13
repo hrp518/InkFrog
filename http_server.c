@@ -1874,7 +1874,7 @@ int http_server_start(void)
 /*
  * 停止HTTP服务器
  */
-void http_server_stop(void)
+void http_server_request_stop(void)
 {
     if (!g_http_running && !g_http_serving) {
         return;
@@ -1890,20 +1890,22 @@ void http_server_stop(void)
     if (g_server_sock >= 0) {
         shutdown(g_server_sock, SHUT_RDWR);
     }
+}
+
+void http_server_stop(void)
+{
+    if (!g_http_running && !g_http_serving) {
+        return;
+    }
+
+    http_server_request_stop();
 
     for (int wait_count = 0; wait_count < HTTP_STOP_WAIT_MAX && g_http_serving; wait_count++) {
         OS_MSleep(HTTP_STOP_WAIT_MS);
     }
     if (g_http_serving) {
-        printf("[HTTP] WARN: worker still serving, force close sockets\r\n");
-        if (g_server_sock >= 0) {
-            closesocket(g_server_sock);
-            g_server_sock = -1;
-        }
-        g_http_serving = 0;
-    } else if (g_server_sock >= 0) {
-        closesocket(g_server_sock);
-        g_server_sock = -1;
+        printf("[HTTP] WARN: worker still serving after %dms\r\n",
+               HTTP_STOP_WAIT_MAX * HTTP_STOP_WAIT_MS);
     }
 
     if (g_client_sock >= 0) {
