@@ -47,7 +47,8 @@
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/portable/GCC/ARM_CM4F/portmacro.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/mpu_wrappers.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h \
- ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h \
+ ../../../../include/sys/sys_heap.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -150,3 +151,5 @@
 ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h:
 
 ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h:
+
+../../../../include/sys/sys_heap.h:

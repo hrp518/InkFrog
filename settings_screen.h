@@ -25,6 +25,11 @@ void settings_screen_init(void);
 const char* settings_get_selected_font(void);
 
 /**
+ * @brief 设置并持久化阅读器 TTF 路径（HTTP 上传 / 设置页共用）
+ */
+void settings_set_reader_font_path(const char *path);
+
+/**
  * @brief 打开WiFi扫描界面（创建新屏幕）
  * @param return_screen 返回时加载的屏幕
  */

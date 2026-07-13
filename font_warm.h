@@ -27,4 +27,7 @@ int font_warm_l1glyf_exists(const char * ttf_path);
 /* 由 TTF 路径推导首选 .l1glyf 缓存路径 */
 void font_warm_l1glyf_path_for_ttf(const char * ttf_path, char * out, size_t out_sz);
 
+/* 在 Font 目录中查找已有 .l1glyf 缓存的 TTF（多个时取最大） */
+int font_warm_find_l1glyf_paired_ttf(char * out, size_t out_sz);
+
 #endif

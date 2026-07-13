@@ -8,6 +8,7 @@ extern "C" {
 void print_heap_info(void);
 void psram_heap_info(void);
 void dma_heap_info(void);
+uint32_t sram_heap_free_bytes(void);
 
 #ifdef __cplusplus
 }

@@ -168,6 +168,16 @@ static void save_settings_to_ini(void)
     SS_LOG("Saved font setting: %s", g_selected_font);
 }
 
+void settings_set_reader_font_path(const char *path)
+{
+    if (!path || path[0] == '\0') {
+        return;
+    }
+    strncpy(g_selected_font, path, sizeof(g_selected_font) - 1);
+    g_selected_font[sizeof(g_selected_font) - 1] = '\0';
+    save_settings_to_ini();
+}
+
 /* ===================================================
  * 重建设置主页
  * =================================================== */

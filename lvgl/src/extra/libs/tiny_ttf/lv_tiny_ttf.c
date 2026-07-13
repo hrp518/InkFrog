@@ -2724,6 +2724,7 @@ lv_font_t * lv_tiny_ttf_create(const char * path, const void * data, size_t data
         dsc->stream.dsc = dsc;
     }
     if(0 == stbtt_InitFont(&dsc->info, &dsc->stream, stbtt_GetFontOffsetForIndex(&dsc->stream, 0))) {
+        printf("[TTF] stbtt_InitFont failed: %s\n", path ? path : "(data)");
         LV_LOG_ERROR("tiny_ttf: init failed\n");
         goto err_after_dsc;
     }

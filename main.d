@@ -239,6 +239,7 @@
  ../../../../project/demo/FontExp/coremark/coremark_runner.h \
  ../../../../project/demo/FontExp/font_priority_loader.h \
  ../../../../project/demo/FontExp/settings_screen.h \
+ ../../../../project/demo/FontExp/font_warm.h \
  ../../../../project/demo/FontExp/settings_storage.h
 
 ../../../../project/common/prj_conf_opt.h:
@@ -728,5 +729,7 @@
 ../../../../project/demo/FontExp/font_priority_loader.h:
 
 ../../../../project/demo/FontExp/settings_screen.h:
+
+../../../../project/demo/FontExp/font_warm.h:
 
 ../../../../project/demo/FontExp/settings_storage.h:

@@ -27,6 +27,8 @@ export __CONFIG_DMAHEAP_PSRAM_SIZE := 1024
 export __CONFIG_MBUF_HEAP_MODE := 1
 export __CONFIG_UMAC_HEAP_MODE := 1
 export __CONFIG_LMAC_HEAP_MODE := 1
+# malloc 先 SRAM，不足时自动 psram_malloc（网络 pbuf/小包不再 heap exhausted）
+export __CONFIG_MIX_HEAP_MANAGE := y
 
 # LVGL source path for include
 export PRJ_EXTRA_INCLUDE := -I../../demo/FontExp/lvgl/src -I../../demo/FontExp/third_party/miniz -I../../demo/FontExp/third_party/expat

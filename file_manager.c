@@ -1392,8 +1392,28 @@ static int ensure_reader_font_loaded(void)
         printf("[FONT] Deferred TTF load failed, using built-in fallback\n");
         return -1;
     }
+    {
+        FILINFO fno;
+        if (f_stat(ttf_file_path, &fno) == FR_OK) {
+            printf("[FONT] Loading TTF: %s (%lu B) l1glyf=%d\n",
+                   ttf_file_path, (unsigned long)fno.fsize,
+                   font_warm_l1glyf_exists(ttf_file_path));
+        } else {
+            printf("[FONT] Loading TTF: %s (stat failed)\n", ttf_file_path);
+        }
+    }
     print_memory_stats_internal("before_create_file_font");
     custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, READER_FONT_SIZE_DEFAULT);
+    if (custom_ttf_font == NULL) {
+        char alt_path[256];
+        if (font_warm_find_l1glyf_paired_ttf(alt_path, sizeof(alt_path)) == 0 &&
+            strcmp(alt_path, ttf_file_path) != 0) {
+            printf("[FONT] Retry with l1glyf-paired TTF: %s\n", alt_path);
+            strncpy(ttf_file_path, alt_path, sizeof(ttf_file_path) - 1);
+            ttf_file_path[sizeof(ttf_file_path) - 1] = '\0';
+            custom_ttf_font = lv_tiny_ttf_create_file_ex(ttf_file_path, READER_FONT_SIZE_DEFAULT);
+        }
+    }
     printf("[FONT] lv_tiny_ttf_create_file_ex returned: %p\n", custom_ttf_font);
     print_memory_stats_internal("after_create_file_font");
     if (custom_ttf_font != NULL) {

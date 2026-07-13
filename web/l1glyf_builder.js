@@ -279,13 +279,13 @@
     });
   }
 
-  function uploadForm(fileOrBlob, path, fileName, onProgress) {
+  function uploadRaw(fileOrBlob, path, fileName, onProgress) {
     return new Promise(function (resolve, reject) {
-      var fd = new FormData();
-      fd.append('path', path);
-      fd.append('file', fileOrBlob, fileName);
+      var url = '/api/upload?path=' + encodeURIComponent(path) +
+        '&name=' + encodeURIComponent(fileName);
       var xhr = new XMLHttpRequest();
-      xhr.open('POST', '/upload', true);
+      xhr.open('PUT', url, true);
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
       if (onProgress && xhr.upload) {
         xhr.upload.onprogress = function (e) {
           if (e.lengthComputable) onProgress(e.loaded, e.total);
@@ -296,19 +296,19 @@
         else reject(new Error('HTTP ' + xhr.status + ' ' + xhr.responseText));
       };
       xhr.onerror = function () { reject(new Error('network')); };
-      xhr.send(fd);
+      xhr.send(fileOrBlob);
     });
   }
 
-  /** Font dir TTF: build l1glyf then upload .l1glyf then .ttf (sequential, device-friendly) */
+  /** Font dir TTF: build l1glyf then upload .l1glyf then .ttf (sequential) */
   function uploadTtfWithCache(file, fontPath, hooks) {
     hooks = hooks || {};
     return buildFromFile(file).then(function (built) {
       if (hooks.onBuilt) hooks.onBuilt(built.stats);
       if (hooks.onPhase) hooks.onPhase('l1glyf', built.name);
-      return uploadForm(built.blob, '0:/Font/.l1glyf', built.name, hooks.onProgress).then(function () {
+      return uploadRaw(built.blob, '0:/Font/.l1glyf', built.name, hooks.onProgress).then(function () {
         if (hooks.onPhase) hooks.onPhase('ttf', file.name);
-        return uploadForm(file, fontPath, file.name, hooks.onProgress);
+        return uploadRaw(file, fontPath, file.name, hooks.onProgress);
       });
     });
   }
@@ -316,7 +316,7 @@
   global.L1GlyfBuilder = {
     buildFromFile: buildFromFile,
     buildFromBuffer: buildFromBuffer,
-    uploadForm: uploadForm,
+    uploadRaw: uploadRaw,
     uploadTtfWithCache: uploadTtfWithCache
   };
 })(typeof window !== 'undefined' ? window : this);

@@ -21,7 +21,26 @@ static volatile int s_warm_busy;
 
 static void font_warm_normalize_path(char * path)
 {
+    char tmp[256];
+
     if(!path || path[0] == '\0') return;
+
+    if(strncmp(path, "//", 2) == 0 && path[2] != '\0') {
+        snprintf(tmp, sizeof(tmp), "0:/%s", path + 2);
+        strncpy(path, tmp, 255);
+        path[255] = '\0';
+    } else if(strncmp(path, "/Font", 5) == 0 && path[5] != '\0' && path[5] != '/') {
+        snprintf(tmp, sizeof(tmp), "0:/Font%s", path + 5);
+        strncpy(path, tmp, 255);
+        path[255] = '\0';
+    } else if(strcmp(path, "/Font") == 0) {
+        strcpy(path, "0:/Font");
+    } else if(strncmp(path, "/Font/", 6) == 0) {
+        snprintf(tmp, sizeof(tmp), "0:%s", path);
+        strncpy(path, tmp, 255);
+        path[255] = '\0';
+    }
+
     if(strncmp(path, "0:Font/", 7) == 0) {
         memmove(path + 2, path + 1, strlen(path));
         path[1] = '/';
@@ -121,6 +140,48 @@ static int font_warm_scan_smallest(char * out, size_t out_sz)
     return 0;
 }
 
+/* 优先选已有 .l1glyf 缓存的 TTF（HTTP 上传流程）；多个时取体积最大者 */
+int font_warm_find_l1glyf_paired_ttf(char * out, size_t out_sz)
+{
+    DIR dir;
+    FILINFO fno;
+    FSIZE_t best = 0;
+    char best_name[128] = "";
+
+    if(f_opendir(&dir, "0:/Font") != FR_OK) {
+        return -1;
+    }
+    for(;;) {
+        char full[256];
+
+        if(f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0) {
+            break;
+        }
+        if(fno.fattrib & AM_DIR) {
+            continue;
+        }
+        const char * ext = strrchr(fno.fname, '.');
+        if(!ext || strcasecmp(ext, ".ttf") != 0) {
+            continue;
+        }
+        snprintf(full, sizeof(full), "0:/Font/%s", fno.fname);
+        if(!font_warm_l1glyf_exists(full)) {
+            continue;
+        }
+        if(fno.fsize >= best) {
+            best = fno.fsize;
+            strncpy(best_name, fno.fname, sizeof(best_name) - 1);
+            best_name[sizeof(best_name) - 1] = '\0';
+        }
+    }
+    f_closedir(&dir);
+    if(best_name[0] == '\0') {
+        return -1;
+    }
+    snprintf(out, out_sz, "0:/Font/%s", best_name);
+    return 0;
+}
+
 int font_warm_resolve_reader_path(char * out, size_t out_sz)
 {
     char saved[256] = "";
@@ -129,6 +190,7 @@ int font_warm_resolve_reader_path(char * out, size_t out_sz)
         if(font_warm_stat_file(saved) == 0) {
             strncpy(out, saved, out_sz - 1);
             out[out_sz - 1] = '\0';
+            printf("[FONT] Reader path from settings: %s\n", out);
             return 0;
         }
     }
@@ -140,10 +202,19 @@ int font_warm_resolve_reader_path(char * out, size_t out_sz)
         if(font_warm_stat_file(saved) == 0) {
             strncpy(out, saved, out_sz - 1);
             out[out_sz - 1] = '\0';
+            printf("[FONT] Reader path from UI selection: %s\n", out);
             return 0;
         }
     }
-    return font_warm_scan_smallest(out, out_sz);
+    if(font_warm_find_l1glyf_paired_ttf(out, out_sz) == 0) {
+        printf("[FONT] Reader path from l1glyf cache: %s\n", out);
+        return 0;
+    }
+    if(font_warm_scan_smallest(out, out_sz) == 0) {
+        printf("[FONT] Reader path smallest TTF: %s\n", out);
+        return 0;
+    }
+    return -1;
 }
 
 static void font_warm_run_locked(const char * path)

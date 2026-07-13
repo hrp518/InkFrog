@@ -198,6 +198,7 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
  ../../../../project/demo/FontExp/wlan_manager.h \
  ../../../../project/demo/FontExp/settings_storage.h \
+ ../../../../project/demo/FontExp/font_warm.h \
  ../../../../project/demo/FontExp/wifi_controller.h \
  ../../../../project/demo/FontExp/epd.h \
  ../../../../project/demo/FontExp/lv_port_disp.h \
@@ -209,7 +210,8 @@
  ../../../../include/kernel/os/os_queue.h \
  ../../../../include/kernel/os/os_semaphore.h \
  ../../../../include/kernel/os/os_mutex.h \
- ../../../../include/kernel/os/os_timer.h
+ ../../../../include/kernel/os/os_timer.h \
+ ../../../../include/sys/sys_heap.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -607,6 +609,8 @@
 
 ../../../../project/demo/FontExp/settings_storage.h:
 
+../../../../project/demo/FontExp/font_warm.h:
+
 ../../../../project/demo/FontExp/wifi_controller.h:
 
 ../../../../project/demo/FontExp/epd.h:
@@ -636,3 +640,5 @@
 ../../../../include/kernel/os/os_mutex.h:
 
 ../../../../include/kernel/os/os_timer.h:
+
+../../../../include/sys/sys_heap.h:

@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include "http_server.h"
 #include "http_l1glyf_js.h"
 #include "screensaver.h"
@@ -19,9 +20,10 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "sys/dma_heap.h"  // 添加PSRAM堆支持
+#include "heap_debug.h"
 
 /* 调试开关 */
-#define HTTP_DEBUG 1
+#define HTTP_DEBUG 0
 #if HTTP_DEBUG
 #define HTTP_LOG(fmt, ...) printf("[HTTP] " fmt "\r\n", ##__VA_ARGS__)
 #else
@@ -33,6 +35,24 @@
 #define HTTP_MAX_PATH 256
 #define HTTP_RESPONSE_SIZE (16 * 1024)  /* PSRAM HTML 缓冲；文件列表过长时截断 */
 #define HTTP_THREAD_STACK_SIZE 4096     /* 开机预创建线程栈（SRAM），font warm 后无法再 alloc */
+#define HTTP_UPLOAD_IO_SIZE   (32 * 1024)
+#define HTTP_UPLOAD_CHUNK     4096
+#define HTTP_WORKSPACE_SIZE   (HTTP_BUF_SIZE + HTTP_RESPONSE_SIZE)
+/* 浏览连接用小缓冲省 SRAM；上传单独调大 */
+#define HTTP_SOCK_RCVBUF      1024
+#define HTTP_SOCK_SNDBUF      2048
+#define HTTP_UPLOAD_SOCK_RCVBUF 8192
+#define HTTP_UPLOAD_SOCK_SNDBUF 4096
+#define HTTP_UPLOAD_RECV_SEC    3       /* 单次 recv 超时；stop 时最多等几秒 */
+#define HTTP_ACCEPT_POLL_MS     50
+#define HTTP_STOP_WAIT_MS       50
+#define HTTP_STOP_WAIT_MAX      40      /* 50ms * 40 = 2s */
+#define HTTP_MIN_SRAM_FREE    2048
+
+/* 上传 I/O 缓冲：静态 PSRAM，避免每次上传 _dma_malloc */
+static uint8_t g_upload_io_buf[HTTP_UPLOAD_IO_SIZE] __attribute__((section(".psram_bss")));
+/* HTTP 工作区：静态 PSRAM，start/stop 不再 _dma_malloc */
+static char g_http_workspace[HTTP_WORKSPACE_SIZE] __attribute__((section(".psram_bss")));
 
 /*
  * PSRAM接收缓冲区 - 用于大文件上传
@@ -44,18 +64,14 @@
 /* 上传文件保存路径 */
 #define UPLOAD_PATH "0:/Font/"
 
-/* 调试：打印堆内存信息 */
-extern void *heap_calloc_trace(size_t nmemb, size_t size, const char *file, int line, const char *func);
-extern void heap_print_info(void);
-
 /* 全局变量 */
 static OS_Thread_t g_http_thread;
 static volatile int g_http_running = 0;
 static int g_http_port = HTTP_SERVER_PORT;
 static int g_server_sock = -1;           /* 服务器socket，用于stop时shutdown */
 static volatile int g_client_sock = -1;  /* 客户端socket，用于stop时shutdown中断recv */
-static char *g_http_buffer = NULL;       /* 接收缓冲区(PSRAM) */
-static char *g_http_response = NULL;     /* 响应缓冲区(PSRAM) */
+static char *g_http_buffer = g_http_workspace;
+static char *g_http_response = g_http_workspace + HTTP_BUF_SIZE;
 static volatile int g_http_serving = 0;  /* 1=正在 accept 服务中 */
 
 static int http_server_thread_active(void)
@@ -83,6 +99,95 @@ static const HTTP_MIME_Type g_mime_types[] = {
 static int send_response(int sock, const char *status, const char *content_type,
                         const char *body, int body_len);
 static int send_html_response(int sock, const char *html_body);
+static int parse_api_upload_params(const char *path, char *out_path, size_t path_sz,
+                                   char *out_name, size_t name_sz);
+static int parse_request_line_path(const char *req, char *path_out, size_t path_sz);
+static int handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
+                                 const char *upload_path, const char *filename);
+
+static void http_tune_client_socket(int sock)
+{
+    int v;
+    struct timeval recv_tv = {2, 0};
+
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+    v = HTTP_SOCK_RCVBUF;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v));
+    v = HTTP_SOCK_SNDBUF;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v));
+}
+
+static void http_tune_upload_socket(int sock)
+{
+    int v;
+    struct timeval recv_tv = { HTTP_UPLOAD_RECV_SEC, 0 };
+
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
+    v = HTTP_UPLOAD_SOCK_RCVBUF;
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v));
+    v = HTTP_UPLOAD_SOCK_SNDBUF;
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v));
+}
+
+static void http_set_nonblock(int sock, int on)
+{
+    int flags = fcntl(sock, F_GETFL, 0);
+    if (flags < 0) {
+        return;
+    }
+    if (on) {
+        (void)fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    } else {
+        (void)fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    }
+}
+
+static int http_accept_client(int server_sock, struct sockaddr_in *client_addr, socklen_t *addr_len)
+{
+    int client_sock;
+
+    for (;;) {
+        client_sock = accept(server_sock, (struct sockaddr *)client_addr, addr_len);
+        if (client_sock >= 0) {
+            return client_sock;
+        }
+        if (!g_http_running) {
+            return -1;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            OS_MSleep(HTTP_ACCEPT_POLL_MS);
+            continue;
+        }
+        return -1;
+    }
+}
+
+static int http_upload_recv_would_retry(void)
+{
+    return (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT);
+}
+
+static void http_drain_extra_clients(int server_sock)
+{
+    int flags = fcntl(server_sock, F_GETFL, 0);
+    int extra;
+
+    if (flags < 0) {
+        return;
+    }
+    (void)fcntl(server_sock, F_SETFL, flags | O_NONBLOCK);
+    for (;;) {
+        struct sockaddr_in ca;
+        socklen_t len = sizeof(ca);
+        extra = accept(server_sock, (struct sockaddr *)&ca, &len);
+        if (extra < 0) {
+            break;
+        }
+        shutdown(extra, SHUT_RDWR);
+        closesocket(extra);
+    }
+    (void)fcntl(server_sock, F_SETFL, flags);
+}
 
 static int parse_content_length(const char *req)
 {
@@ -250,6 +355,282 @@ static int handle_screensaver_upload_raw(int sock, const char *initial_data, int
 
     send_response(sock, "500 Internal Server Error", "text/plain", "Save failed", 11);
     return -1;
+}
+
+static int http_build_paths(const char *upload_path, const char *filename,
+                            char *final_path, char *temp_path, size_t sz)
+{
+    if (!upload_path || !filename || !final_path || !temp_path) {
+        return -1;
+    }
+    if (strlen(upload_path) + strlen(filename) + 8 >= sz) {
+        return -1;
+    }
+    if (upload_path[strlen(upload_path) - 1] == '/') {
+        snprintf(final_path, sz, "%s%s", upload_path, filename);
+    } else {
+        snprintf(final_path, sz, "%s/%s", upload_path, filename);
+    }
+    snprintf(temp_path, sz, "%s.part", final_path);
+    return 0;
+}
+
+static void url_decode(char *dst, const char *src);
+
+static void http_ensure_dir(const char *dir)
+{
+    FRESULT fr;
+    char buf[HTTP_MAX_PATH];
+    char acc[HTTP_MAX_PATH];
+    const char *p;
+    int i;
+
+    if (!dir || !dir[0]) {
+        return;
+    }
+
+    fr = f_mkdir(dir);
+    if (fr == FR_OK || fr == FR_EXIST) {
+        return;
+    }
+
+    strncpy(buf, dir, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    if (strncmp(buf, "0:", 2) == 0) {
+        strcpy(acc, "0:");
+        p = buf + 2;
+        if (*p == '/') {
+            strcat(acc, "/");
+            p++;
+        }
+    } else {
+        acc[0] = '\0';
+        p = buf;
+        if (*p == '/') {
+            strcat(acc, "/");
+            p++;
+        }
+    }
+
+    while (*p) {
+        char segment[64];
+
+        i = 0;
+        while (*p && *p != '/' && i < (int)sizeof(segment) - 1) {
+            segment[i++] = *p++;
+        }
+        segment[i] = '\0';
+        if (segment[0]) {
+            if (acc[0] && acc[strlen(acc) - 1] != '/') {
+                strcat(acc, "/");
+            }
+            strcat(acc, segment);
+            (void)f_mkdir(acc);
+        }
+        while (*p == '/') {
+            p++;
+        }
+    }
+}
+
+static int parse_request_line_path(const char *req, char *path_out, size_t path_sz)
+{
+    const char *p = req;
+    int i;
+
+    while (*p && *p != ' ') {
+        p++;
+    }
+    if (*p != ' ') {
+        return -1;
+    }
+    while (*p == ' ') {
+        p++;
+    }
+    i = 0;
+    while (*p && *p != ' ' && *p != '\r' && *p != '\n' && i < (int)path_sz - 1) {
+        path_out[i++] = *p++;
+    }
+    path_out[i] = '\0';
+    return (i > 0) ? 0 : -1;
+}
+
+static int parse_api_upload_params(const char *path, char *out_path, size_t path_sz,
+                                   char *out_name, size_t name_sz)
+{
+    const char *q = strchr(path, '?');
+    const char *p;
+    char tmp[HTTP_MAX_PATH];
+
+    if (!q || !out_path || !out_name) {
+        return -1;
+    }
+    out_path[0] = '\0';
+    out_name[0] = '\0';
+
+    p = strstr(q, "path=");
+    if (p) {
+        int i = 0;
+        p += 5;
+        while (*p && *p != '&' && i < (int)sizeof(tmp) - 1) {
+            tmp[i++] = *p++;
+        }
+        tmp[i] = '\0';
+        url_decode(out_path, tmp);
+    }
+
+    p = strstr(q, "name=");
+    if (p) {
+        int i = 0;
+        p += 5;
+        while (*p && *p != '&' && i < (int)sizeof(tmp) - 1) {
+            tmp[i++] = *p++;
+        }
+        tmp[i] = '\0';
+        url_decode(out_name, tmp);
+    }
+
+    if (!out_path[0] || !out_name[0]) {
+        return -1;
+    }
+    if (strlen(out_name) >= name_sz - 1) {
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * PUT /api/upload?path=...&name=...  原始二进制上传（主路径）
+ */
+static int handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
+                                 const char *upload_path, const char *filename)
+{
+    const char *body;
+    char final_path[HTTP_MAX_PATH];
+    char temp_path[HTTP_MAX_PATH];
+    FIL fp;
+    FRESULT fr;
+    int content_len;
+    int body_len;
+    int received;
+    int n;
+    UINT bw;
+
+    body = strstr(header_buf, "\r\n\r\n");
+    if (!body) {
+        send_response(sock, "400 Bad Request", "text/plain", "Missing header", 14);
+        return -1;
+    }
+    body += 4;
+    body_len = header_recv_len - (int)(body - header_buf);
+    content_len = parse_content_length(header_buf);
+    if (content_len <= 0) {
+        send_response(sock, "400 Bad Request", "text/plain", "Bad length", 10);
+        return -1;
+    }
+
+    if (http_build_paths(upload_path, filename, final_path, temp_path, sizeof(final_path)) != 0) {
+        send_response(sock, "400 Bad Request", "text/plain", "Bad path", 8);
+        return -1;
+    }
+
+    printf("[HTTP] upload %s (%d B) -> %s\r\n", filename, content_len, final_path);
+
+    http_ensure_dir(upload_path);
+    http_tune_upload_socket(sock);
+
+    fr = f_open(&fp, temp_path, FA_WRITE | FA_CREATE_ALWAYS);
+    if (fr != FR_OK) {
+        printf("[HTTP] upload f_open fail %d %s\r\n", fr, temp_path);
+        send_response(sock, "500 Internal Server Error", "text/plain", "Open failed", 11);
+        return -1;
+    }
+
+    received = 0;
+    if (body_len > 0) {
+        int chunk = body_len;
+        if (chunk > content_len) {
+            chunk = content_len;
+        }
+        fr = f_write(&fp, body, chunk, &bw);
+        if (fr != FR_OK || (int)bw != chunk) {
+            f_close(&fp);
+            f_unlink(temp_path);
+            send_response(sock, "500 Internal Server Error", "text/plain", "Write failed", 12);
+            return -1;
+        }
+        received += chunk;
+    }
+
+    while (received < content_len && g_http_running) {
+        int want = content_len - received;
+        if (want > HTTP_UPLOAD_CHUNK) {
+            want = HTTP_UPLOAD_CHUNK;
+        }
+        n = recv(sock, g_upload_io_buf, want, 0);
+        if (n < 0) {
+            if (!g_http_running) {
+                printf("[HTTP] upload aborted (stop) at %d/%d\r\n", received, content_len);
+                f_close(&fp);
+                f_unlink(temp_path);
+                return -1;
+            }
+            if (http_upload_recv_would_retry()) {
+                OS_ThreadYield();
+                continue;
+            }
+            printf("[HTTP] upload recv %d errno=%d at %d/%d\r\n",
+                   n, errno, received, content_len);
+            f_close(&fp);
+            f_unlink(temp_path);
+            return -1;
+        }
+        if (n == 0) {
+            printf("[HTTP] upload peer closed at %d/%d\r\n", received, content_len);
+            f_close(&fp);
+            f_unlink(temp_path);
+            return -1;
+        }
+        fr = f_write(&fp, g_upload_io_buf, n, &bw);
+        if (fr != FR_OK || (int)bw != n) {
+            printf("[HTTP] upload f_write fail %d bw=%u\r\n", fr, (unsigned)bw);
+            f_close(&fp);
+            f_unlink(temp_path);
+            send_response(sock, "500 Internal Server Error", "text/plain", "Write failed", 12);
+            return -1;
+        }
+        received += n;
+        OS_ThreadYield();
+    }
+
+    if (received != content_len) {
+        f_close(&fp);
+        f_unlink(temp_path);
+        send_response(sock, "400 Bad Request", "text/plain", "Size mismatch", 13);
+        return -1;
+    }
+
+    if (f_sync(&fp) != FR_OK) {
+        f_close(&fp);
+        f_unlink(temp_path);
+        send_response(sock, "500 Internal Server Error", "text/plain", "Sync failed", 11);
+        return -1;
+    }
+    f_close(&fp);
+
+    f_unlink(final_path);
+    fr = f_rename(temp_path, final_path);
+    if (fr != FR_OK) {
+        printf("[HTTP] upload rename fail %d\r\n", fr);
+        f_unlink(temp_path);
+        send_response(sock, "500 Internal Server Error", "text/plain", "Rename failed", 13);
+        return -1;
+    }
+
+    printf("[HTTP] upload OK %s (%d B)\r\n", final_path, received);
+    send_response(sock, "200 OK", "text/plain", "Upload OK", 9);
+    return 0;
 }
 
 /*
@@ -480,15 +861,17 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    var s=document.querySelector('#'+itemId+' .upload-item-status');\n"
         "    if(s){s.className='upload-item-status '+cls;s.textContent=msg;}}\n"
         "function uploadOneXHR(file,path,itemId,done){\n"
-        "    var fd=new FormData();fd.append('path',path);fd.append('file',file);\n"
+        "    var url='/api/upload?path='+encodeURIComponent(path)+'&name='+encodeURIComponent(file.name);\n"
         "    var xhr=new XMLHttpRequest();\n"
+        "    xhr.open('PUT',url,true);\n"
+        "    xhr.setRequestHeader('Content-Type','application/octet-stream');\n"
         "    xhr.upload.addEventListener('progress',function(e){\n"
         "        if(e.lengthComputable)setItemProgress(itemId,e.loaded,e.total);},false);\n"
         "    xhr.addEventListener('load',function(){\n"
         "        if(xhr.status===200){setItemStatus(itemId,'completed','OK');setItemProgress(itemId,1,1);}\n"
         "        else setItemStatus(itemId,'error','Failed');done();},false);\n"
         "    xhr.addEventListener('error',function(){setItemStatus(itemId,'error','Error');done();},false);\n"
-        "    xhr.open('POST','/upload',true);xhr.send(fd);}\n"
+        "    xhr.send(file);}\n"
         "function startUpload() {\n"
         "    if (selectedFiles.length === 0) {\n"
         "        alert('\\u8BF7\\u5148\\u9009\\u62E9\\u6587\\u4EF6\\uFF01');\n"
@@ -530,7 +913,7 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    '</div>';\n"
         "    if (currentUploadIndex === 0) progressDiv.innerHTML = '<h4>Progress</h4>' + itemHtml;\n"
         "    else progressDiv.innerHTML += itemHtml;\n"
-        "    var advance = function(){currentUploadIndex++;setTimeout(uploadNextFile,500);};\n"
+        "    var advance = function(){currentUploadIndex++;setTimeout(uploadNextFile,0);};\n"
         "    if (isFontDir(currentPath) && isTtfFile(file.name) && window.L1GlyfBuilder) {\n"
         "        setItemStatus(itemId,'uploading','Build L1...');\n"
         "        L1GlyfBuilder.uploadTtfWithCache(file,currentPath,{\n"
@@ -854,17 +1237,10 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     int total_written = 0;
     int found_filename = 0;
     int buf_used = 0;
-    
-    /* 强制从 PSRAM 申请缓冲区，不再依赖失效的 __CONFIG_PSRAM 宏 */
-    #define BUFFER_SIZE (16 * 1024)  /* 16KB */
-    char *recv_buffer = (char *)_dma_malloc(BUFFER_SIZE, DMAHEAP_PSRAM);
-    if (!recv_buffer) {
-        HTTP_LOG("Failed to allocate PSRAM g_http_buffer for upload!");
-        return -1;
-    }
-    HTTP_LOG("Using PSRAM g_http_buffer for upload, size: %d bytes", BUFFER_SIZE);
-    
-    HTTP_LOG("Processing streaming upload, path: %s, initial_len: %d", upload_path, initial_len);
+    char *recv_buffer = (char *)g_upload_io_buf;
+    const int BUFFER_SIZE = HTTP_UPLOAD_IO_SIZE;
+
+    HTTP_LOG("Streaming upload path=%s initial_len=%d", upload_path, initial_len);
     
     /* 确保上传目录存在 */
     res = f_mkdir(upload_path);
@@ -888,7 +1264,6 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
         /* 检查是否被要求停止 */
         if (!g_http_running) {
             HTTP_LOG("Upload aborted (finding filename): server stopping");
-            _dma_free(recv_buffer, 0);
             return -1;
         }
         
@@ -930,12 +1305,10 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
             int recv_len = recv(sock, recv_buffer + buf_used, BUFFER_SIZE - buf_used - 1, 0);
             if (recv_len <= 0) {
                 HTTP_LOG("recv returned %d while finding filename", recv_len);
-                _dma_free(recv_buffer, 0);
                 return -1;
             }
             buf_used += recv_len;
             recv_buffer[buf_used] = '\0';
-            OS_MSleep(50);  // 让lwIP释放pbuf内存（增加延迟避免heap exhausted）
         }
     }
     
@@ -947,7 +1320,6 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
         /* 检查是否被要求停止 */
         if (!g_http_running) {
             HTTP_LOG("Upload aborted (finding header end): server stopping");
-            _dma_free(recv_buffer, 0);
             return -1;
         }
         
@@ -966,12 +1338,10 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
             int recv_len = recv(sock, recv_buffer + buf_used, BUFFER_SIZE - buf_used - 1, 0);
             if (recv_len <= 0) {
                 HTTP_LOG("recv returned %d while finding header end", recv_len);
-                _dma_free(recv_buffer, 0);
                 return -1;
             }
             buf_used += recv_len;
             recv_buffer[buf_used] = '\0';
-            OS_MSleep(50);  // 让lwIP释放pbuf内存（增加延迟避免heap exhausted）
         }
     }
     
@@ -986,7 +1356,6 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
     res = f_open(&fp, filepath, FA_WRITE | FA_CREATE_ALWAYS);
     if (res != FR_OK) {
         HTTP_LOG("f_open failed: %d", res);
-        _dma_free(recv_buffer, 0);
         return -1;
     }
     
@@ -1028,9 +1397,6 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
                 }
                 HTTP_LOG("Upload complete! Total: %d bytes", total_written);
                 f_close(&fp);
-                _dma_free(recv_buffer, 0);
-                
-                /* 注意：成功后应当向浏览器返回 200 OK 响应 */
                 send_response(sock, "200 OK", "text/plain", "Upload OK", 9);
                 return 0;
             }
@@ -1059,12 +1425,9 @@ static int handle_file_upload_streaming(int sock, const char *boundary,
         }
         
         buf_used += recv_len;
-        recv_buffer[buf_used] = '\0';
-        OS_MSleep(50);  // 让lwIP释放pbuf内存（增加延迟避免heap exhausted）
     }
     
     f_close(&fp);
-    _dma_free(recv_buffer, 0);
     HTTP_LOG("Connection closed abruptly or write failed. Total: %d bytes", total_written);
     send_response(sock, "400 Bad Request", "text/plain", "Incomplete upload", 17);
     return -1;
@@ -1139,9 +1502,9 @@ static int parse_request(const char *req, char *method, char *path, char *versio
             HTTP_LOG("Download request: %s", file_path);
         }
     } else if (dir_path) {
-        /* 提取?path=参数（用于目录浏览） */
+        /* ?path= 用于目录浏览；/api/upload 的 query 由上传处理自行解析 */
         const char *path_param = strstr(path, "?path=");
-        if (path_param) {
+        if (path_param && strncmp(path, "/api/upload", 11) != 0) {
             /* 找到?path=，提取路径部分 */
             char path_copy[HTTP_MAX_PATH];
             strncpy(path_copy, path, sizeof(path_copy) - 1);
@@ -1181,24 +1544,8 @@ static int parse_request(const char *req, char *method, char *path, char *versio
  */
 static int http_server_alloc_buffers(void)
 {
-    if (!g_http_buffer) {
-        g_http_buffer = (char *)_dma_malloc(HTTP_BUF_SIZE, DMAHEAP_PSRAM);
-    }
-    if (!g_http_response) {
-        g_http_response = (char *)_dma_malloc(HTTP_RESPONSE_SIZE, DMAHEAP_PSRAM);
-    }
-    if (!g_http_buffer || !g_http_response) {
-        HTTP_LOG("PSRAM buffer alloc failed buf=%p resp=%p", g_http_buffer, g_http_response);
-        if (g_http_buffer) {
-            _dma_free(g_http_buffer, 0);
-            g_http_buffer = NULL;
-        }
-        if (g_http_response) {
-            _dma_free(g_http_response, 0);
-            g_http_response = NULL;
-        }
-        return -1;
-    }
+    g_http_buffer = g_http_workspace;
+    g_http_response = g_http_workspace + HTTP_BUF_SIZE;
     return 0;
 }
 
@@ -1252,34 +1599,31 @@ static int http_server_alloc_buffers(void)
     }
     
     /* 监听 */
-    if (listen(g_server_sock, 5) < 0) {
+    if (listen(g_server_sock, 1) < 0) {
         HTTP_LOG("Failed to listen");
         closesocket(g_server_sock);
         g_server_sock = -1;
         goto serve_cleanup;
     }
-    
+
+    printf("[HTTP] listening :%d (rcvbuf=%d sndbuf=%d sram_free=%u)\r\n",
+           g_http_port, HTTP_SOCK_RCVBUF, HTTP_SOCK_SNDBUF,
+           (unsigned)sram_heap_free_bytes());
+    print_heap_info();
     HTTP_LOG("Server listening on port %d", g_http_port);
+    http_set_nonblock(g_server_sock, 1);
     
     while (g_http_running) {
-        client_sock = accept(g_server_sock, (struct sockaddr *)&client_addr, &addr_len);
+        client_sock = http_accept_client(g_server_sock, &client_addr, &addr_len);
         if (client_sock < 0) {
             break;
         }
-
-        /* stop 期间 accept 可能仍返回已排队连接，直接丢弃 */
-        if (!g_http_running) {
-            closesocket(client_sock);
-            break;
-        }
         
-        /* 记录client_sock到全局变量，以便stop时可以shutdown中断recv */
         g_client_sock = client_sock;
-        
-        /* 设置recv超时为2秒，避免stop时recv永久阻塞 */
-        struct timeval recv_tv = {2, 0};
-        setsockopt(client_sock, SOL_SOCKET, SO_RCVTIMEO, &recv_tv, sizeof(recv_tv));
-        
+        http_tune_client_socket(client_sock);
+
+        printf("[HTTP] client %s:%d\r\n",
+               inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
         HTTP_LOG("Client connected: %s:%d",
                 inet_ntoa(client_addr.sin_addr),
                 ntohs(client_addr.sin_port));
@@ -1325,7 +1669,21 @@ static int http_server_alloc_buffers(void)
                         send_html_response(client_sock, g_http_response);
                     }
                     }
-                } else if (strcmp(method, "POST") == 0) {
+                    } else if (strcmp(method, "PUT") == 0 &&
+                               strncmp(path, "/api/upload", 11) == 0) {
+                        char up_path[HTTP_MAX_PATH];
+                        char up_name[128];
+                        char raw_path[256];
+                        if (parse_request_line_path(g_http_buffer, raw_path, sizeof(raw_path)) != 0 ||
+                            parse_api_upload_params(raw_path, up_path, sizeof(up_path),
+                                                    up_name, sizeof(up_name)) != 0) {
+                            send_response(client_sock, "400 Bad Request", "text/plain",
+                                          "Bad upload query", 16);
+                        } else {
+                            handle_api_upload_raw(client_sock, g_http_buffer, recv_len,
+                                                  up_path, up_name);
+                        }
+                    } else if (strcmp(method, "POST") == 0) {
                     /* 检查是否是删除请求 */
                     if (strncmp(path, "/delete", 7) == 0) {
                         HTTP_LOG("DELETE request: %s", dir_path);
@@ -1340,159 +1698,70 @@ static int http_server_alloc_buffers(void)
                     } else if (strcmp(path, "/screensaver/upload") == 0) {
                         handle_screensaver_upload_raw(client_sock, g_http_buffer, recv_len);
                     } else if (strstr(g_http_buffer, "multipart/form-data")) {
-                        HTTP_LOG("=== DEBUG: Before header scan, recv_len=%d ===", recv_len);
-                        HTTP_LOG("=== DEBUG: First 50 bytes: %.50s ===", g_http_buffer);
-                        
-                        /* 确保接收完整的header（直到\r\n\r\n） */
                         char *header_end = strstr(g_http_buffer, "\r\n\r\n");
                         if (!header_end) {
-                            /* header不完整，需要继续接收 */
                             int total_received = recv_len;
-                            HTTP_LOG("=== DEBUG: Header incomplete, trying to receive more... ===");
                             while (!header_end && total_received < HTTP_BUF_SIZE - 1 && g_http_running) {
-                                int more = recv(client_sock, g_http_buffer + total_received, HTTP_BUF_SIZE - total_received - 1, 0);
+                                int more = recv(client_sock, g_http_buffer + total_received,
+                                                HTTP_BUF_SIZE - total_received - 1, 0);
                                 if (more <= 0) {
-                                    HTTP_LOG("=== DEBUG: recv returned %d, breaking ===", more);
                                     break;
                                 }
                                 total_received += more;
                                 g_http_buffer[total_received] = '\0';
-                                HTTP_LOG("=== DEBUG: After recv, total_received=%d ===", total_received);
                                 header_end = strstr(g_http_buffer, "\r\n\r\n");
-                                if (header_end) {
-                                    HTTP_LOG("=== DEBUG: Found header_end at offset %d ===", header_end - g_http_buffer);
-                                    break;
-                                }
                             }
                             recv_len = total_received;
                         }
-                        
-                        HTTP_LOG("=== DEBUG: After header scan, recv_len=%d, g_http_buffer len=%d ===", recv_len, (int)strlen(g_http_buffer));
-                        
+
                         if (header_end && g_http_running) {
-                            int header_total_len = header_end + 4 - g_http_buffer;
-                            HTTP_LOG("=== DEBUG: header_end found, header_total_len=%d ===", header_total_len);
-                            HTTP_LOG("=== DEBUG: Content-Length in header ===");
-                            /* 获取boundary */
                             const char *boundary_start = strstr(g_http_buffer, "boundary=");
                             char boundary[64] = {0};
+                            char upload_path[HTTP_MAX_PATH] = UPLOAD_PATH;
+                            char uploaded_filename[128] = {0};
+                            int header_total_len = (int)(header_end + 4 - g_http_buffer);
+                            int body_initial_len = recv_len - header_total_len;
+                            const char *path_start;
+
                             if (boundary_start) {
                                 boundary_start += 9;
                                 int i = 0;
-                                while (*boundary_start && *boundary_start != '\r' && i < sizeof(boundary) - 3) {
+                                while (*boundary_start && *boundary_start != '\r' && i < (int)sizeof(boundary) - 3) {
                                     boundary[i++] = *boundary_start++;
                                 }
-                                /* 如果boundary没有--前缀，添加上去 */
                                 if (boundary[0] != '-' || boundary[1] != '-') {
                                     memmove(boundary + 2, boundary, i + 1);
                                     boundary[0] = '-';
                                     boundary[1] = '-';
                                 }
                             }
-                            
-                            /* 提取上传路径 - 从multipart数据中的name="path"字段 */
-                            char upload_path[HTTP_MAX_PATH] = UPLOAD_PATH;
-                            const char *path_start = strstr(g_http_buffer, "name=\"path\"");
+
+                            path_start = strstr(g_http_buffer, "name=\"path\"");
                             if (path_start) {
                                 const char *value_start = strstr(path_start, "\r\n\r\n");
                                 if (value_start) {
-                                    value_start += 4;
                                     int i = 0;
-                                    while (*value_start && *value_start != '\r' && i < sizeof(upload_path) - 1) {
+                                    value_start += 4;
+                                    while (*value_start && *value_start != '\r' && i < (int)sizeof(upload_path) - 1) {
                                         upload_path[i++] = *value_start++;
                                     }
                                     upload_path[i] = '\0';
-                                    HTTP_LOG("Upload path from form: %s", upload_path);
-                                }
-                            } else {
-                                /* 默认使用UPLOAD_PATH */
-                                strncpy(upload_path, UPLOAD_PATH, sizeof(upload_path) - 1);
-                                upload_path[sizeof(upload_path) - 1] = '\0';
-                            }
-                            
-                            /* 处理文件上传 - 使用流式处理支持大文件 */
-                            char uploaded_filename[128] = {0};
-                            int header_len = header_end + 4 - g_http_buffer;
-                            
-                            /* 调试：打印header内容 - 扩大打印范围 */
-                            HTTP_LOG("=== DEBUG: Header dump (len=%d) ===", header_len);
-                            int dump_len = (header_len > 400) ? 400 : header_len;
-                            char hex_line[128];
-                            char ascii_line[128];
-                            int col = 0;
-                            hex_line[0] = '\0';
-                            ascii_line[0] = '\0';
-                            for (int i = 0; i < dump_len; i++) {
-                                char tmp[8];
-                                snprintf(tmp, sizeof(tmp), "%02X ", (unsigned char)g_http_buffer[i]);
-                                strcat(hex_line, tmp);
-                                if (g_http_buffer[i] >= 0x20 && g_http_buffer[i] < 0x7F) {
-                                    char a[2] = {(char)g_http_buffer[i], '\0'};
-                                    strcat(ascii_line, a);
-                                } else {
-                                    strcat(ascii_line, ".");
-                                }
-                                col++;
-                                if (col >= 16) {
-                                    HTTP_LOG("%s | %s", hex_line, ascii_line);
-                                    hex_line[0] = '\0';
-                                    ascii_line[0] = '\0';
-                                    col = 0;
                                 }
                             }
-                            if (col > 0) {
-                                /* 填充对齐 */
-                                while (col < 16) {
-                                    strcat(hex_line, "   ");
-                                    col++;
-                                }
-                                HTTP_LOG("%s | %s", hex_line, ascii_line);
+
+                            if (body_initial_len < 0) {
+                                body_initial_len = 0;
                             }
-                            HTTP_LOG("=== End header dump ===");
-                            
-                            /* 特别检查Content-Type和filename */
-                            char *ct = strstr(g_http_buffer, "Content-Type:");
-                            if (ct) {
-                                HTTP_LOG("Content-Type found at offset %d", ct - g_http_buffer);
+
+                            if (handle_file_upload_streaming(client_sock, boundary,
+                                    g_http_buffer + header_total_len, body_initial_len,
+                                    uploaded_filename, upload_path) == 0) {
+                                HTTP_LOG("Multipart upload OK: %s", uploaded_filename);
                             } else {
-                                HTTP_LOG("Content-Type NOT FOUND in header");
-                            }
-                            char *fn = strstr(g_http_buffer, "filename=");
-                            if (fn) {
-                                HTTP_LOG("filename found at offset %d", fn - g_http_buffer);
-                            } else {
-                                HTTP_LOG("filename NOT FOUND in header");
-                            }
-                            
-                            if (handle_file_upload_streaming(client_sock, boundary, g_http_buffer, header_len, uploaded_filename, upload_path) == 0) {
-                                HTTP_LOG("File uploaded successfully: %s", uploaded_filename);
-                                /* 上传成功 - chunked响应已在streaming函数中发送，此处不重复发送 */
-                            } else {
-                                snprintf(g_http_response, HTTP_RESPONSE_SIZE,
-                                    "<!DOCTYPE html>"
-                                    "<html>"
-                                    "<head>"
-                                    "<meta charset=\"UTF-8\">"
-                                    "<title>上传失败</title>"
-                                    "<style>"
-                                    "body { font-family: Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #f0f0f0; }"
-                                    ".container { text-align: center; background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
-                                    "h1 { color: #f44336; }"
-                                    ".btn { display: inline-block; padding: 10px 20px; background: #f44336; color: white; text-decoration: none; border-radius: 5px; margin-top: 20px; }"
-                                    "</style>"
-                                    "</head>"
-                                    "<body>"
-                                    "<div class=\"container\">"
-                                    "<h1>上传失败</h1>"
-                                    "<a href=\"/\" class=\"btn\">返回文件管理</a>"
-                                    "</div>"
-                                    "</body>"
-                                    "</html>");
-                                send_html_response(client_sock, g_http_response);
+                                send_response(client_sock, "500 Internal Server Error", "text/plain",
+                                              "Upload failed", 13);
                             }
                         } else {
-                            /* 无法获取完整header */
-                            HTTP_LOG("Failed to get complete header");
                             send_response(client_sock, "400 Bad Request", "text/plain",
                                        "Bad Request: incomplete header", 28);
                         }
@@ -1514,8 +1783,12 @@ static int http_server_alloc_buffers(void)
             }
         }
         
+        shutdown(client_sock, SHUT_RDWR);
         closesocket(client_sock);
         g_client_sock = -1;
+        if (g_server_sock >= 0) {
+            http_drain_extra_clients(g_server_sock);
+        }
 
         if (!g_http_running) {
             break;
@@ -1523,13 +1796,14 @@ static int http_server_alloc_buffers(void)
     }
      
 serve_cleanup:
+    http_set_nonblock(g_server_sock, 0);
     if (g_server_sock >= 0) {
         closesocket(g_server_sock);
         g_server_sock = -1;
     }
 
-    if (g_http_buffer) { _dma_free(g_http_buffer, 0); g_http_buffer = NULL; }
-    if (g_http_response) { _dma_free(g_http_response, 0); g_http_response = NULL; }
+    printf("[HTTP] stopped\r\n");
+    print_heap_info();
 
     g_http_serving = 0;
     /* 保留工作线程，回到 idle 等待下次 start */
@@ -1557,7 +1831,7 @@ int http_server_reserve_thread(void)
         return 0;
     }
 
-    HTTP_LOG("Reserving worker thread (stack=%d bytes SRAM)...", HTTP_THREAD_STACK_SIZE);
+    HTTP_LOG("Reserving worker thread (stack=%d bytes)...", HTTP_THREAD_STACK_SIZE);
     if (OS_ThreadCreate(&g_http_thread, "http_server",
                         http_server_thread, NULL,
                         OS_PRIORITY_NORMAL, HTTP_THREAD_STACK_SIZE) != 0) {
@@ -1587,6 +1861,11 @@ int http_server_start(void)
         return 0;
     }
 
+    if (sram_heap_free_bytes() < HTTP_MIN_SRAM_FREE) {
+        printf("[HTTP] WARN: SRAM free low (%u B), network buffers use PSRAM fallback\r\n",
+               (unsigned)sram_heap_free_bytes());
+    }
+
     g_http_running = 1;
     HTTP_LOG("HTTP server start requested (worker will bind port %d)", g_http_port);
     return 0;
@@ -1601,7 +1880,7 @@ void http_server_stop(void)
         return;
     }
 
-    HTTP_LOG("Stopping HTTP server...");
+    printf("[HTTP] stopping...\r\n");
     g_http_running = 0;
 
     if (g_client_sock >= 0) {
@@ -1609,17 +1888,22 @@ void http_server_stop(void)
     }
 
     if (g_server_sock >= 0) {
-        int srv = g_server_sock;
-        shutdown(srv, SHUT_RDWR);
-        closesocket(srv);
-        g_server_sock = -1;
+        shutdown(g_server_sock, SHUT_RDWR);
     }
 
-    for (int wait_count = 0; wait_count < 50 && g_http_serving; wait_count++) {
-        OS_MSleep(100);
+    for (int wait_count = 0; wait_count < HTTP_STOP_WAIT_MAX && g_http_serving; wait_count++) {
+        OS_MSleep(HTTP_STOP_WAIT_MS);
     }
     if (g_http_serving) {
-        HTTP_LOG("Worker still serving after timeout");
+        printf("[HTTP] WARN: worker still serving, force close sockets\r\n");
+        if (g_server_sock >= 0) {
+            closesocket(g_server_sock);
+            g_server_sock = -1;
+        }
+        g_http_serving = 0;
+    } else if (g_server_sock >= 0) {
+        closesocket(g_server_sock);
+        g_server_sock = -1;
     }
 
     if (g_client_sock >= 0) {
@@ -1627,7 +1911,9 @@ void http_server_stop(void)
         g_client_sock = -1;
     }
 
-    HTTP_LOG("HTTP server stopped");
+    print_heap_info();
+    printf("[HTTP] stop done (running=%d serving=%d)\r\n",
+           g_http_running, g_http_serving);
 }
 
 /*

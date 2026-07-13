@@ -16,6 +16,7 @@
  ../../../../include/libc/stdio.h \
  ../../../../project/demo/FontExp/epub_xhtml_parser.h \
  ../../../../include/sys/dma_heap.h ../../../../include/types.h \
+ ../../../../include/sys/sys_heap.h \
  ../../../../include/driver/chip/hal_dcache.h \
  ../../../../include/driver/chip/hal_def.h \
  ../../../../include/driver/chip/chip.h \
@@ -23,8 +24,7 @@
  ../../../../include/driver/cmsis/core_cmInstr.h \
  ../../../../include/driver/cmsis/core_cmFunc.h \
  ../../../../include/driver/cmsis/core_cmSimd.h \
- ../../../../include/driver/chip/psram/psram.h \
- ../../../../include/sys/sys_heap.h
+ ../../../../include/driver/chip/psram/psram.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -66,6 +66,8 @@
 
 ../../../../include/types.h:
 
+../../../../include/sys/sys_heap.h:
+
 ../../../../include/driver/chip/hal_dcache.h:
 
 ../../../../include/driver/chip/hal_def.h:
@@ -81,5 +83,3 @@
 ../../../../include/driver/cmsis/core_cmSimd.h:
 
 ../../../../include/driver/chip/psram/psram.h:
-
-../../../../include/sys/sys_heap.h:
