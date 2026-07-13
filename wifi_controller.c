@@ -33,8 +33,8 @@
 
 #define WC_FM_PAUSE_SLEEP_MS  5000
 
-/* 重试退避 (ms) */
-static const uint32_t kBackoffMs[] = { 5000, 10000, 30000, 60000, 60000 };
+/* 重试退避 (ms)：首次连接不等待；失败后 1s/3s/... */
+static const uint32_t kBackoffMs[] = { 1000, 3000, 10000, 30000, 60000 };
 #define BACKOFF_COUNT  (sizeof(kBackoffMs)/sizeof(kBackoffMs[0]))
 #define CONNECT_TIMEOUT_MS  30000
 #define POLL_INTERVAL_MS    5000  /* 已连接时检测 link 的周期 */
@@ -294,9 +294,13 @@ static void wc_task(void *arg)
                 wc_sleep_interruptible(60000);
                 break;
             }
-            /* 退避 */
-            {
-                uint32_t backoff = kBackoffMs[g_wifi.retry_count];
+            /* 仅失败重试才退避；retry_count==0 表示首次连接，立即执行 */
+            if (g_wifi.retry_count > 0) {
+                uint32_t index = (uint32_t)(g_wifi.retry_count - 1);
+                if (index >= BACKOFF_COUNT) {
+                    index = BACKOFF_COUNT - 1;
+                }
+                uint32_t backoff = kBackoffMs[index];
                 WC_LOG("Backoff %ums before retry %d", backoff, g_wifi.retry_count);
                 wc_sleep_interruptible(backoff);
                 if (!g_wc_running || wc_has_pending_request() || !g_wifi.enabled ||

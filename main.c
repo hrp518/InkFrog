@@ -621,6 +621,12 @@ static void on_wifi_phase_change(WLAN_Phase_t phase, void *user_data)
     (void)user_data;
     printf("[WIFIC] Phase callback: %d\n", (int)phase);
 
+    if (phase == WLAN_PHASE_CONNECTING) {
+        /* 首页 CONNECTING 不刷图标，避免与 WPA 关联竞态 */
+        settings_wifi_on_phase_change(phase);
+        return;
+    }
+
     /* Home 顶部 WiFi 图标 - 仅 CONNECTED 时显示 */
     if (g_wifi_icon_label) {
         if (phase == WLAN_PHASE_CONNECTED) {
@@ -1243,16 +1249,13 @@ int main(void)
         printf("[HTTP] WARNING: failed to reserve worker thread at boot\r\n");
     }
     wifi_controller_init();
-    wifi_controller_start();
     
-    /* 创建主界面UI - 先显示UI，WiFi后台连接 */
+    /* 创建主界面UI - 先显示首屏，再启动 WiFi */
     main_ui_create();
     screensaver_init();
-    font_warm_schedule_boot();
     
     printf("\r\n[OK] LVGL system initialized!\r\n");
     printf("[INFO] Controls: Files and Settings tiles\r\n");
-    printf("[INFO] WiFi connecting in background...\r\n\r\n");
 
     /* UI创建完毕，启动后台任务 */
     printf("[Display] create disp_task stack=%d lvgl stack=%d\r\n",
@@ -1271,13 +1274,17 @@ int main(void)
     }
     print_heap_info();
 
-    /* WiFi 状态机已在 font warm 前启动 */
-    printf("[WiFi] WiFi controller already started at boot\r\n");
-    wifi_controller_register_cb(on_wifi_phase_change, NULL);
-
-    // 初始化完成，恢复EPD刷新
     epd_resume_refresh();
     printf("[EPD] Refresh resumed after init\n");
+
+    /* 首屏刷完再连 WiFi，避免 EPD 全刷与 wlan_sta_enable 竞态 */
+    (void)epd_wait_first_frame_done(2000);
+
+    wifi_controller_register_cb(on_wifi_phase_change, NULL);
+    wifi_controller_start();
+    printf("[INFO] WiFi connecting in background...\r\n\r\n");
+
+    font_warm_schedule_boot();
 
     /* 主线程完成，LVGL任务在后台运行 */
     while (1) {

@@ -20,9 +20,12 @@
 #include "driver/chip/hal_gpio.h"
 #include "kernel/os/os.h"
 #include "task.h"
+#include "wifi_controller.h"
 
 /* LVGL线程句柄 - 用于刷新时挂起LVGL任务防止SPI冲突 */
 extern OS_Thread_t lvgl_thread;
+
+static volatile int s_epd_first_frame_done;
 
 /*====================
  * EPD_3IN52 配置
@@ -403,6 +406,11 @@ void epd_do_refresh(void) {
     if (!epd_refresh_requested) return;
     if (epd_refresh_in_progress) return;
 
+    /* WLAN 关联阶段对时序敏感，推迟全刷到连接结束 */
+    if (g_wifi.phase == WLAN_PHASE_CONNECTING) {
+        return;
+    }
+
     epd_refresh_requested = 0;
     epd_refresh_in_progress = 1;
     uint32_t t = epd_get_tick();
@@ -440,6 +448,23 @@ void epd_do_refresh(void) {
     epd_sync.state = EPD_STATE_IDLE;
 
     printf("[EPD] LVGL resumed, invalidation ENABLED (inv_p cleared)\n");
+
+    s_epd_first_frame_done = 1;
+}
+
+int epd_wait_first_frame_done(uint32_t timeout_ms)
+{
+    uint32_t t0 = epd_get_tick();
+
+    while (!s_epd_first_frame_done) {
+        if (timeout_ms > 0 && (epd_get_tick() - t0) >= timeout_ms) {
+            printf("[EPD] wait_first_frame timeout (%ums)\r\n", (unsigned)timeout_ms);
+            return -1;
+        }
+        OS_MSleep(20);
+    }
+    printf("[EPD] first frame done\r\n");
+    return 0;
 }
 
 /*====================

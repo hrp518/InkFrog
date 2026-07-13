@@ -3,6 +3,7 @@
 #include "settings_screen.h"
 #include "settings_storage.h"
 #include "http_server.h"
+#include "wifi_controller.h"
 #include "lvgl/lvgl.h"
 #include "lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h"
 #include "fs/fatfs/ff.h"
@@ -252,6 +253,12 @@ static void font_warm_timer_cb(lv_timer_t * timer)
     if(http_server_is_running()) {
         printf("[FONT_WARM] HTTP active, retry in %dms\n", FONT_WARM_RETRY_MS);
         s_warm_timer = lv_timer_create(font_warm_timer_cb, FONT_WARM_RETRY_MS, NULL);
+        lv_timer_set_repeat_count(s_warm_timer, 1);
+        return;
+    }
+    if(g_wifi.phase == WLAN_PHASE_CONNECTING) {
+        printf("[FONT_WARM] WiFi connecting, retry in 1s\n");
+        s_warm_timer = lv_timer_create(font_warm_timer_cb, 1000, NULL);
         lv_timer_set_repeat_count(s_warm_timer, 1);
         return;
     }

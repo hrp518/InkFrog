@@ -78,6 +78,8 @@ int wlan_manager_connect(const char *ssid, const char *passwd)
     }
     
     WLAN_LOG("Connecting to SSID: %s", ssid);
+    g_connect_canceled = 0;
+    g_connected = 0;
     g_wlan_state = WLAN_STATE_CONNECTING;
     
     /* 记录当前连接的SSID */

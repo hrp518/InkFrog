@@ -59,6 +59,12 @@ void epd_set_content_dirty(void);
 void epd_do_refresh(void);
 
 /**
+ * 阻塞等待首帧 EPD 刷新完成（启动 WiFi 前调用）
+ * @return 0 成功, -1 超时
+ */
+int epd_wait_first_frame_done(uint32_t timeout_ms);
+
+/**
  * 获取系统运行时间（毫秒）- 调试用
  */
 uint32_t epd_get_tick(void);
