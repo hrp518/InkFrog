@@ -73,6 +73,8 @@ uint32_t epd_get_tick(void) {
 static uint8_t epd_sync_can_refresh(void) {
     uint32_t now = epd_get_tick();
     if (epd_sync.refresh_paused) return 0;
+    /* 首屏必须放出；CONNECTING 期间只推迟后续全刷 */
+    if (g_wifi.phase == WLAN_PHASE_CONNECTING && s_epd_first_frame_done) return 0;
     return (now - epd_sync.last_refresh_time >= epd_sync.min_interval_ms) ? 1 : 0;
 }
 
@@ -406,8 +408,8 @@ void epd_do_refresh(void) {
     if (!epd_refresh_requested) return;
     if (epd_refresh_in_progress) return;
 
-    /* WLAN 关联阶段对时序敏感，推迟全刷到连接结束 */
-    if (g_wifi.phase == WLAN_PHASE_CONNECTING) {
+    /* 首屏可与 WiFi 并行；首帧完成后 CONNECTING 再推迟全刷 */
+    if (g_wifi.phase == WLAN_PHASE_CONNECTING && s_epd_first_frame_done) {
         return;
     }
 
@@ -467,6 +469,11 @@ int epd_wait_first_frame_done(uint32_t timeout_ms)
     return 0;
 }
 
+int epd_is_first_frame_done(void)
+{
+    return s_epd_first_frame_done ? 1 : 0;
+}
+
 /*====================
  * 公开API
  *===================*/
@@ -489,6 +496,9 @@ void epd_notify_touch_up(void) {
 }
 
 void epd_mark_refresh_pending(void) {
+    if (g_wifi.phase == WLAN_PHASE_CONNECTING && s_epd_first_frame_done) {
+        return;
+    }
     if (epd_sync.state != EPD_STATE_REFRESHING && !epd_sync.refresh_busy && !epd_sync.refresh_paused) {
         lv_disp_t * disp = lv_disp_get_default();
         if (disp && !lv_disp_is_invalidation_enabled(disp)) {

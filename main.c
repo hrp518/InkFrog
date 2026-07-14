@@ -41,6 +41,7 @@
 #include "font_priority_loader.h"
 #include "settings_screen.h"
 #include "font_warm.h"
+#include "time_sync.h"
 #include "settings_storage.h"
 
 extern const lv_font_t lv_font_montserrat_12;
@@ -79,6 +80,8 @@ static uint8_t g_adc_inited = 0;
 
 /* Home 顶部 WiFi 图标 (仅 CONNECTED 时显示) */
 static lv_obj_t *g_wifi_icon_label = NULL;
+/* Home 顶部时间 (授时后显示 HH:MM) */
+static lv_obj_t *g_time_label = NULL;
 
 /* PA6 按键屏保触发 */
 #define PA6_BUTTON_PIN  GPIO_PIN_6
@@ -616,25 +619,63 @@ static void settings_font_sel_btn_cb(lv_event_t *e) {
 
 /* 在 LVGL 线程中由 wlan_manager_poll() 触发
  * 主要作用: WiFi 掉了自动停 HTTP + 更新 home WiFi 图标 */
+static int s_font_warm_after_wifi_done;
+
+/* 同步首页 WiFi 图标到当前 phase，并尽快刷到墨水屏 */
+static void home_time_label_apply(int force_epd)
+{
+    if (!g_time_label) {
+        return;
+    }
+    if (time_sync_is_valid() && time_sync_get_text()[0]) {
+        lv_label_set_text(g_time_label, time_sync_get_text());
+    } else {
+        lv_label_set_text(g_time_label, "");
+    }
+    if (force_epd) {
+        lv_obj_invalidate(g_time_label);
+        lv_refr_now(NULL);
+        epd_mark_refresh_pending();
+    }
+}
+
+static void home_wifi_icon_sync(int force_epd)
+{
+    if (!g_wifi_icon_label) {
+        return;
+    }
+
+    if (g_wifi.phase == WLAN_PHASE_CONNECTED) {
+        lv_label_set_text(g_wifi_icon_label, LV_SYMBOL_WIFI);
+    } else {
+        lv_label_set_text(g_wifi_icon_label, "");
+    }
+
+    if (force_epd) {
+        lv_obj_invalidate(g_wifi_icon_label);
+        /* early WiFi 常在首帧渲染之后才 CONNECTED；先 refr 进 fb，再请求 EPD */
+        lv_refr_now(NULL);
+        epd_mark_refresh_pending();
+    }
+}
+
 static void on_wifi_phase_change(WLAN_Phase_t phase, void *user_data)
 {
     (void)user_data;
     printf("[WIFIC] Phase callback: %d\n", (int)phase);
 
     if (phase == WLAN_PHASE_CONNECTING) {
-        /* 首页 CONNECTING 不刷图标，避免与 WPA 关联竞态 */
-        settings_wifi_on_phase_change(phase);
+        /* 关联阶段不刷首页/settings，减少与 WPA 并发的 EPD 请求 */
         return;
     }
 
-    /* Home 顶部 WiFi 图标 - 仅 CONNECTED 时显示 */
-    if (g_wifi_icon_label) {
-        if (phase == WLAN_PHASE_CONNECTED) {
-            lv_label_set_text(g_wifi_icon_label, LV_SYMBOL_WIFI);
-        } else {
-            lv_label_set_text(g_wifi_icon_label, "");
-        }
+    if (!s_font_warm_after_wifi_done && phase == WLAN_PHASE_CONNECTED) {
+        s_font_warm_after_wifi_done = 1;
+        font_warm_schedule_boot();
     }
+
+    /* Home 顶部 WiFi 图标：CONNECTED 显示，其它清空并刷新 */
+    home_wifi_icon_sync(1);
 
     /* WiFi 掉了 -> 自动停 HTTP */
     if (phase != WLAN_PHASE_CONNECTED && g_wifi.http_running) {
@@ -670,6 +711,9 @@ static void settings_btn_event_handler(lv_event_t * e) {
     /* 清屏 */
     lv_obj_clean(scr);
     g_settings_scr = scr;
+    g_wifi_icon_label = NULL;
+    g_time_label = NULL;
+    g_vbat_label = NULL;
     
     /* 应用无动画样式 */
     lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
@@ -845,6 +889,11 @@ static void lvgl_task(void *arg) {
         /* 轮询 wifi controller (扫描/连接/phase 回调) - 确保在LVGL线程中调用 */
         wifi_controller_poll();
 
+        /* NTP 对时结果 / 本地钟点刷新 → 首页时间标签 */
+        if (time_sync_take_pending()) {
+            home_time_label_apply(1);
+        }
+
         /* 诊断: 每 200 次循环 ~1s 打印一次, 验证 lvgl_task 在 resume 后是否还在跑 */
         if (s_lvgl_loop_count % 200 == 0) {
             uint32_t now = OS_GetTicks();
@@ -870,10 +919,12 @@ static void update_vbat_display(void);
 
 /* VBAT更新间隔（每5秒更新一次） */
 #define VBAT_UPDATE_INTERVAL_MS  5000
+#define TIME_TICK_INTERVAL_MS   60000
 
 static void disp_task(void *arg) {
     printf("[Display] Task started\r\n");
     uint32_t vbat_counter = 0;
+    uint32_t time_counter = 0;
 
     /* 初始化ADC并在首次读取VBAT */
     adc_vbat_init();
@@ -909,6 +960,13 @@ static void disp_task(void *arg) {
             vbat_counter = 0;
             update_vbat_display();
         }
+
+        /* 每分钟刷新首页时钟文本（EPD 仅在分钟变化时刷） */
+        time_counter += DISP_TASK_PERIOD;
+        if (time_counter >= TIME_TICK_INTERVAL_MS) {
+            time_counter = 0;
+            (void)time_sync_refresh_local();
+        }
         
         /* 休眠 */
         OS_MSleep(DISP_TASK_PERIOD);
@@ -924,6 +982,9 @@ void main_ui_create(void)
 
     /* 清屏 */
     lv_obj_clean(scr);
+    g_wifi_icon_label = NULL;
+    g_time_label = NULL;
+    g_vbat_label = NULL;
 
     /* 初始化全局样式（仅首次） */
     static int styles_inited = 0;
@@ -962,21 +1023,31 @@ void main_ui_create(void)
     lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
     lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
 
-    /* 标题 - 居左, 让出右侧给 vbat + WiFi 图标 */
+    /* 标题 - 居左, 中间留给时间, 右侧 vbat + WiFi */
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "Home");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(title, 80, 30);
+    lv_obj_set_size(title, 48, 30);
     lv_obj_align(title, LV_ALIGN_TOP_LEFT, 5, 10);
+
+    /* 顶端时间 HH:MM（WiFi 连通后国家授时中心同步） */
+    g_time_label = lv_label_create(scr);
+    lv_obj_set_style_text_font(g_time_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(g_time_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_width(g_time_label, 50);
+    lv_obj_set_style_text_align(g_time_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(g_time_label, LV_ALIGN_TOP_MID, 0, 12);
+    home_time_label_apply(0);
 
     /* WiFi 图标 - 紧贴 vbat 左侧, 仅 CONNECTED 时显示 */
     g_wifi_icon_label = lv_label_create(scr);
-    lv_label_set_text(g_wifi_icon_label, "");
     lv_obj_set_style_text_font(g_wifi_icon_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(g_wifi_icon_label, lv_color_make(0, 0, 0), 0);
     lv_obj_set_size(g_wifi_icon_label, 18, 14);
     lv_obj_align(g_wifi_icon_label, LV_ALIGN_TOP_RIGHT, -78, 12);
+    /* early WiFi 可能已 CONNECTED：创建时同步，避免首帧无图标 */
+    home_wifi_icon_sync(0);
 
     /* 第一行按钮: Files 和 Settings */
     create_home_tile(scr, 10, 78, 106, 84,
@@ -1203,8 +1274,33 @@ int main(void)
     
     /* 执行FatFs文件系统测试（FatFs内部会初始化SD卡） */
     fatfs_filesystem_test();
-    
-    /* 初始化LVGL - lv_port_disp_init()会初始化EPD */
+
+    /*====================
+     * 网络尽早启动（对齐原版：与 EPD/UI 并行，争取 ~4.6s 拿到 IP）
+     *===================*/
+    printf("\r\n");
+    printf("======================================\r\n");
+    printf("Network Initialization (early)\r\n");
+    printf("======================================\r\n\r\n");
+
+    printf("[NET] Initializing WLAN...\r\n");
+    if (wlan_manager_init() != 0) {
+        printf("[NET ERROR] WLAN init failed!\r\n");
+    } else {
+        printf("[NET] WLAN initialized\r\n");
+    }
+
+    settings_screen_init();
+    http_server_init(HTTP_SERVER_PORT);
+    if (http_server_reserve_thread() != 0) {
+        printf("[HTTP] WARNING: failed to reserve worker thread at boot\r\n");
+    }
+    wifi_controller_init();
+    wifi_controller_register_cb(on_wifi_phase_change, NULL);
+    wifi_controller_start();
+    printf("[INFO] WiFi connecting early (parallel with EPD/UI)...\r\n\r\n");
+
+    /* 初始化LVGL - lv_port_disp_init()会初始化EPD（与 WiFi 并行） */
     printf("[MAIN] Step 1: Calling lv_init()...\r\n");
     printf("[MAIN] Calling lv_init()...\r\n");
     fflush(stdout);
@@ -1221,36 +1317,8 @@ int main(void)
     printf("[MAIN] Step 3: Calling lv_port_indev_init()...\r\n");
     lv_port_indev_init();
     printf("[MAIN] Step 3: lv_port_indev_init() completed\r\n");
-    
-    /*====================
-     * 网络初始化
-     *===================*/
-    printf("\r\n");
-    printf("======================================\r\n");
-    printf("Network Initialization\r\n");
-    printf("======================================\r\n\r\n");
-    
-    /* 初始化WLAN模块 */
-    printf("[NET] Initializing WLAN...\r\n");
-    if (wlan_manager_init() != 0) {
-        printf("[NET ERROR] WLAN init failed!\r\n");
-    } else {
-        printf("[NET] WLAN initialized\r\n");
-        /* WiFi连接将在后台任务中进行，不阻塞UI启动 */
-    }
-    printf("\r\n");
-    
-    /* 初始化设置模块（从INI加载字体选择等） */
-    settings_screen_init();
 
-    /* HTTP / WiFi 工作线程须在 font warm 前预创建（warm 后 SRAM 堆几乎用尽） */
-    http_server_init(HTTP_SERVER_PORT);
-    if (http_server_reserve_thread() != 0) {
-        printf("[HTTP] WARNING: failed to reserve worker thread at boot\r\n");
-    }
-    wifi_controller_init();
-    
-    /* 创建主界面UI - 先显示首屏，再启动 WiFi */
+    /* 创建主界面UI */
     main_ui_create();
     screensaver_init();
     
@@ -1276,15 +1344,6 @@ int main(void)
 
     epd_resume_refresh();
     printf("[EPD] Refresh resumed after init\n");
-
-    /* 首屏刷完再连 WiFi，避免 EPD 全刷与 wlan_sta_enable 竞态 */
-    (void)epd_wait_first_frame_done(2000);
-
-    wifi_controller_register_cb(on_wifi_phase_change, NULL);
-    wifi_controller_start();
-    printf("[INFO] WiFi connecting in background...\r\n\r\n");
-
-    font_warm_schedule_boot();
 
     /* 主线程完成，LVGL任务在后台运行 */
     while (1) {

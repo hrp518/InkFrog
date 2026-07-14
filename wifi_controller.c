@@ -12,6 +12,7 @@
 #include "wifi_controller.h"
 #include "settings_storage.h"
 #include "http_server.h"
+#include "time_sync.h"
 #include "kernel/os/os.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -36,8 +37,17 @@
 /* 重试退避 (ms)：首次连接不等待；失败后 1s/3s/... */
 static const uint32_t kBackoffMs[] = { 1000, 3000, 10000, 30000, 60000 };
 #define BACKOFF_COUNT  (sizeof(kBackoffMs)/sizeof(kBackoffMs[0]))
-#define CONNECT_TIMEOUT_MS  30000
-#define POLL_INTERVAL_MS    5000  /* 已连接时检测 link 的周期 */
+/*
+ * 对齐原版速度：
+ * - SDK 官方路径 set→enable（内部自扫自连），不做 enable 前 pre-scan
+ * - 休眠唤醒后首次 enable 常 WSM TMO；约 0.8s 内无 IP 则立刻 disable 再连
+ * - 好“第二次必成”路径，总开销约 1s warm + 2s 成功，而非干等 10s
+ */
+#define CONNECT_NO_ASSOC_MS          1000
+#define CONNECT_AFTER_ASSOC_MS       5000
+#define CONNECT_RETRY_NO_ASSOC_MS    3000
+#define CONNECT_RETRY_AFTER_ASSOC_MS 15000
+#define POLL_INTERVAL_MS             5000
 
 wifi_ctx_t g_wifi;
 
@@ -104,8 +114,42 @@ static void wc_handle_link_lost(void)
     g_wifi.retry_count = 0;
 }
 
+/* 一轮：set→enable→智能等 IP */
+static int wc_connect_once(uint32_t no_assoc_ms, uint32_t after_assoc_ms)
+{
+    int ret;
+    int wait;
+
+    if (!g_wc_running || g_wifi.fm_paused || !g_wifi.enabled) {
+        return -1;
+    }
+
+    if (wlan_manager_is_connected() ||
+        wlan_manager_get_state() == WLAN_STATE_CONNECTING) {
+        wlan_manager_disconnect();
+        OS_MSleep(100);
+    }
+
+    WC_TRACE_LOG("[TRACE] calling wlan_manager_connect");
+    ret = wlan_manager_connect(g_wifi.ssid, g_wifi.password);
+    WC_TRACE_LOG("[TRACE] wlan_manager_connect returned ret=%d", ret);
+    if (ret != 0) {
+        WC_LOG("wlan_manager_connect failed: %d", ret);
+        return -1;
+    }
+    if (!g_wc_running || g_wifi.fm_paused) {
+        return -1;
+    }
+
+    wait = wlan_manager_wait_for_ip_ex(no_assoc_ms, after_assoc_ms);
+    WC_TRACE_LOG("[TRACE] wait_for_ip_ex returned wait=%d", wait);
+    return wait;
+}
+
 static void wc_try_connect(void)
 {
+    int wait;
+
     WC_TRACE_LOG("[TRACE] wc_try_connect enter");
     if (!g_wc_running) {
         return;
@@ -125,31 +169,19 @@ static void wc_try_connect(void)
         return;
     }
 
-    WC_LOG("Attempt %d: connecting to '%s'", g_wifi.retry_count, g_wifi.ssid);
+    WC_LOG("Attempt %d: set+enable '%s' (early parallel)", g_wifi.retry_count, g_wifi.ssid);
     wc_set_phase(WLAN_PHASE_CONNECTING);
 
-    /* 先确保已断开 */
-    if (wlan_manager_is_connected() || wlan_manager_get_state() == WLAN_STATE_CONNECTING) {
+    wait = wc_connect_once(CONNECT_NO_ASSOC_MS, CONNECT_AFTER_ASSOC_MS);
+    if (wait != 0 && g_wc_running && !g_wifi.fm_paused && g_wifi.enabled) {
+        WC_LOG("No assoc in %ums (WSM TMO?), immediate reconnect",
+               (unsigned)CONNECT_NO_ASSOC_MS);
+        wlan_manager_cancel_connect();
         wlan_manager_disconnect();
-        OS_MSleep(500);
+        OS_MSleep(80);
+        wait = wc_connect_once(CONNECT_RETRY_NO_ASSOC_MS, CONNECT_RETRY_AFTER_ASSOC_MS);
     }
 
-    WC_TRACE_LOG("[TRACE] calling wlan_manager_connect");
-    int ret = wlan_manager_connect(g_wifi.ssid, g_wifi.password);
-    WC_TRACE_LOG("[TRACE] wlan_manager_connect returned ret=%d", ret);
-    if (ret != 0) {
-        WC_LOG("wlan_manager_connect failed: %d", ret);
-        g_wifi.retry_count++;
-        wc_set_phase(WLAN_PHASE_DISCONNECTED);
-        return;
-    }
-    if (!g_wc_running || g_wifi.fm_paused) {
-        return;
-    }
-
-    WC_TRACE_LOG("[TRACE] calling wlan_manager_wait_for_ip timeout=%d", CONNECT_TIMEOUT_MS);
-    int wait = wlan_manager_wait_for_ip(CONNECT_TIMEOUT_MS);
-    WC_TRACE_LOG("[TRACE] wlan_manager_wait_for_ip returned wait=%d", wait);
     if (wait == 0) {
         WLAN_IPInfo_t info;
         if (wlan_manager_get_ip_info(&info) == 0) {
@@ -160,6 +192,8 @@ static void wc_try_connect(void)
             WC_TRACE_LOG("[TRACE] calling wc_set_phase(CONNECTED)");
             wc_set_phase(WLAN_PHASE_CONNECTED);
             WC_TRACE_LOG("[TRACE] wc_set_phase(CONNECTED) returned");
+            /* 国家授时中心对时（阻塞在本线程，不占 LVGL） */
+            (void)time_sync_from_ntsc();
         } else {
             WC_LOG("No IP after wait");
             g_wifi.retry_count++;

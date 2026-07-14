@@ -36,8 +36,8 @@ extern "C" {
 
 #define EPUB_MAX_TITLE_LEN     128
 #define EPUB_MAX_PATH_LEN      256
-#define EPUB_MAX_SPINE_COUNT   8       /* 减少预分配以节省heap空间 */
-#define EPUB_MAX_TOC_COUNT     4       /* 减少预分配以节省heap空间 */
+#define EPUB_MAX_SPINE_COUNT   32      /* PSRAM 上的 EpubReader，可容纳中篇目录 */
+#define EPUB_MAX_TOC_COUNT     64      /* toc.ncx navPoint 上限（含嵌套） */
 
 /*====================
  *   数据结构

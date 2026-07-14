@@ -63,6 +63,14 @@ typedef void (*WLAN_ConnectDoneCb_t)(int success, void *user_data);
 int wlan_manager_init(void);
 
 /*
+ * 连接前预扫描（对齐原版：scan success 后再 associate）
+ * @param want_ssid 目标 SSID，可 NULL（只等任意结果）
+ * @param wait_ms 最长等待
+ * @return >=0 扫到的 AP 数, -1 失败/取消
+ */
+int wlan_manager_pre_scan(const char *want_ssid, uint32_t wait_ms);
+
+/*
  * 连接WIFI
  * @param ssid WIFI名称
  * @param passwd WIFI密码
@@ -110,6 +118,14 @@ int wlan_manager_get_ip_info(WLAN_IPInfo_t *info);
  * @return 0成功获取IP, -1超时
  */
 int wlan_manager_wait_for_ip(uint32_t timeout_ms);
+
+/*
+ * 智能等待 IP（对齐原版冷启速度）：
+ * - 若 no_assoc_ms 内未收到 WLAN_CONNECTED，立即返回失败以便快速重连
+ *   （吸收休眠唤醒后首次 WSM TMO，勿干等 10s auth timeout）
+ * - 一旦关联成功，再等 after_assoc_ms 做 DHCP
+ */
+int wlan_manager_wait_for_ip_ex(uint32_t no_assoc_ms, uint32_t after_assoc_ms);
 
 /*
  * WiFi同步扫描 - 扫描周围AP（阻塞调用，不要在LVGL线程中使用！）

@@ -22,6 +22,7 @@
 ../../../../project/demo/FontExp/http_l1glyf_js.o
 ../../../../project/demo/FontExp/settings_screen.o
 ../../../../project/demo/FontExp/heap_mix.o
+../../../../project/demo/FontExp/time_sync.o
 ../../../../project/demo/FontExp/coremark/core_matrix.o
 ../../../../project/demo/FontExp/coremark/core_main.o
 ../../../../project/demo/FontExp/coremark/core_portme.o

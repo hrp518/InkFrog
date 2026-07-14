@@ -28,6 +28,7 @@
 #define WLAN_LOG(fmt, ...) 
 #endif
 
+
 /* 全局变量 */
 static volatile WLAN_State_t g_wlan_state = WLAN_STATE_IDLE;
 static int g_connected = 0;
@@ -66,6 +67,90 @@ int wlan_manager_init(void)
 }
 
 /*
+ * 连接前预扫描：先让 WSM 完成一轮 scan，再 associate（对齐原版）
+ */
+int wlan_manager_pre_scan(const char *want_ssid, uint32_t wait_ms)
+{
+    int ret;
+    int num = 0;
+    uint32_t elapsed = 0;
+    int found = 0;
+
+    if (wait_ms == 0) {
+        wait_ms = 1500;
+    }
+
+    /* 新一轮连接流程：清掉上次 cancel，避免快速重试被误杀 */
+    g_connect_canceled = 0;
+
+    WLAN_LOG("Pre-scan start (want='%s', wait=%ums)",
+             want_ssid ? want_ssid : "", (unsigned)wait_ms);
+
+    ret = wlan_sta_scan_once();
+    if (ret != 0) {
+        WLAN_LOG("Pre-scan start failed: %d", ret);
+        return -1;
+    }
+
+    while (elapsed < wait_ms) {
+        if (g_connect_canceled) {
+            WLAN_LOG("Pre-scan canceled");
+            return -1;
+        }
+        vTaskDelay(200 / (uint32_t)portTICK_RATE_MS);
+        elapsed += 200;
+
+        if (wlan_sta_get_scan_result_num(&num) != 0 || num <= 0) {
+            continue;
+        }
+
+        if (want_ssid == NULL || want_ssid[0] == '\0') {
+            WLAN_LOG("Pre-scan got %d APs in %ums", num, (unsigned)elapsed);
+            return num;
+        }
+
+        {
+            int n = num;
+            int i;
+            wlan_sta_ap_t *ap_list;
+            wlan_sta_scan_results_t scan_results;
+
+            if (n > WLAN_MAX_SCAN_RESULTS) {
+                n = WLAN_MAX_SCAN_RESULTS;
+            }
+            ap_list = (wlan_sta_ap_t *)psram_malloc(n * sizeof(wlan_sta_ap_t));
+            if (!ap_list) {
+                WLAN_LOG("Pre-scan alloc fail, treat as ready (%d APs)", num);
+                return num;
+            }
+            scan_results.ap = ap_list;
+            scan_results.size = n;
+            if (wlan_sta_scan_result(&scan_results) == 0) {
+                for (i = 0; i < scan_results.num; i++) {
+                    if (strncmp((const char *)ap_list[i].ssid.ssid, want_ssid,
+                                WLAN_MGR_MAX_SSID_LEN) == 0) {
+                        found = 1;
+                        break;
+                    }
+                }
+            }
+            psram_free(ap_list);
+        }
+
+        if (found) {
+            WLAN_LOG("Pre-scan found '%s' in %ums (aps=%d)",
+                     want_ssid, (unsigned)elapsed, num);
+            return num;
+        }
+        WLAN_LOG("Pre-scan %d APs, target not yet, keep waiting...", num);
+    }
+
+    WLAN_LOG("Pre-scan done elapsed=%ums aps=%d found=%d",
+             (unsigned)elapsed, num, found);
+    return (num > 0) ? num : 0;
+}
+
+/*
  * 连接WIFI
  */
 int wlan_manager_connect(const char *ssid, const char *passwd)
@@ -85,7 +170,7 @@ int wlan_manager_connect(const char *ssid, const char *passwd)
     /* 记录当前连接的SSID */
     strncpy(g_current_ssid, ssid, WLAN_MGR_MAX_SSID_LEN - 1);
     g_current_ssid[WLAN_MGR_MAX_SSID_LEN - 1] = '\0';
-    
+
     /* 设置SSID和密码 */
     WLAN_LOG("[TRACE] wlan_manager_connect: calling wlan_sta_set");
     if (passwd == NULL || strlen(passwd) == 0) {
@@ -204,18 +289,75 @@ int wlan_manager_get_ip_info(WLAN_IPInfo_t *info)
     return 0;
 }
 
-/* 事件观察者，用于监听network up事件 */
+/* 事件观察者，用于监听 network / wlan 事件 */
 static observer_base *g_network_up_observer = NULL;
+static observer_base *g_wlan_event_observer = NULL;
+static volatile int g_wlan_assoc_ok = 0;   /* 已关联 (WPA done / connected) */
+static volatile int g_wlan_assoc_fail = 0; /* 关联失败事件 */
 
 /*
  * network up事件回调
  */
 static void network_up_callback(uint32_t event, uint32_t data, void *arg)
 {
+    (void)event;
+    (void)data;
+    (void)arg;
     WLAN_LOG("Network up event received!");
     g_wlan_state = WLAN_STATE_CONNECTED;
     g_connected = 1;
+    g_wlan_assoc_ok = 1;
     WLAN_LOG("[TRACE] network_up_callback set g_connected=1");
+}
+
+static void wlan_event_callback(uint32_t event, uint32_t data, void *arg)
+{
+    uint16_t type = EVENT_SUBTYPE(event);
+    (void)data;
+    (void)arg;
+
+    switch (type) {
+    case NET_CTRL_MSG_WLAN_CONNECTED:
+        g_wlan_assoc_ok = 1;
+        g_wlan_assoc_fail = 0;
+        WLAN_LOG("WLAN_CONNECTED (assoc ok)");
+        break;
+    case NET_CTRL_MSG_WLAN_DISCONNECTED:
+    case NET_CTRL_MSG_WLAN_CONNECT_FAILED:
+    case NET_CTRL_MSG_WLAN_4WAY_HANDSHAKE_FAILED:
+    case NET_CTRL_MSG_CONNECTION_LOSS:
+        if (!g_connected) {
+            g_wlan_assoc_fail = 1;
+            WLAN_LOG("WLAN link fail event=%u", (unsigned)type);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void wlan_manager_ensure_observers(void)
+{
+    if (g_network_up_observer == NULL) {
+        g_network_up_observer = callback_observer_create(
+            CTRL_MSG_TYPE_NETWORK << 16 | NET_CTRL_MSG_NETWORK_UP,
+            network_up_callback,
+            NULL);
+        if (g_network_up_observer != NULL) {
+            sys_ctrl_attach(g_network_up_observer);
+            WLAN_LOG("Registered network up observer");
+        }
+    }
+    if (g_wlan_event_observer == NULL) {
+        g_wlan_event_observer = callback_observer_create(
+            CTRL_MSG_TYPE_NETWORK << 16 | NET_CTRL_MSG_ALL,
+            wlan_event_callback,
+            NULL);
+        if (g_wlan_event_observer != NULL) {
+            sys_ctrl_attach(g_wlan_event_observer);
+            WLAN_LOG("Registered wlan event observer");
+        }
+    }
 }
 
 /*
@@ -223,8 +365,25 @@ static void network_up_callback(uint32_t event, uint32_t data, void *arg)
  */
 int wlan_manager_wait_for_ip(uint32_t timeout_ms)
 {
+    return wlan_manager_wait_for_ip_ex(timeout_ms, timeout_ms);
+}
+
+int wlan_manager_wait_for_ip_ex(uint32_t no_assoc_ms, uint32_t after_assoc_ms)
+{
     struct netif *netif;
-    
+    uint32_t start;
+    uint32_t assoc_at = 0;
+
+    if (no_assoc_ms == 0) {
+        no_assoc_ms = 1000;
+    }
+    if (after_assoc_ms == 0) {
+        after_assoc_ms = 5000;
+    }
+
+    g_wlan_assoc_ok = 0;
+    g_wlan_assoc_fail = 0;
+
     /* 首先检查是否已经有IP（快速路径） */
     netif = wlan_get_netif();
     if (netif != NULL && netif->ip_addr.addr != 0) {
@@ -235,68 +394,62 @@ int wlan_manager_wait_for_ip(uint32_t timeout_ms)
         g_connected = 1;
         return 0;
     }
-    
-    /* 注册network up事件观察者 */
-    if (g_network_up_observer == NULL) {
-        g_network_up_observer = callback_observer_create(
-            CTRL_MSG_TYPE_NETWORK << 16 | NET_CTRL_MSG_NETWORK_UP,
-            network_up_callback,
-            NULL);
-        if (g_network_up_observer != NULL) {
-            sys_ctrl_attach(g_network_up_observer);
-            WLAN_LOG("Registered network up observer");
-        } else {
-            WLAN_LOG("Failed to create network up observer");
-        }
-    }
-    
-    /* 等待network up事件或超时 */
-    uint32_t start = xTaskGetTickCount();
-    uint32_t timeout_ticks = timeout_ms / (uint32_t)portTICK_RATE_MS;
-    if (timeout_ticks == 0) timeout_ticks = 1;
-    
-    WLAN_LOG("Waiting for network up event (timeout=%ums, %u ticks)...", timeout_ms, timeout_ticks);
-    
+
+    wlan_manager_ensure_observers();
+
+    start = xTaskGetTickCount();
+    WLAN_LOG("Wait IP: no_assoc=%ums after_assoc=%ums",
+             (unsigned)no_assoc_ms, (unsigned)after_assoc_ms);
+
     while (1) {
         uint32_t elapsed = xTaskGetTickCount() - start;
 
-        /* 检查是否已收到network up事件 */
         if (g_connected) {
-            /* 立即尝试获取IP */
             netif = wlan_get_netif();
             if (netif != NULL && netif->ip_addr.addr != 0) {
                 WLAN_IPInfo_t ip_info;
                 wlan_manager_get_ip_info(&ip_info);
                 WLAN_LOG("Got IP: %s (elapsed=%u ticks)", ip_info.ip, elapsed);
-                WLAN_LOG("[TRACE] wait_for_ip: returning 0 from inside loop");
                 return 0;
             }
-            /* IP还没到，稍后重试（可能DHCP还在处理中）*/
-            WLAN_LOG("Network up but IP not ready, waiting...");
         }
-        
-        /* 检查是否被取消 */
+
         if (g_connect_canceled) {
             WLAN_LOG("WiFi connect canceled by user");
             return -1;
         }
-        
-        /* 检查超时 */
-        if (elapsed >= timeout_ticks) {
-            /* 最后再检查一次IP */
-            netif = wlan_get_netif();
-            if (netif != NULL && netif->ip_addr.addr != 0) {
-                WLAN_IPInfo_t ip_info;
-                wlan_manager_get_ip_info(&ip_info);
-                WLAN_LOG("Got IP at last moment: %s (elapsed=%u ticks)", ip_info.ip, elapsed);
-                return 0;
-            }
-            WLAN_LOG("Wait for IP timeout (elapsed=%u ticks)", elapsed);
-            return -1;
+
+        if (g_wlan_assoc_ok && assoc_at == 0) {
+            assoc_at = xTaskGetTickCount();
+            WLAN_LOG("Assoc reached, DHCP window %ums", (unsigned)after_assoc_ms);
         }
-        
-        /* 等待事件或轮询 */
-        vTaskDelay(100 / (uint32_t)portTICK_RATE_MS);
+
+        /* 未关联：超时或失败事件 → 立即返回，供上层快速重连 */
+        if (!g_wlan_assoc_ok && !g_connected) {
+            if (g_wlan_assoc_fail && elapsed >= (200 / (uint32_t)portTICK_RATE_MS)) {
+                WLAN_LOG("Abort wait: assoc fail event (elapsed=%u)", elapsed);
+                return -1;
+            }
+            if (elapsed >= (no_assoc_ms / (uint32_t)portTICK_RATE_MS)) {
+                WLAN_LOG("Abort wait: no assoc in %ums", (unsigned)no_assoc_ms);
+                return -1;
+            }
+        } else {
+            uint32_t since_assoc = xTaskGetTickCount() - (assoc_at ? assoc_at : start);
+            if (since_assoc >= (after_assoc_ms / (uint32_t)portTICK_RATE_MS)) {
+                netif = wlan_get_netif();
+                if (netif != NULL && netif->ip_addr.addr != 0) {
+                    WLAN_IPInfo_t ip_info;
+                    wlan_manager_get_ip_info(&ip_info);
+                    WLAN_LOG("Got IP at DHCP deadline: %s", ip_info.ip);
+                    return 0;
+                }
+                WLAN_LOG("DHCP timeout after assoc (elapsed=%u)", elapsed);
+                return -1;
+            }
+        }
+
+        vTaskDelay(50 / (uint32_t)portTICK_RATE_MS);
     }
 }
 

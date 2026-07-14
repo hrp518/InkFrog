@@ -201,6 +201,7 @@
  ../../../../project/demo/FontExp/wlan_manager.h \
  ../../../../project/demo/FontExp/settings_storage.h \
  ../../../../project/demo/FontExp/http_server.h \
+ ../../../../project/demo/FontExp/wifi_controller.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h \
  ../../../../include/fs/fatfs/ff.h ../../../../include/fs/fatfs/integer.h \
  ../../../../include/fs/fatfs/ffconf.h ../../../../include/kernel/os/os.h \
@@ -613,6 +614,8 @@
 ../../../../project/demo/FontExp/settings_storage.h:
 
 ../../../../project/demo/FontExp/http_server.h:
+
+../../../../project/demo/FontExp/wifi_controller.h:
 
 ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h:
 

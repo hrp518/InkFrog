@@ -582,7 +582,10 @@ static void opf_start_cb(const char *name, const char **atts, void *user_data) {
                 strstr(href, "titlepage") || strstr(href, ".css")) {
                 return;
             }
-            if (*ctx->spine_count >= ctx->max_spine) return;
+            if (*ctx->spine_count >= ctx->max_spine) {
+                EPUB_ERR("Spine full (max=%d), drop: %s\n", ctx->max_spine, href);
+                return;
+            }
             char full_href[256];
             if (ctx->base_path[0]) {
                 snprintf(full_href, sizeof(full_href), "%s/%s", ctx->base_path, href);
@@ -603,6 +606,63 @@ static void opf_start_cb(const char *name, const char **atts, void *user_data) {
         }
         return;
     }
+}
+
+/* 将 toc.ncx 的 content src 映射到 spine 下标（去掉 #锚点，路径后缀/文件名匹配） */
+static int toc_href_to_spine_index(EpubReader *reader, const char *href)
+{
+    if (!reader || !href || !href[0]) return -1;
+
+    char clean[256];
+    strncpy(clean, href, sizeof(clean) - 1);
+    clean[sizeof(clean) - 1] = '\0';
+    char *hash = strchr(clean, '#');
+    if (hash) *hash = '\0';
+    if (!clean[0]) return -1;
+
+    char full[256];
+    int has_base = reader->book.base_path[0] != '\0';
+    int already_rooted = (strchr(clean, '/') != NULL) &&
+                         (!has_base || strncmp(clean, reader->book.base_path,
+                                               strlen(reader->book.base_path)) == 0);
+    if (has_base && !already_rooted) {
+        snprintf(full, sizeof(full), "%s/%s", reader->book.base_path, clean);
+    } else {
+        strncpy(full, clean, sizeof(full) - 1);
+        full[sizeof(full) - 1] = '\0';
+    }
+
+    for (int i = 0; i < reader->spine_count; i++) {
+        const char *sp = reader->spine[i].href;
+        if (strcmp(sp, full) == 0 || strcmp(sp, clean) == 0)
+            return i;
+    }
+
+    /* 后缀匹配：spine 以 /clean 或 clean 结尾 */
+    size_t cl = strlen(clean);
+    for (int i = 0; i < reader->spine_count; i++) {
+        const char *sp = reader->spine[i].href;
+        size_t sl = strlen(sp);
+        if (cl > 0 && sl >= cl && strcmp(sp + sl - cl, clean) == 0) {
+            if (sl == cl || sp[sl - cl - 1] == '/')
+                return i;
+        }
+    }
+
+    /* 仅文件名匹配 */
+    const char *bn = strrchr(clean, '/');
+    bn = bn ? bn + 1 : clean;
+    if (bn[0]) {
+        for (int i = 0; i < reader->spine_count; i++) {
+            const char *sp = reader->spine[i].href;
+            const char *sb = strrchr(sp, '/');
+            sb = sb ? sb + 1 : sp;
+            if (strcmp(bn, sb) == 0)
+                return i;
+        }
+    }
+
+    return -1;
 }
 
 static void opf_end_cb(const char *name, void *user_data) {
@@ -765,39 +825,92 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
         reader->spine_count = 1;
         strcpy(reader->spine[0].href, content_opf_path);
     }
+    EPUB_LOG("Spine count=%d (max=%d)\n", reader->spine_count, EPUB_MAX_SPINE_COUNT);
+    for (int si = 0; si < reader->spine_count; si++) {
+        EPUB_LOG("  spine[%d]=%s\n", si, reader->spine[si].href);
+    }
 
     char toc_path[256];
     snprintf(toc_path, sizeof(toc_path), "%s/toc.ncx",
              reader->book.base_path[0] ? reader->book.base_path : "EPUB");
     size_t toc_size = 0;
     char *toc_data = read_file_from_zip(reader, toc_path, &toc_size);
+    if (!toc_data) {
+        /* 部分书籍 ncx 不叫 toc.ncx，再试常见路径 */
+        static const char *alt_ncx[] = {
+            "toc.ncx", "OEBPS/toc.ncx", "EPUB/toc.ncx",
+            "OPS/toc.ncx", "content/toc.ncx", NULL
+        };
+        for (int ai = 0; alt_ncx[ai]; ai++) {
+            if (strcmp(alt_ncx[ai], toc_path) == 0) continue;
+            toc_data = read_file_from_zip(reader, alt_ncx[ai], &toc_size);
+            if (toc_data) {
+                strncpy(toc_path, alt_ncx[ai], sizeof(toc_path) - 1);
+                break;
+            }
+        }
+    }
     if (toc_data && toc_size > 0) {
+        EPUB_LOG("TOC file: %s size=%u\n", toc_path, (unsigned)toc_size);
         reader->toc_count = 0;
+        int nav_seen = 0;
+        int nav_skipped = 0;
         const char *scan = toc_data;
         while (reader->toc_count < EPUB_MAX_TOC_COUNT) {
             char *np_start = strstr(scan, "<navPoint");
             if (!np_start) break;
+            nav_seen++;
+            /* 限定在本 navPoint 开头段内查找，避免吃到下一个兄弟/子节点之前的标签；
+             * 仍按文档顺序扫描每个 navPoint（含嵌套）。 */
             char *text_start = strstr(np_start, "<text>");
             char *text_end = text_start ? strstr(text_start + 6, "</text>") : NULL;
             char *content_start = strstr(np_start, "<content src=\"");
-            char *content_end = content_start ? strchr(content_start + 14, '"') : NULL;
-            if (text_start && text_end && content_start && content_end) {
-                int text_len = text_end - text_start - 6;
-                int href_len = content_end - content_start - 14;
-                if (text_len > 0 && text_len < 128 && href_len > 0 && href_len < 256) {
-                    strncpy(reader->toc[reader->toc_count].title,
-                            text_start + 6, text_len);
-                    reader->toc[reader->toc_count].title[text_len] = '\0';
-                    strncpy(reader->toc[reader->toc_count].href,
-                            content_start + 14, href_len);
-                    reader->toc[reader->toc_count].href[href_len] = '\0';
-                    reader->toc[reader->toc_count].spine_index = 0;
-                    reader->toc_count++;
+            if (!content_start)
+                content_start = strstr(np_start, "<content src='");
+            char *content_end = NULL;
+            int src_off = 0;
+            if (content_start) {
+                if (content_start[13] == '"') {
+                    src_off = 14;
+                    content_end = strchr(content_start + src_off, '"');
+                } else if (content_start[13] == '\'') {
+                    src_off = 14;
+                    content_end = strchr(content_start + src_off, '\'');
                 }
+            }
+            /* 若 text/content 落在下一个 navPoint 之后，视为本节点缺失 */
+            char *next_np = strstr(np_start + 8, "<navPoint");
+            if (text_start && next_np && text_start >= next_np) text_start = NULL;
+            if (content_start && next_np && content_start >= next_np) content_start = NULL;
+
+            if (text_start && text_end && content_start && content_end) {
+                int text_len = (int)(text_end - text_start - 6);
+                int href_len = (int)(content_end - content_start - src_off);
+                if (text_len > 0 && text_len < 128 && href_len > 0 && href_len < 256) {
+                    EpubTocEntry *ent = &reader->toc[reader->toc_count];
+                    strncpy(ent->title, text_start + 6, text_len);
+                    ent->title[text_len] = '\0';
+                    strncpy(ent->href, content_start + src_off, href_len);
+                    ent->href[href_len] = '\0';
+                    ent->spine_index = toc_href_to_spine_index(reader, ent->href);
+                    EPUB_LOG("  toc[%d] spine=%d title=\"%s\" href=\"%s\"\n",
+                             reader->toc_count, ent->spine_index, ent->title, ent->href);
+                    reader->toc_count++;
+                } else {
+                    nav_skipped++;
+                }
+            } else {
+                nav_skipped++;
             }
             scan = np_start + 8;
         }
-        EPUB_LOG("Parsed %d TOC entries from toc.ncx\n", reader->toc_count);
+        if (nav_seen > reader->toc_count) {
+            EPUB_LOG("TOC truncated or skipped: navPoint=%d kept=%d skipped=%d max=%d\n",
+                     nav_seen, reader->toc_count, nav_skipped, EPUB_MAX_TOC_COUNT);
+        }
+        EPUB_LOG("Parsed %d TOC entries from %s\n", reader->toc_count, toc_path);
+    } else {
+        EPUB_LOG("No toc.ncx found (tried %s and alts)\n", toc_path);
     }
 
     reader->loaded = true;
@@ -941,5 +1054,8 @@ int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *o
 
 int epub_reader_jump_to_toc(EpubReader *reader, int toc_index) {
     if (!reader || toc_index < 0 || toc_index >= reader->toc_count) return -1;
-    return reader->toc[toc_index].spine_index;
+    int spine = reader->toc[toc_index].spine_index;
+    EPUB_LOG("jump_to_toc[%d] -> spine=%d title=\"%s\"\n",
+             toc_index, spine, reader->toc[toc_index].title);
+    return spine;
 }

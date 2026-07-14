@@ -880,7 +880,7 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_transition(btn_toc, NULL, LV_PART_MAIN);
     epd_disable_all_animations_recursive(btn_toc);
     lv_obj_t *lbl_toc = lv_label_create(btn_toc);
-    lv_label_set_text(lbl_toc, "TOC");
+    lv_label_set_text(lbl_toc, "目录");
     lv_obj_set_style_text_font(lbl_toc, ui_font, 0);
     lv_obj_center(lbl_toc);
     lv_obj_add_event_cb(btn_toc, toc_btn_cb, LV_EVENT_CLICKED, viewer);
@@ -1572,7 +1572,7 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
     epd_disable_all_animations_recursive(header);
 
     lv_obj_t *toc_title = lv_label_create(header);
-    lv_label_set_text(toc_title, "TOC");
+    lv_label_set_text(toc_title, "目录");
     lv_obj_set_style_text_font(toc_title, ui_font, 0);
     lv_obj_set_style_text_color(toc_title, lv_color_black(), 0);
     lv_obj_align(toc_title, LV_ALIGN_LEFT_MID, 4, 0);
@@ -1594,6 +1594,9 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
 
     /* 目录列表 */
     int toc_count = epub_reader_get_toc_count(viewer->reader);
+    int spine_count = epub_reader_get_chapter_count(viewer->reader);
+    printf("[TOC_UI] open list: toc_count=%d spine_count=%d cur_ch=%d\n",
+           toc_count, spine_count, viewer->current_chapter);
     if (toc_count > 0) {
         lv_obj_t *list = lv_list_create(viewer->toc_overlay);
         lv_obj_set_size(list, SCREEN_WIDTH, SCREEN_HEIGHT - 34);
@@ -1601,18 +1604,13 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
         lv_obj_set_style_pad_row(list, 2, 0);
         epd_disable_all_animations_recursive(list);
 
-        for (int i = 0; i < toc_count && i < 20; i++) {
+        for (int i = 0; i < toc_count; i++) {
             EpubTocEntry *toc = epub_reader_get_toc(viewer->reader, i);
             if (toc) {
-                /* 使用带标记的按钮文本 */
                 char item_text[128];
-                bool is_current = false;
-
-                /* 判断是否当前章节 */
-                if (viewer->reader) {
-                    int ch = epub_reader_jump_to_toc(viewer->reader, i);
-                    if (ch == viewer->current_chapter) is_current = true;
-                }
+                bool is_current = (toc->spine_index >= 0 &&
+                                   toc->spine_index == viewer->current_chapter);
+                bool can_jump = (toc->spine_index >= 0);
 
                 if (is_current) {
                     snprintf(item_text, sizeof(item_text), "> %s", toc->title);
@@ -1620,18 +1618,27 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
                     snprintf(item_text, sizeof(item_text), "  %s", toc->title);
                 }
 
+                printf("[TOC_UI] item[%d] spine=%d cur=%d title=\"%s\"\n",
+                       i, toc->spine_index, is_current ? 1 : 0, toc->title);
+
                 lv_obj_t *btn = lv_list_add_btn(list, NULL, item_text);
                 lv_obj_set_style_text_font(btn, ui_font, 0);
                 if (is_current) {
                     lv_obj_set_style_text_color(btn, lv_color_black(), 0);
+                } else if (!can_jump) {
+                    lv_obj_set_style_text_color(btn, lv_color_make(0x99, 0x99, 0x99), 0);
                 } else {
                     lv_obj_set_style_text_color(btn, lv_color_make(0x44, 0x44, 0x44), 0);
                 }
                 /* 将索引编码到user_data */
                 lv_obj_set_user_data(btn, (void*)(long)(i + 1)); /* +1 区分NULL */
-                lv_obj_add_event_cb(btn, toc_item_cb, LV_EVENT_CLICKED, viewer);
+                if (can_jump) {
+                    lv_obj_add_event_cb(btn, toc_item_cb, LV_EVENT_CLICKED, viewer);
+                }
             }
         }
+    } else {
+        printf("[TOC_UI] empty TOC\n");
     }
 
     epd_mark_refresh_pending();
@@ -1646,15 +1653,30 @@ static void toc_item_cb(lv_event_t *e) {
     int toc_idx = (int)(btn_idx - 1);  /* -1 还原 */
     if (toc_idx < 0) return;
 
+    int chapter = -1;
     if (viewer->reader) {
-        int chapter = epub_reader_jump_to_toc(viewer->reader, toc_idx);
-        if (chapter >= 0) epub_viewer_goto_chapter(viewer, chapter, 0);
+        chapter = epub_reader_jump_to_toc(viewer->reader, toc_idx);
+        printf("[TOC_UI] click toc[%d] -> chapter=%d\n", toc_idx, chapter);
     }
 
-    if (viewer->toc_overlay) {
-        lv_obj_del_async(viewer->toc_overlay);
-        viewer->toc_overlay = NULL;
-        epd_mark_refresh_pending();
+    /* 必须先藏起目录再 goto：否则 update_display/lv_refr_now 时遮罩仍盖住全文，
+     * EPD 刷到的仍是目录画面（看起来像“点了没跳转”）。事件回调里不能同步 del 父对象。 */
+    lv_obj_t *overlay = viewer->toc_overlay;
+    viewer->toc_overlay = NULL;
+    if (overlay) {
+        lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(overlay, LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    if (chapter >= 0) {
+        epub_viewer_goto_chapter(viewer, chapter, 0);
+    } else {
+        printf("[TOC_UI] jump failed (unmapped spine)\n");
+    }
+
+    if (overlay) {
+        lv_obj_del_async(overlay);
+        /* goto_chapter 已 refr+EPD；这里不再多刷一次，避免用旧 FB 盖住正文 */
     }
 }
 

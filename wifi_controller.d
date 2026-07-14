@@ -7,6 +7,7 @@
  ../../../../project/demo/FontExp/wlan_manager.h \
  ../../../../project/demo/FontExp/settings_storage.h \
  ../../../../project/demo/FontExp/http_server.h \
+ ../../../../project/demo/FontExp/time_sync.h \
  ../../../../include/kernel/os/os.h \
  ../../../../include/kernel/os/os_time.h \
  ../../../../include/kernel/os/os_common.h ../../../../include/compiler.h \
@@ -38,6 +39,8 @@
 ../../../../project/demo/FontExp/settings_storage.h:
 
 ../../../../project/demo/FontExp/http_server.h:
+
+../../../../project/demo/FontExp/time_sync.h:
 
 ../../../../include/kernel/os/os.h:
 

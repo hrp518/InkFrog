@@ -220,7 +220,9 @@
  ../../../../include/kernel/os/os_mutex.h \
  ../../../../include/kernel/os/os_timer.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h \
- ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h
+ ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h \
+ ../../../../project/demo/FontExp/wifi_controller.h \
+ ../../../../project/demo/FontExp/wlan_manager.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -665,3 +667,7 @@
 ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/task.h:
 
 ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/list.h:
+
+../../../../project/demo/FontExp/wifi_controller.h:
+
+../../../../project/demo/FontExp/wlan_manager.h:

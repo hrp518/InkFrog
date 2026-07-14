@@ -65,6 +65,11 @@ void epd_do_refresh(void);
 int epd_wait_first_frame_done(uint32_t timeout_ms);
 
 /**
+ * 首帧是否已刷完（WiFi CONNECTING 时仍允许首屏）
+ */
+int epd_is_first_frame_done(void);
+
+/**
  * 获取系统运行时间（毫秒）- 调试用
  */
 uint32_t epd_get_tick(void);
