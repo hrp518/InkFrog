@@ -40,6 +40,11 @@ void wifi_controller_start(void);
  * 取消连接 + 等 wc_task 退出 + wlan_sta_disable + net 栈沉淀。 */
 void wifi_controller_stop(void);
 
+/* fix-power-saving v2: 休眠前手动 wlan_sta_disable + 等 Sys3 掉电。
+ * 前置: 必须先调 wifi_controller_stop() 停 wc_task。
+ * 配合: 调用方需 pm_unregister_wlan_power_onoff() 屏蔽 SDK 重复 teardown。 */
+void wifi_controller_poweroff(void);
+
 /* 注册 phase 回调 (LVGL 线程中安全) - 通常 main.c 用来更新 status bar */
 void wifi_controller_register_cb(WLAN_PhaseCb_t cb, void *user_data);
 

@@ -43,6 +43,8 @@
 #include "font_warm.h"
 #include "time_sync.h"
 #include "settings_storage.h"
+#include "bookshelf.h"
+#include "clock_mode.h"
 
 extern const lv_font_t lv_font_montserrat_12;
 
@@ -127,6 +129,7 @@ extern void platform_init(void);
 /* 前向声明 - 解决main_ui_create在定义前被调用的问题 */
 void main_ui_create(void);
 static void settings_btn_event_handler(lv_event_t * e);
+static void settings_sleep_clock_btn_cb(lv_event_t * e);
 
 /*====================
  * SD卡测试函数
@@ -613,6 +616,31 @@ static void settings_font_sel_btn_cb(lv_event_t *e) {
     epd_resume_refresh();
 }
 
+/* 休眠时钟按钮回调 - 进入时钟模式(GPT clock 方案 §一)
+ * 需 WiFi 已连接(用于 NTP 校时写入 RTC)。进入后系统进入 HIBERNATION 不返回。 */
+static void settings_sleep_clock_btn_cb(lv_event_t * e) {
+    (void)e;
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
+        printf("[CLOCK] need WiFi connected for NTP time, abort\r\n");
+        return;
+    }
+    printf("[Settings] Entering sleep clock mode\n");
+    /* clock_mode_enter 内部会 NTP->RTC、刷新首帧、关停外设、进 HIBERNATION，
+     * 正常情况下不再返回。 */
+    clock_mode_enter();
+}
+
+/* 首页休眠时钟按钮回调 (fix-power-saving: 把时钟入口提到首页) */
+static void home_clock_btn_event_handler(lv_event_t *e) {
+    (void)e;
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
+        printf("[CLOCK] need WiFi connected for NTP time, abort\r\n");
+        return;
+    }
+    printf("[Home] Entering sleep clock mode\n");
+    clock_mode_enter();
+}
+
 /*====================
  * Home 顶部 WiFi 状态栏 (由 wifi_controller phase 回调驱动)
  *===================*/
@@ -796,7 +824,25 @@ static void settings_btn_event_handler(lv_event_t * e) {
     lv_obj_set_style_text_color(font_sel_label, lv_color_make(0, 0, 0), 0);
     lv_obj_center(font_sel_label);
     lv_obj_add_event_cb(btn_font_sel, settings_font_sel_btn_cb, LV_EVENT_CLICKED, NULL);
-    
+
+    /* 休眠时钟按钮 - Y=240 (Font Select 下方)。
+     * 进入后每分钟刷新一次时钟并 HIBERNATION，按 PA6 退出回正常模式。 */
+    lv_obj_t *btn_sleep_clock = lv_btn_create(scr);
+    lv_obj_set_size(btn_sleep_clock, 200, 35);
+    lv_obj_set_pos(btn_sleep_clock, 10, 240);
+    lv_obj_set_style_bg_color(btn_sleep_clock, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(btn_sleep_clock, 2, 0);
+    lv_obj_set_style_border_color(btn_sleep_clock, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(btn_sleep_clock, 4, 0);
+    lv_obj_set_style_transition(btn_sleep_clock, NULL, LV_PART_MAIN);
+
+    lv_obj_t *sleep_clock_label = lv_label_create(btn_sleep_clock);
+    lv_label_set_text(sleep_clock_label, LV_SYMBOL_BELL "  Sleep Clock");
+    lv_obj_set_style_text_font(sleep_clock_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sleep_clock_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_center(sleep_clock_label);
+    lv_obj_add_event_cb(btn_sleep_clock, settings_sleep_clock_btn_cb, LV_EVENT_CLICKED, NULL);
+
     /* 【EPD优化】恢复刷新，触发一次完整刷新 */
     epd_resume_refresh();
     
@@ -829,6 +875,23 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
     
     // 【EPD优化】FM创建完成后恢复刷新，会自动触发一次完整刷新
     epd_resume_refresh();
+}
+
+/* 书架入口 */
+static void bookshelf_btn_event_handler(lv_event_t * e) {
+    (void)e;
+    epd_pause_refresh();
+
+    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
+        printf("[BS] WiFi not connected, canceling background connect\n");
+        wlan_manager_cancel_connect();
+    }
+
+    printf("[BS] Mounting SD card...\n");
+    fs_ctrl_mount(FS_MNT_DEV_TYPE_SDCARD, 0);
+
+    bookshelf_init();
+    /* bookshelf_init 内部会 resume+mark */
 }
 
 static lv_obj_t *create_home_tile(lv_obj_t *parent,
@@ -936,17 +999,34 @@ static void disp_task(void *arg) {
          *   调 EPD_DrawStringCentered("Tuwa Reader") 覆盖画面。
          *   正确做法是调 screensaver_task_force_enter() → screensaver_enter(),
          *   内部会先加载 screensaver.bin (有图) 或显示 Tuwa Reader (无图),
-         *   再断 WiFi + EPD deep sleep + PA6 唤醒源。 */
+         *   再断 WiFi + EPD deep sleep + PA6 唤醒源。
+         *
+         * 时钟模式退出保护(GPT 方案 §三)：PA6 唤醒退出时钟模式后，本检测会立刻
+         * 看到 PA6 仍可能处于按下态而再次进休眠。boot_key_guard 由
+         * clock_boot_dispatch() 在退出时置位，这里消费它以忽略首次按下。 */
         if (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
-            printf("[PA6] Button pressed, entering hibernation (via screensaver)\r\n");
-            OS_MSleep(50);
-            while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
-                OS_MSleep(20);
+            if (clock_consume_boot_key_guard()) {
+                printf("[PA6] boot_key_guard: swallowed post-clock-mode press\r\n");
+                /* 等按键彻底释放后再继续，避免持续触发 */
+                while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
+                    OS_MSleep(20);
+                }
+            } else {
+                printf("[PA6] Button pressed, entering hibernation (via screensaver)\r\n");
+                OS_MSleep(50);
+                while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
+                    OS_MSleep(20);
+                }
+                screensaver_task_force_enter();
             }
-            screensaver_task_force_enter();
         }
 
         screensaver_task();
+
+        /* 休眠时钟模式：lvgl 按钮回调只设标志，真正进入在此(disp_task 上下文)
+         * 执行。pm_enter_mode(HIBERNATION) 必须在 disp_task 调用，与 screensaver
+         * 一致；在 lvgl 上下文调用会触发 PM 框架 UsageFault。enter_run 不返回。 */
+        clock_mode_enter_run();
 
         /* 处理待刷新的显示 - 检查状态 */
         lv_port_disp_task();
@@ -1060,11 +1140,23 @@ void main_ui_create(void)
                      "Settings",
                      settings_btn_event_handler);
 
-    /* 第二行按钮: CoreMark */
+    /* 第二行: 书架 */
     create_home_tile(scr, 10, 170, 220, 60,
+                     LV_SYMBOL_LIST,
+                     "Books",
+                     bookshelf_btn_event_handler);
+
+    /* 第三行: CoreMark */
+    create_home_tile(scr, 10, 240, 220, 60,
                      LV_SYMBOL_CHARGE,
                      "CoreMark",
                      coremark_btn_event_handler);
+
+    /* 第四行: 休眠时钟 (fix-power-saving: 从 Settings 里提到首页) */
+    create_home_tile(scr, 10, 310, 220, 60,
+                     LV_SYMBOL_BELL,
+                     "Sleep Clock",
+                     home_clock_btn_event_handler);
 
     /* VBAT SOC%标签 - 标题右侧 */
     g_vbat_label = lv_label_create(scr);
@@ -1271,7 +1363,16 @@ int main(void)
      * EXT LDO 硬件稳定时间 <1ms, 只需给电容充电几 ms 即可。 */
     printf("[SD] Waiting 100ms for EXT LDO to stabilize...\r\n");
     OS_MSleep(100);
-    
+
+    /*====================================================
+     * 休眠时钟启动分流 (GPT clock 方案 §二)
+     * 必须在 WiFi/SD/LVGL/触摸等普通服务启动之前。
+     *   - WKTIMER 唤醒 -> 分钟周期(最小化)，不返回
+     *   - PA6 唤醒且处于时钟模式 -> 清标志 + boot guard，继续正常启动
+     *   - 其它 -> 正常 InkFrog 启动
+     *==================================================*/
+    clock_boot_dispatch();
+
     /* 执行FatFs文件系统测试（FatFs内部会初始化SD卡） */
     fatfs_filesystem_test();
 

@@ -454,6 +454,47 @@ void wifi_controller_stop(void)
     }
 }
 
+/* fix-power-saving v2: 休眠前完整下电 WiFi 协处理器(Sys3)。
+ *
+ * 为什么不能让 SDK 自己 net_sys_onoff(0) 关:
+ *   SDK 的 net_sys_onoff(0) 在 pm_enter_mode 内部调用, 此时底层 wlan 线程
+ *   (umac/wpas/rx_proc/BH) 仍在运行, teardown 与它们竞争 wlan 驱动 ->
+ *   UNDEFINSTR 崩溃 (PC=0x004120ee, 历史 PC=0x00200024)。
+ *   原版固件不崩是因为它没有任何用户线程在碰 wlan。
+ *
+ * 本函数的做法 (在 screensaver_enter 里调, 此时 wc_task 已停):
+ *   1. wlan_sta_disable() — 主动断开, 触发 Issue unjoin
+ *   2. while(IsSys3Alive()) sleep — 等 Sys3 协处理器真正掉电
+ *   调用方必须先 wifi_controller_stop() 停 wc_task, 再调本函数,
+ *   并配合 pm_unregister_wlan_power_onoff() 屏蔽 SDK 重复 teardown。 */
+void wifi_controller_poweroff(void)
+{
+    WC_LOG("Powering off WiFi (manual wlan_sta_disable for hibernation)");
+
+    /* wc_task 必须先退出(调用方已调 wifi_controller_stop), 再确认一次 */
+    int wait_ms = 0;
+    while (!g_wc_exited && wait_ms < 2000) {
+        OS_MSleep(20);
+        wait_ms += 20;
+    }
+
+    /* 主动 wlan_sta_disable — 等价原版日志的 Issue unjoin / join_status:0。
+     * wlan_manager_disconnect() 内部调 wlan_sta_disable()。 */
+    WLAN_State_t st = wlan_manager_get_state();
+    if (st != WLAN_STATE_IDLE && st != WLAN_STATE_DISCONNECTED) {
+        wlan_manager_disconnect();
+    }
+
+    /* 等 Sys3 协处理器真正掉电 — 对照 net_sys_stop() 的做法。 */
+    wait_ms = 0;
+    while (HAL_PRCM_IsSys3Alive() && wait_ms < 3000) {
+        OS_MSleep(10);
+        wait_ms += 10;
+    }
+    WC_LOG("Sys3 %s (waited %dms)",
+           HAL_PRCM_IsSys3Alive() ? "STILL ALIVE" : "powered off", wait_ms);
+}
+
 void wifi_controller_register_cb(WLAN_PhaseCb_t cb, void *user_data)
 {
     wlan_manager_set_phase_callback(cb, user_data);

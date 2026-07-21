@@ -20,8 +20,10 @@
 #include "pm/pm.h"
 #include "driver/chip/hal_gpio.h"
 #include "driver/chip/hal_i2c.h"
+#include "driver/chip/hal_adc.h"
 #include "driver/chip/sdmmc/sdmmc.h"
 #include "driver/chip/sdmmc/hal_sdhost.h"
+#include "chsc6540.h"
 #include "pm/pm.h"
 
 extern OS_Thread_t lvgl_thread;
@@ -80,6 +82,12 @@ static int screensaver_enter(int force)
         return -1;
     }
 
+    /* 取 EPD/framebuffer 独占所有权 (GPT clock 方案 §六)：
+     * 之前 screensaver_enter 直接改 framebuffer 并 EPD_3IN52_Display()，
+     * 而此时 lvgl_task 仍每 5ms 跑 flush_cb，存在 framebuffer 在传输中被
+     * 修改的竞争。take 后 lvgl 线程被挂起，可安全操作 framebuffer。 */
+    epd_take_ownership();
+
     /* 尝试加载屏保图片 */
     if (screensaver_load_to_framebuffer() == 0) {
         has_image = 1;
@@ -93,32 +101,38 @@ static int screensaver_enter(int force)
 
     printf("[SS] entering hibernation (has_image=%d, force=%d)\n", has_image, force);
 
-    /* WiFi: wifi_controller_stop 停 wc_task + wlan_sta_disable;
-     * pm_unregister 跳过 net_sys_onoff(0) (该路径在活跃 net 上会断言崩溃)。 */
-    wifi_controller_stop();
-    pm_unregister_wlan_power_onoff();
+    /* ====== fix-power-saving v2: WiFi 手动下电 + 屏蔽 SDK 重复 teardown ======
+     * 历史: 让 SDK 在 pm_enter_mode 内部 net_sys_onoff(0) 关 WiFi 会崩
+     *   (PC=0x004120ee UNDEFINSTR, BH 线程与 umac/wpas 竞争 wlan 驱动)。
+     * 原版不崩是因为没有用户线程碰 wlan; FontExp 必须手动安全下电。
+     *
+     * 顺序 (对照原版休眠日志, 但避开 SDK 崩溃路径):
+     *   1. wifi_controller_stop()  停 wc_task 线程
+     *   2. pm_unregister_wlan_power_onoff()  屏蔽 SDK 的 net_sys_onoff(0)
+     *   3. wifi_controller_poweroff()  手动 wlan_sta_disable + 等 Sys3 掉电 */
 
-    /* EPD deep sleep */
+    /* 1. WiFi: 停 wc_task 线程 */
+    wifi_controller_stop();
+    /* 2. 屏蔽 SDK 在 pm_enter_mode 内部的 net_sys_onoff(0) (崩溃源) */
+    pm_unregister_wlan_power_onoff();
+    /* 3. 手动 wlan_sta_disable + while(IsSys3Alive()) 等协处理器掉电 */
+    wifi_controller_poweroff();
+
+    /* 4. EPD deep sleep (原版在 cg_flush_task 里做, 我们在这做) */
     EPD_3IN52_Init();
     EPD_3IN52_Display();
     EPD_Sleep();
     printf("[SS] EPD entered deep sleep\n");
 
-    /* ========================================
-     * 休眠前外设操作 (严格按原版固件休眠.log 的顺序)
-     * ========================================
-     * 原版顺序: EPD flush -> WakeupIO -> net_sys_onoff -> spi deinit
-     *           -> mod_vfat_power:en=0 -> suspend devices -> nvic/WFE
-     *
-     * WiFi: wifi_controller_stop 已 wlan_sta_disable; PM 跳过 net_sys_onoff。
-     *
-     * 原版【没有】的操作 (不在这里做!):
-     *   - PA07/PA23/PA03 等 GPIO 操作
-     *   - SPI GPIO 输入模式配置
-     *   - I2C deinit / I2C GPIO 输入
-     *   这些都破坏了 flash 唤醒 (rom_flash_rw fail)。
-     * ======================================== */
-    /* 按原版顺序: spi deinit (SD 控制器) -> mod_vfat_power:en=0 (断电) */
+    /* 5. 触摸 + I2C0 下电 (新增, 原版由驱动框架 suspend 链处理) */
+    CHSC6540_DeInit();
+    printf("[SS] Touch controller deinitialized\n");
+
+    /* 6. ADC 下电 (新增, 停 VBAT 连续转换, 省电) */
+    HAL_ADC_DeInit();
+    printf("[SS] ADC deinitialized\n");
+
+    /* 7. SD 卡: unmount + 卡 deinit + SDC 控制器 deinit (原版 "spi deinit") */
     printf("[SS] Unmount SD card filesystem\n");
     f_mount(NULL, "0:", 0);
 
@@ -134,13 +148,6 @@ static int screensaver_enter(int force)
     printf("[SS] Deinit SD controller (spi deinit)\n");
     HAL_SDC_Deinit(0);
 
-#if 0  /* 暂时注释: 怀疑 HAL_PRCM_SetEXTLDOMode 写 PRCM 寄存器干扰了 PA6 唤醒域 */
-    printf("[SS] Power off EXT LDO (SD card - mod_vfat_power en=0)\n");
-    HAL_PRCM_SetEXTLDOMode(PRCM_EXTLDO_ALWAYS_OFF);
-#endif
-
-    /* ======================================== */
-
     /* 配置唤醒源:
      *   WKIO2 = PA06  -> 翻页/唤醒按键 (下降沿唤醒)
      * 注意:HAL_Wakeup_SetIO 的 pn 是 WKIO 索引 0~9,不是 GPIO 引脚号。
@@ -151,6 +158,18 @@ static int screensaver_enter(int force)
      * 作为下降沿唤醒源会干扰休眠,且会引发"充上电就开机→自动休眠→
      * 又开机"的循环。充电唤醒逻辑改由软件层处理。 */
     HAL_Wakeup_SetIO(2, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);   /* PA6  按键   */
+
+    /* fix-power-saving: 【不手动关 EXT LDO!】
+     * 根据 XR872_User_Manual §3.1: EXT LDO 给 VDDIO/GPADC/CODEC 供电,
+     * 而 PA6(WKIO2) 的输入检测电路依赖 VDDIO。手动 SetEXTLDOMode(OFF)
+     * 会断掉 VDDIO -> PA6 失电 -> 无法唤醒(实测确认)。
+     *
+     * 正确做法: 让硬件 PMU 在进 hibernation 时按 SYS1_SLEEP_CTRL 自动
+     * 管理电源域(手册 §3.3.3 Wakeup from Hibernation: VDD_EXT 唤醒时
+     * 硬件自动恢复)。原版日志里的 mod_vfat_power en=0 是原版应用私有
+     * 代码,可能针对不同硬件版本,不适用于我们。
+     *
+     * 已下电的外设(WiFi/触摸/ADC/SD)不受 EXT LDO 影响,省电效果保留。 */
 
     /* 进入 MCU hibernation */
     pm_enter_mode(PM_MODE_HIBERNATION);
