@@ -150,7 +150,7 @@ static const char *next_line(const char *p, const char *line, int *line_len)
 
 /* ==================== 公共接口实现 ==================== */
 
-int settings_save_bookmark(const char *filepath, int chapter, int offset)
+int settings_save_bookmark(const char *filepath, int chapter, int offset, int pct)
 {
     /* 构造section名: "bookmark:/xxx.epub" */
     char section[SETTINGS_MAX_SECTION];
@@ -165,6 +165,12 @@ int settings_save_bookmark(const char *filepath, int chapter, int offset)
     /* 保存offset */
     snprintf(val_buf, sizeof(val_buf), "%d", offset);
     if (settings_set_string(section, "offset", val_buf) != 0) return -1;
+
+    /* 保存全书百分比 pct (0-100) */
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    snprintf(val_buf, sizeof(val_buf), "%d", pct);
+    if (settings_set_string(section, "pct", val_buf) != 0) return -1;
 
     return 0;
 }
@@ -184,6 +190,19 @@ int settings_load_bookmark(const char *filepath, int *chapter_out, int *offset_o
 
     printf("[SETTINGS] Loaded bookmark: %s ch=%d off=%d\n", filepath, *chapter_out, *offset_out);
     return 0;
+}
+
+int settings_load_bookmark_pct(const char *filepath)
+{
+    char section[SETTINGS_MAX_SECTION];
+    snprintf(section, sizeof(section), "bookmark:%s", filepath ? filepath : "");
+
+    char val[32];
+    if (settings_get_string(section, "pct", val, sizeof(val)) != 0) return 0;
+    int pct = atoi(val);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
 }
 
 int settings_set_string(const char *section, const char *key, const char *value)

@@ -10,6 +10,7 @@
 #include <ctype.h>
 /* #include <sys/dma_heap.h>  -- 不再使用 DMA heap，改用静态分配 (.psram_bss) */
 #include "fs/fatfs/ff.h"
+#include "loading.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -299,10 +300,19 @@ static void filter_unsupported_chars_ex(char *str, bool preserve_markers) {
         if (unicode == 0x0A || unicode == 0xE000 ||
             (unicode >= 0x20 && unicode <= 0x7E) ||
             (unicode >= 0x4E00 && unicode <= 0x9FA5) ||
-            (unicode >= 0x3000 && unicode <= 0x303F)) {
+            (unicode >= 0x3001 && unicode <= 0x303F)) {
             for (int i = 0; i < char_len; i++) *write_ptr++ = read_ptr[i];
         } else {
-            if (unicode == 0xFF08) *write_ptr++ = '(';
+            /* 各类空白字符：字体多无字模会画成方框，统一转半角空格
+             * U+0009 Tab, U+00A0 NBSP, U+2000-200A 各种宽度空格,
+             * U+200B-200D 零宽, U+202F/205F 窄/中数学空格,
+             * U+3000 全角空格, U+FEFF BOM/零宽不换行空格 */
+            if (unicode == 0x09 || unicode == 0x00A0 || unicode == 0x3000 ||
+                unicode == 0x202F || unicode == 0x205F || unicode == 0xFEFF ||
+                (unicode >= 0x2000 && unicode <= 0x200D)) {
+                *write_ptr++ = ' ';
+            }
+            else if (unicode == 0xFF08) *write_ptr++ = '(';
             else if (unicode == 0xFF09) *write_ptr++ = ')';
             else if (unicode == 0xFF01) *write_ptr++ = '!';
             else if (unicode == 0xFF1A) *write_ptr++ = ':';
@@ -754,7 +764,8 @@ static void update_display(EpubViewer *viewer) {
 
     /* 保存书签到settings.ini（每次翻页/跳转后自动保存） */
     if (viewer->filepath[0] != '\0') {
-        settings_save_bookmark(viewer->filepath, viewer->current_chapter, viewer->read_offset);
+        int pct = epub_viewer_get_overall_pct(viewer);
+        settings_save_bookmark(viewer->filepath, viewer->current_chapter, viewer->read_offset, pct);
     }
 }
 
@@ -1164,12 +1175,15 @@ void epub_viewer_destroy(EpubViewer *viewer) {
 /* ========== 章节加载 ========== */
 
 bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset) {
-if (!viewer || !viewer->reader) return false;
+	if (!viewer || !viewer->reader) return false;
     if (chapter_index < 0 || chapter_index >= viewer->reader->spine_count) return false;
 
     viewer->current_chapter = chapter_index;
 
     VIEW_LOG("Goto chapter %d...\n", chapter_index);
+
+    /* loading: 整章 inflate + 分页 + 首页渲染可能数百 ms ~ 1s+ */
+    loading_show("Loading chapter...");
 
     viewer->whole_xhtml_len = epub_reader_read_chapter_full(
         viewer->reader, chapter_index,
@@ -1181,6 +1195,7 @@ if (!viewer || !viewer->reader) return false;
         } else {
             VIEW_ERR("Failed to read chapter %d\n", chapter_index);
         }
+        loading_hide();
         return false;
     }
 
@@ -1204,6 +1219,7 @@ if (!viewer || !viewer->reader) return false;
 
     if (!parse_ok) {
         VIEW_ERR("Expat parse failed for chapter %d\n", chapter_index);
+        loading_hide();
         return false;
     }
 
@@ -1224,6 +1240,8 @@ if (!viewer || !viewer->reader) return false;
     history_clear(viewer);
 
     update_display(viewer);
+
+    loading_hide();   /* 章节加载 + 首页渲染完成, 关闭 loading */
 
     if (viewer->chapter_cb) viewer->chapter_cb(chapter_index, viewer->reader->spine_count);
     return true;
@@ -1718,6 +1736,18 @@ void epub_viewer_set_filepath(EpubViewer *viewer, const char *filepath) {
 }
 
 int epub_viewer_get_read_offset(EpubViewer *viewer) { return viewer ? viewer->read_offset : 0; }
+
+int epub_viewer_get_overall_pct(EpubViewer *viewer) {
+    if (!viewer || !viewer->reader) return 0;
+    int sc = viewer->reader->spine_count;
+    if (sc <= 0) return 0;
+    float intra = (viewer->chapter_len > 0)
+        ? (float)viewer->read_offset / (float)viewer->chapter_len : 0.0f;
+    int pct = (int)(((float)viewer->current_chapter + intra) * 100.0f / (float)sc);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    return pct;
+}
 
 void epub_viewer_set_read_offset(EpubViewer *viewer, int offset) {
     if (viewer) viewer->read_offset = offset;

@@ -45,6 +45,7 @@
 #include "settings_storage.h"
 #include "bookshelf.h"
 #include "clock_mode.h"
+#include "charge_mode.h"
 
 extern const lv_font_t lv_font_montserrat_12;
 
@@ -125,11 +126,15 @@ static void ui_apply_static_btn_style(lv_obj_t *btn, int border_width, int radiu
 
 /* platform_init声明 */
 extern void platform_init(void);
+/* 省电优化: 仅 level0 (flash/image/PSRAM/cache), 跳过 level1(WiFi)/level2(SD)。
+ * platform_init_level0 是 __weak 函数(platform_init.c:548), 未在头文件声明。 */
+extern void platform_init_level0(void);
 
 /* 前向声明 - 解决main_ui_create在定义前被调用的问题 */
 void main_ui_create(void);
 static void settings_btn_event_handler(lv_event_t * e);
 static void settings_sleep_clock_btn_cb(lv_event_t * e);
+static void settings_sd_diag_btn_cb(lv_event_t *e);
 
 /*====================
  * SD卡测试函数
@@ -721,6 +726,68 @@ static void on_wifi_phase_change(WLAN_Phase_t phase, void *user_data)
     settings_wifi_on_phase_change(phase);
 }
 
+/* SD 卡写诊断: 测单块/多块写入是否可靠。
+ * 观察日志判断是卡质量问题还是硬件竞争:
+ *   - 单块写(BSZ=1)也报 DCE → 卡/电源问题
+ *   - 只有多块写(BSZ≥4)报 DCE → DMA 时序/Bus 竞争
+ *   - 关了 WiFi 就不报 → WiFi + SD 并发竞争
+ */
+static void sd_write_diag_run(void)
+{
+    FIL fp;
+    FRESULT fr;
+    UINT bw;
+    int bs, retry, ok, fail;
+    static const int test_bsz[] = {1, 2, 4, 6, 8, 0};  /* sector counts */
+    uint8_t buf[4096] __attribute__((aligned(64)));
+
+    printf("\r\n=== SD Write Diagnostic ===\r\n");
+    printf("[SD-DIAG] VBAT=%s charging=%d\r\n", g_vbat_text,
+           (int)HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21) == 0);
+
+    memset(buf, 0xA5, sizeof(buf));
+
+    for (bs = 0; test_bsz[bs] != 0; bs++) {
+        int bsz = test_bsz[bs];
+        int len = bsz * 512;
+        ok = fail = 0;
+
+        fr = f_open(&fp, "0:/_sd_diag.tmp", FA_CREATE_ALWAYS | FA_WRITE);
+        if (fr != FR_OK) {
+            printf("[SD-DIAG] open fail %d\r\n", (int)fr);
+            return;
+        }
+
+        for (retry = 0; retry < 10; retry++) {
+            f_lseek(&fp, retry * len);
+            bw = 0;
+            fr = f_write(&fp, buf, len, &bw);
+            if (fr == FR_OK && bw == (UINT)len) {
+                ok++;
+            } else {
+                fail++;
+                printf("[SD-DIAG] BSZ=%d try=%d: fr=%d bw=%u/%d\r\n",
+                       bsz, retry, (int)fr, (unsigned)bw, len);
+                /* 等卡恢复 */
+                OS_MSleep(200);
+            }
+        }
+        f_close(&fp);
+        printf("[SD-DIAG] BSZ=%d (%uB): ok=%d fail=%d\r\n",
+               bsz, (unsigned)len, ok, fail);
+    }
+    f_unlink("0:/_sd_diag.tmp");
+    printf("=== SD Write Diagnostic END ===\r\n\r\n");
+}
+
+/* Settings SD 诊断按钮回调 */
+static void settings_sd_diag_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    printf("[Settings] SD Write Diagnostic triggered\r\n");
+    sd_write_diag_run();
+}
+
 /* Settings 入口按钮事件处理 */
 static void settings_btn_event_handler(lv_event_t * e) {
     printf("[Settings] Entering Settings page\n");
@@ -842,6 +909,23 @@ static void settings_btn_event_handler(lv_event_t * e) {
     lv_obj_set_style_text_color(sleep_clock_label, lv_color_make(0, 0, 0), 0);
     lv_obj_center(sleep_clock_label);
     lv_obj_add_event_cb(btn_sleep_clock, settings_sleep_clock_btn_cb, LV_EVENT_CLICKED, NULL);
+
+    /* SD 写诊断按钮 - Y=285 (Sleep Clock 下方) */
+    lv_obj_t *btn_sd_diag = lv_btn_create(scr);
+    lv_obj_set_size(btn_sd_diag, 200, 35);
+    lv_obj_set_pos(btn_sd_diag, 10, 285);
+    lv_obj_set_style_bg_color(btn_sd_diag, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(btn_sd_diag, 2, 0);
+    lv_obj_set_style_border_color(btn_sd_diag, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(btn_sd_diag, 4, 0);
+    lv_obj_set_style_transition(btn_sd_diag, NULL, LV_PART_MAIN);
+
+    lv_obj_t *sd_diag_label = lv_label_create(btn_sd_diag);
+    lv_label_set_text(sd_diag_label, LV_SYMBOL_LIST "  SD Write Diag");
+    lv_obj_set_style_text_font(sd_diag_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(sd_diag_label, lv_color_make(0, 0, 0), 0);
+    lv_obj_center(sd_diag_label);
+    lv_obj_add_event_cb(btn_sd_diag, settings_sd_diag_btn_cb, LV_EVENT_CLICKED, NULL);
 
     /* 【EPD优化】恢复刷新，触发一次完整刷新 */
     epd_resume_refresh();
@@ -1012,11 +1096,17 @@ static void disp_task(void *arg) {
                     OS_MSleep(20);
                 }
             } else {
-                printf("[PA6] Button pressed, entering hibernation (via screensaver)\r\n");
+                printf("[PA6] Button pressed");
                 OS_MSleep(50);
                 while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
                     OS_MSleep(20);
                 }
+                /* 充电模式: 插着电按 PA6 → 进充电模式 (显示充电界面, 低功耗) */
+                if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21) == 0) {
+                    printf(", charger connected -> charge mode\r\n");
+                    charge_mode_enter();  /* 不返回 */
+                }
+                printf(", entering hibernation (via screensaver)\r\n");
                 screensaver_task_force_enter();
             }
         }
@@ -1283,7 +1373,45 @@ int main(void)
     printf("EPD_3IN52 + CHSC6540\r\n");
     printf("======================================\r\n\r\n");
     
-    /* 平台初始化 */
+    /*====================================================
+     * 省电优化: WKTIMER 分钟唤醒走最小化初始化路径
+     *   正常时钟模式每分钟冷启动本来要跑完整 platform_init (含 WiFi/SD),
+     *   但分钟周期只用 EPD(PSRAM)+RTC+pm_enter_mode, 完全不需要 WiFi/SD。
+     *   这里在 platform_init 之前早判 (HAL_Wakeup_GetEvent 在 SystemInit→pm_init
+     *   里已填充, main 第一行即可用), 若是 WKTIMER 唤醒则只跑 level0
+     *   (flash/image/PSRAM/cache), 跳过 level1(WiFi) 和 level2(SD/audio),
+     *   直接进 clock_minute_cycle 渲染时钟。
+     *==================================================*/
+    if (HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKTIMER) {
+        /* WKTIMER 同时被时钟模式和充电模式使用:
+         *  - RTC weekday==7 → 时钟模式(分钟刷新)
+         *  - RTC weekday==6 → 充电模式(电量刷新)
+         *  - 其它 → 异常, 走正常启动 */
+        if (charge_mode_enabled()) {
+            printf("[BOOT] WKTIMER wake -> charge mode cycle\r\n");
+            platform_init_level0();
+            EPD_GPIO_Init_Public();
+            charge_mode_cycle();       /* 不返回 */
+        }
+        printf("[BOOT] WKTIMER wake -> minimal init (skip WiFi/SD)\r\n");
+        platform_init_level0();          /* 仅 flash/image/PSRAM/cache */
+        EPD_GPIO_Init_Public();          /* EPD GPIO 最小初始化 */
+        clock_minute_cycle();            /* 不返回: 渲染→刷新→配置唤醒→HIBERNATION */
+        /* 不会到达 */
+    }
+
+    /* PA21(WKIO7) 充电唤醒早判: 插入充电器从普通休眠唤醒。
+     * 此时 RTC weekday 还是正常值(不是 6), 用唤醒源区分。 */
+    if ((HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKIO7) && !charge_mode_enabled()
+        && !clock_mode_enabled()) {
+        printf("[BOOT] PA21(WKIO7) wake -> charge mode (charger inserted)\r\n");
+        platform_init_level0();
+        EPD_GPIO_Init_Public();
+        charge_mode_cycle();       /* 不返回: 设 magic + 渲染充电界面 + HIBERNATION */
+        /* 不会到达 */
+    }
+
+    /* 平台初始化 (正常启动: 完整初始化含 WiFi/SD) */
     platform_init();
 
     {
@@ -1372,6 +1500,15 @@ int main(void)
      *   - 其它 -> 正常 InkFrog 启动
      *==================================================*/
     clock_boot_dispatch();
+
+    /* 充电模式 PA6 唤醒 → 清标志, 正常启动 (可看书/设置) */
+    if (charge_mode_enabled()) {
+        uint32_t event = HAL_Wakeup_GetEvent();
+        if (event & PM_WAKEUP_SRC_WKIO2) {
+            printf("[BOOT] PA6 wake from charge mode -> normal boot\r\n");
+        }
+        charge_mode_set_enabled(false);
+    }
 
     /* 执行FatFs文件系统测试（FatFs内部会初始化SD卡） */
     fatfs_filesystem_test();

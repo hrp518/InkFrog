@@ -30,9 +30,11 @@
 #include "epub_viewer.h"
 #include "settings_storage.h"
 #include "font_priority_loader.h"
+#include "loading.h"
 #include "font_warm.h"
 #include "wifi_controller.h"
 #include "http_server.h"
+#include "fm_ota.h"
 #include <sys/dma_heap.h>
 #include "kernel/os/os.h"
 
@@ -133,6 +135,10 @@ static int ensure_reader_font_loaded(void);
 static void release_reader_fonts(void);
 static uint8_t g_fm_show_pending = 0;
 void file_manager_show(void);
+
+/* EPUB/TXT 关闭后回到的 UI（NULL = 文件管理器） */
+static void (*g_reader_ui_return)(void) = NULL;
+static void (*g_txt_ui_return)(void) = NULL;
 
 /*====================
  *   触摸滑动相关变量（已迁移到lv_port_indev.c驱动层）
@@ -239,8 +245,9 @@ static void physical_back_btn_handler(void)
                 fp = selected_filepath;
             }
             if (fp) {
-                settings_save_bookmark(fp, ch, off);
-                printf("[FM] Bookmark saved: ch=%d off=%d\n", ch, off);
+                int pct = epub_viewer_get_overall_pct(g_epub_viewer);
+                settings_save_bookmark(fp, ch, off, pct);
+                printf("[FM] Bookmark saved: ch=%d off=%d pct=%d%%\n", ch, off, pct);
             }
         }
         /* 保存书签后统一走 file_manager_show 恢复 FM */
@@ -327,7 +334,6 @@ static void file_btn_cb(lv_event_t *e)
 static void viewer_back_cb(lv_event_t *e)
 {
     (void)e;
-    lv_disp_load_scr(fm_screen);
     if (viewer_textarea) {
         lv_obj_del(viewer_textarea);
         viewer_textarea = NULL;
@@ -335,6 +341,15 @@ static void viewer_back_cb(lv_event_t *e)
     if (viewer_screen) {
         lv_obj_del(viewer_screen);
         viewer_screen = NULL;
+    }
+    if (g_txt_ui_return) {
+        void (*cb)(void) = g_txt_ui_return;
+        g_txt_ui_return = NULL;
+        cb();
+        return;
+    }
+    if (fm_screen) {
+        lv_disp_load_scr(fm_screen);
     }
     epd_mark_refresh_pending();
 }
@@ -357,6 +372,9 @@ static void delete_confirm_cb(lv_event_t *e)
     epd_mark_refresh_pending();
 }
 
+static void show_ota_confirm(const char *filepath);
+static void ota_confirm_cb(lv_event_t *e);
+
 static void action_btn_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -372,7 +390,10 @@ static void action_btn_cb(lv_event_t *e)
     } else if (btn_idx == 2) {
         lv_async_call(show_rename_keyboard, (void*)selected_filepath);
     } else if (btn_idx == 10) {
+        g_reader_ui_return = NULL; /* 返回文件管理器 */
         lv_async_call(async_open_epub_wrapper, selected_filepath);
+    } else if (btn_idx == 11) {
+        show_ota_confirm(selected_filepath);
     }
     // 取消按钮不做任何操作
 }
@@ -599,6 +620,7 @@ static const char* get_file_icon(const char *filename, uint8_t is_dir)
         if (strcasecmp(ext, ".txt") == 0 || strcasecmp(ext, ".md") == 0) return "[TXT]";
         if (strcasecmp(ext, ".epub") == 0) return "[EPUB]";
         if (strcasecmp(ext, ".bmp") == 0 || strcasecmp(ext, ".jpg") == 0) return "[IMG]";
+        if (strcasecmp(ext, ".bin") == 0 || strcasecmp(ext, ".img") == 0) return "[OTA]";
     }
     return "[FILE]";
 }
@@ -1088,17 +1110,16 @@ static void close_action_dialog(void)
     }
 }
 
-static void action_btn_cb(lv_event_t *e);
-
 static void show_file_action_menu(const char *filename)
 {
     close_action_dialog();
     
     const char *ext = strrchr(filename, '.');
     int is_epub = (ext && strcasecmp(ext, ".epub") == 0);
+    int is_fw = fm_ota_is_firmware_file(filename);
     
     action_dialog = lv_obj_create(fm_screen);
-    lv_obj_set_size(action_dialog, 200, is_epub ? 240 : 165);
+    lv_obj_set_size(action_dialog, 200, (is_epub || is_fw) ? 220 : 165);
     lv_obj_align(action_dialog, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_bg_color(action_dialog, lv_color_white(), 0);
     epd_disable_all_animations_recursive(action_dialog);
@@ -1115,7 +1136,52 @@ static void show_file_action_menu(const char *filename)
     lv_obj_set_width(fname_label, 180);
     lv_obj_align(fname_label, LV_ALIGN_TOP_MID, 0, 25);
     
-    if (is_epub) {
+    if (is_fw) {
+        lv_obj_t *btn_ota = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn_ota, 170, 35);
+        lv_obj_align(btn_ota, LV_ALIGN_TOP_LEFT, 15, 55);
+        epd_disable_all_animations_recursive(btn_ota);
+        lv_obj_set_style_border_width(btn_ota, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn_ota, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn_ota, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn_ota, (void*)11);
+        lv_obj_add_event_cb(btn_ota, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn_ota_label = lv_label_create(btn_ota);
+        lv_label_set_text(btn_ota_label, "固件更新");
+        lv_obj_set_style_text_font(btn_ota_label, get_reader_font(), 0);
+        lv_obj_center(btn_ota_label);
+        
+        lv_obj_t *btn2 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn2, 80, 30);
+        lv_obj_align(btn2, LV_ALIGN_TOP_LEFT, 10, 105);
+        epd_disable_all_animations_recursive(btn2);
+        lv_obj_set_style_border_width(btn2, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn2, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn2, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn2, (void*)1);
+        lv_obj_add_event_cb(btn2, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn2_label = lv_label_create(btn2);
+        lv_label_set_text(btn2_label, "删除");
+        lv_obj_set_style_text_font(btn2_label, get_reader_font(), 0);
+        lv_obj_center(btn2_label);
+        
+        lv_obj_t *btn3 = lv_btn_create(action_dialog);
+        lv_obj_set_size(btn3, 80, 30);
+        lv_obj_align(btn3, LV_ALIGN_TOP_RIGHT, -10, 105);
+        epd_disable_all_animations_recursive(btn3);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_PRESSED);
+        lv_obj_set_style_border_width(btn3, 1, LV_STATE_FOCUSED);
+        lv_obj_set_style_outline_width(btn3, 0, LV_STATE_FOCUSED);
+        lv_obj_set_user_data(btn3, (void*)3);
+        lv_obj_add_event_cb(btn3, action_btn_cb, LV_EVENT_CLICKED, NULL);
+        
+        lv_obj_t *btn3_label = lv_label_create(btn3);
+        lv_label_set_text(btn3_label, "取消");
+        lv_obj_set_style_text_font(btn3_label, get_reader_font(), 0);
+        lv_obj_center(btn3_label);
+    } else if (is_epub) {
         lv_obj_t *btn_epub = lv_btn_create(action_dialog);
         lv_obj_set_size(btn_epub, 170, 35);
         lv_obj_align(btn_epub, LV_ALIGN_TOP_LEFT, 15, 60);
@@ -1261,10 +1327,42 @@ static void open_text_viewer(const char *filepath)
     memset(text_content, 0, sizeof(text_content));
     res = f_read(&fp, text_content, sizeof(text_content) - 1, &br);
     f_close(&fp);
-    
+
     if (res != FR_OK) {
         printf("[FM] Failed to read file, error: %d\n", res);
         return;
+    }
+
+    /* 各类空白字符 → 半角空格，避免字体无字模显示成方框
+     * 覆盖: U+0009 Tab, U+00A0 NBSP, U+2000-200D, U+202F/205F,
+     *       U+3000 全角空格, U+FEFF BOM */
+    {
+        size_t i = 0, w = 0;
+        while (text_content[i] && w < sizeof(text_content) - 1) {
+            uint32_t u = 0;
+            int cl = 0;
+            unsigned char b0 = (unsigned char)text_content[i];
+            if (b0 < 0x80) { u = b0; cl = 1; }
+            else if ((b0 & 0xE0) == 0xC0 && text_content[i+1]) {
+                u = ((b0 & 0x1F) << 6) | ((unsigned char)text_content[i+1] & 0x3F); cl = 2;
+            } else if ((b0 & 0xF0) == 0xE0 && text_content[i+1] && text_content[i+2]) {
+                u = ((b0 & 0x0F) << 12) | (((unsigned char)text_content[i+1] & 0x3F) << 6)
+                   | ((unsigned char)text_content[i+2] & 0x3F); cl = 3;
+            } else if ((b0 & 0xF8) == 0xF0 && text_content[i+1] && text_content[i+2] && text_content[i+3]) {
+                u = ((b0 & 0x07) << 18) | (((unsigned char)text_content[i+1] & 0x3F) << 12)
+                   | (((unsigned char)text_content[i+2] & 0x3F) << 6) | ((unsigned char)text_content[i+3] & 0x3F); cl = 4;
+            } else { u = b0; cl = 1; }
+
+            if (u == 0x09 || u == 0x00A0 || u == 0x3000 || u == 0x202F ||
+                u == 0x205F || u == 0xFEFF || (u >= 0x2000 && u <= 0x200D)) {
+                text_content[w++] = ' ';
+                i += cl;
+            } else {
+                for (int k = 0; k < cl && w < sizeof(text_content) - 1; k++)
+                    text_content[w++] = text_content[i++];
+            }
+        }
+        text_content[w] = '\0';
     }
     
     viewer_screen = lv_obj_create(NULL);
@@ -1324,6 +1422,40 @@ static void show_delete_confirm(const char *filepath)
     lv_obj_align(mbox, LV_ALIGN_CENTER, 0, 0);
     
     lv_obj_add_event_cb(mbox, delete_confirm_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    epd_mark_refresh_pending();
+}
+
+static void ota_confirm_cb(lv_event_t *e)
+{
+    lv_obj_t *mbox = lv_event_get_current_target(e);
+    uint16_t btn_id = lv_msgbox_get_active_btn(mbox);
+    if (btn_id == 0) {
+        printf("[FM] OTA confirmed: %s\n", selected_filepath);
+        lv_msgbox_close(mbox);
+        fm_ota_start(selected_filepath);
+    } else {
+        lv_msgbox_close(mbox);
+        epd_mark_refresh_pending();
+    }
+}
+
+static void show_ota_confirm(const char *filepath)
+{
+    const char *fname = strrchr(filepath, '/');
+    if (fname) fname++; else fname = filepath;
+
+    static const char *btns[] = {"确认更新", "取消", ""};
+    char confirm_text[160];
+    snprintf(confirm_text, sizeof(confirm_text),
+             "将写入备用固件区并重启\n请保持供电\n\n%s", fname);
+
+    lv_obj_t *mbox = lv_msgbox_create(fm_screen, "固件更新", confirm_text, btns, false);
+    epd_disable_all_animations_recursive(mbox);
+    lv_obj_set_style_text_font(lv_msgbox_get_title(mbox), get_reader_font(), 0);
+    lv_obj_set_style_text_font(lv_msgbox_get_text(mbox), get_reader_font(), 0);
+    lv_obj_set_width(mbox, 220);
+    lv_obj_align(mbox, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_add_event_cb(mbox, ota_confirm_cb, LV_EVENT_VALUE_CHANGED, NULL);
     epd_mark_refresh_pending();
 }
 
@@ -1469,6 +1601,9 @@ static void open_epub_viewer(const char *filepath)
 {
     printf("[FM] Opening EPUB: %s\n", filepath);
 
+    /* loading: WiFi 断开(500ms) + EPUB 解析 + 首页渲染要数秒, 先给反馈 */
+    loading_show("Opening EPUB...");
+
     /* 【内存优化】EPUB 打开时强制断开 WiFi, 释放 SRAM 给 inflate / 缓存
      * 现象: EPUB 开启后立即 inflate 申请 32KB 失败 (heap exhausted),
      *       根因是 wc_task 后台连接 / DHCP 持有 ~30KB SRAM。
@@ -1509,35 +1644,38 @@ static void open_epub_viewer(const char *filepath)
     if (!g_epub_reader) {
         printf("[FM] Failed to create EPUB reader\n");
         fm_resume_after_reader();
+        loading_hide();
         return;
     }
-    
+
     if (!epub_reader_open(g_epub_reader, filepath)) {
         printf("[FM] Failed to open EPUB file\n");
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
         fm_resume_after_reader();
+        loading_hide();
         return;
     }
 
     /* EPUB 元数据解析完毕，释放 DMA bump 区，给后续章节解压腾空间 */
     extern void epub_buffer_reset(void);
     epub_buffer_reset();
-    
+
     printf("[FM] EPUB opened: %s, chapters: %d\n",
            epub_reader_get_title(g_epub_reader),
            epub_reader_get_chapter_count(g_epub_reader));
-    
+
     g_epub_viewer = epub_viewer_create(g_epub_reader);
     if (!g_epub_viewer) {
         printf("[FM] Failed to create EPUB viewer\n");
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
         fm_resume_after_reader();
+        loading_hide();
         return;
     }
     
-    /* 设置EPUB关闭回调，返回文件管理器 */
+    /* 关闭回调：统一走 file_manager_show，再按 g_reader_ui_return 分流 */
     epub_viewer_set_close_cb(g_epub_viewer, file_manager_show);
     
     /* 设置文件路径（用于书签存储） */
@@ -1554,6 +1692,8 @@ static void open_epub_viewer(const char *filepath)
     } else {
         epub_viewer_goto_chapter(g_epub_viewer, 0, 0);
     }
+
+    loading_hide();   /* EPUB 打开 + 首页渲染完成, 关闭 loading */
 }
 
 /*====================
@@ -1565,10 +1705,11 @@ void file_manager_close(void)
     printf("[FM] Closing File Manager...\n");
 
     /* XR872 修复: 退出 FM 恢复 WiFi 重试
-     * 进入 FM/EPUB 时设了 fm_paused=1 让 wc_task 暂停, 退出时清掉 */
+     * 进入 FM/EPUB 时设了 fm_paused=1 让 wc_task 暂停, 退出时清掉并重启 WiFi */
     if (g_wifi.fm_paused) {
         printf("[FM] Resuming WiFi controller (fm_paused=0)\n");
         g_wifi.fm_paused = 0;
+        wifi_controller_request_enable();
     }
 
     /* 清空滑动回调 */
@@ -1620,14 +1761,7 @@ static void file_manager_show_async(void *user_data)
 {
     (void)user_data;
 
-    printf("[FM] Showing File Manager (return from EPUB)...\n");
-
-    if (!fm_screen) {
-        printf("[FM] fm_screen is NULL, cannot show\n");
-        g_fm_show_pending = 0;
-        epd_resume_refresh();
-        return;
-    }
+    printf("[FM] Return from EPUB (cleanup)...\n");
 
     g_rendering_in_progress = 0;
 
@@ -1635,9 +1769,6 @@ static void file_manager_show_async(void *user_data)
     EpubReader *r = g_epub_reader;
     g_epub_viewer = NULL;
     g_epub_reader = NULL;
-
-    /* 先切回 FM 屏幕，避免 EPD 刷新仍显示 EPUB */
-    lv_disp_load_scr(fm_screen);
 
     if (v) {
         epub_viewer_set_close_cb(v, NULL);
@@ -1650,6 +1781,29 @@ static void file_manager_show_async(void *user_data)
 
     release_reader_fonts();
     fm_resume_after_reader();
+
+    /* 书架等外部调用方：清理后回到其 UI */
+    if (g_reader_ui_return) {
+        void (*cb)(void) = g_reader_ui_return;
+        g_reader_ui_return = NULL;
+        printf("[FM] Returning to external UI after EPUB\n");
+        cb();
+        epd_resume_refresh();
+        epd_mark_refresh_pending();
+        g_fm_show_pending = 0;
+        return;
+    }
+
+    if (!fm_screen) {
+        printf("[FM] fm_screen is NULL, cannot show\n");
+        g_fm_show_pending = 0;
+        epd_resume_refresh();
+        return;
+    }
+
+    /* 先切回 FM 屏幕，避免 EPD 刷新仍显示 EPUB */
+    lv_disp_load_scr(fm_screen);
+
     touch_register_swipe_callback(swipe_handler);
 
     refresh_file_list(current_path);
@@ -1665,6 +1819,28 @@ static void file_manager_show_async(void *user_data)
 
     printf("[FM] File Manager shown\n");
     g_fm_show_pending = 0;
+}
+
+void file_manager_open_epub(const char *filepath, void (*on_ui_return)(void))
+{
+    if (!filepath || !filepath[0]) {
+        return;
+    }
+    strncpy(selected_filepath, filepath, sizeof(selected_filepath) - 1);
+    selected_filepath[sizeof(selected_filepath) - 1] = '\0';
+    g_reader_ui_return = on_ui_return;
+    lv_async_call(async_open_epub_wrapper, selected_filepath);
+}
+
+void file_manager_open_txt(const char *filepath, void (*on_ui_return)(void))
+{
+    if (!filepath || !filepath[0]) {
+        return;
+    }
+    strncpy(selected_filepath, filepath, sizeof(selected_filepath) - 1);
+    selected_filepath[sizeof(selected_filepath) - 1] = '\0';
+    g_txt_ui_return = on_ui_return;
+    open_text_viewer(selected_filepath);
 }
 
 void file_manager_show(void)

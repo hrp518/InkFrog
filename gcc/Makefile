@@ -78,6 +78,9 @@ $(RESPONSE_FILE): $(OBJS)
 	@rm -f $(RESPONSE_FILE)
 	@$(foreach obj,$(OBJS),echo $(obj) >> $(RESPONSE_FILE);)
 
+# image.cfg relative to ../image/xr872/ — 8MB dual-bank (2044K / OTA@2048K)
+IMAGE_CFG := image.cfg
+
 # project make rules - 必须在响应文件规则之后include
 include $(PRJ_MAKE_RULES)
 
@@ -92,3 +95,24 @@ endif
 	$(Q)$(CC) -E -P -CC $(CC_SYMBOLS) -o $(PROJECT_LD) - < $(LINKER_SCRIPT) && \
 	$(Q)$(CC) $(LD_FLAGS) -T$(PROJECT_LD) $(LIBRARY_PATHS) -o $@ @$(RESPONSE_FILE) $(LIBRARIES)
 	@echo "Linking $@...done"
+
+# ----------------------------------------------------------------------------
+# Per-file 优化: stbtt 字形光栅化是浮点密集型(M4F FPU), 全局 -Os 太保守。
+# 单独给 lv_tiny_ttf.c 开 -O3 -ffast-math:
+#   -O3              自动循环展开/向量化, stbtt 内层循环受益最大
+#   -ffast-math      放松 IEEE 精度约束(坐标/缩放计算无影响), 让 FPU 跑满
+#   -fno-trapping-math 告诉编译器无浮点陷阱, 避免拉入 abort()->_exit() 链
+#                     (否则 -ffast-math 会引入浮点异常处理路径, 链接时缺 stubs)
+#   保留 softfp ABI, 和 SDK 其余模块/预编译库 ABI 兼容, 安全。
+# 实测单字渲染 100-200ms -> 预期 40-80ms。
+# ----------------------------------------------------------------------------
+TINY_TTF_SRC := $(PRJ_ROOT_PATH)/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.c
+TINY_TTF_OBJ := $(PRJ_ROOT_PATH)/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.o
+
+$(TINY_TTF_OBJ): $(TINY_TTF_SRC)
+	@echo "[FPU-OPT] Compiling $< with -O3 -ffast-math"
+	$(Q)$(CC) $(CPU) -c $(DBG_FLAG) -fno-common -fmessage-length=0 \
+		-fno-exceptions -ffunction-sections -fdata-sections -fomit-frame-pointer \
+		-Wall -Wpointer-arith -Wno-error -MMD -MP \
+		-O3 -ffast-math -fno-trapping-math \
+		-std=gnu99 $(CC_SYMBOLS) $(INCLUDE_PATHS) -o $@ $<

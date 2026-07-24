@@ -74,4 +74,46 @@ int epd_is_first_frame_done(void);
  */
 uint32_t epd_get_tick(void);
 
+/**
+ * 获取 EPD/framebuffer 独占所有权 (GPT clock 方案 §六)。
+ *
+ * 用于 screensaver_enter() / clock_mode_enter() 这类需要在 LVGL 之外
+ * 直接改 framebuffer 并做整帧刷新的场景：
+ *   - 暂停自动刷新(epd_pause_refresh)
+ *   - 等待正在进行的 epd_do_refresh 完成(refresh_in_progress 清0)
+ *   - 挂起 lvgl 线程(防止 flush_cb 在刷新期间改 framebuffer)
+ *   - 清掉 pending 刷新标记
+ * 调用者随后可安全地直接操作 framebuffer + EPD_3IN52_Display_*()。
+ *
+ * 注意：本函数会挂起 lvgl 线程，因此**只能在非 lvgl 线程**调用
+ * (如 disp_task)。绝不能从 lvgl 按钮回调(lvgl_task 上下文)调用，
+ * 否则会挂起自己导致死锁。从 lvgl 上下文进入、且即将进 HIBERNATION
+ * 不返回的路径用 epd_wait_refresh_drain()。
+ *
+ * 进入 HIBERNATION 前的路径只需 take，不需要 release(系统即将复位)；
+ * 非休眠的状态切换(如 screensaver_exit)用 release 恢复。
+ */
+void epd_take_ownership(void);
+
+/**
+ * 排空 EPD 刷新队列(不挂起 lvgl 线程)。
+ *
+ * 供"从 lvgl 上下文(按钮回调)进入、即将进 HIBERNATION 不返回"的路径用，
+ * 例如 clock_mode_enter()：
+ *   - 暂停自动刷新
+ *   - 等待正在进行的 epd_do_refresh 完成
+ *   - 清掉 pending 刷新标记
+ *
+ * 与 epd_take_ownership() 的区别：**不挂起 lvgl 线程**(因为调用者本身
+ * 就在 lvgl 线程里)。由于调用者随后会关停外设并进 HIBERNATION,系统复位,
+ * lvgl 线程不会再并发跑 flush_cb,因此无需挂起。
+ */
+void epd_wait_refresh_drain(void);
+
+/**
+ * 释放 EPD/framebuffer 所有权 (GPT clock 方案 §六)。
+ * 恢复 lvgl 线程并重新允许自动刷新。仅用于不复位的状态切换路径。
+ */
+void epd_release_ownership(void);
+
 #endif /* LV_PORT_DISP_H */

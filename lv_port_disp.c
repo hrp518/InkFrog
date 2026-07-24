@@ -536,3 +536,89 @@ void epd_set_content_dirty(void) {
     epd_sync.refresh_pending = 0;
     epd_sync.state = EPD_STATE_CONTENT_UPDATE;
 }
+
+/*============================================================
+ * EPD/framebuffer 独占所有权 (GPT clock 方案 §六)
+ *
+ * screensaver_enter()/clock_mode_enter() 需要在 LVGL 之外直接写
+ * framebuffer 并整帧刷新。若不取所有权，lvgl_task 仍可能每 5ms 跑
+ * flush_cb 改 framebuffer，造成刷新过程中 framebuffer 被并发修改。
+ *
+ * take: 暂停自动刷新 → 等待正在进行的 epd_do_refresh 完成 → 挂起 lvgl
+ *       线程 → 清掉 pending。
+ * release: 恢复 lvgl 线程并恢复自动刷新(仅用于不复位的状态切换)。
+ *============================================================*/
+void epd_take_ownership(void)
+{
+    /* 1. 暂停：阻止后续 mark_refresh_pending 设 pending */
+    epd_pause_refresh();
+
+    /* 2. 等待正在进行的刷新(epd_do_refresh 内的 EPD_3IN52_Display_DU)结束。
+     *    同时让任何已 requested 的刷新跑完。最长等 5s。*/
+    uint32_t waited = 0;
+    while ((epd_refresh_requested || epd_refresh_in_progress) && waited < 5000) {
+        OS_MSleep(5);
+        waited += 5;
+    }
+    if (waited >= 5000) {
+        printf("[EPD] take_ownership: refresh still in progress after 5s, proceeding\n");
+    }
+
+    /* 3. 挂起 lvgl 线程，阻止 flush_cb 写 framebuffer */
+    vTaskSuspend(lvgl_thread.handle);
+
+    /* 4. 清掉残留 pending(挂起后不会再被处理) */
+    epd_sync.refresh_pending = 0;
+    epd_refresh_requested = 0;
+
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp) {
+        disp->inv_p = 0;
+    }
+
+    printf("[EPD] ownership taken (lvgl suspended)\n");
+}
+
+void epd_release_ownership(void)
+{
+    vTaskResume(lvgl_thread.handle);
+    lv_timer_handler_unblock_after_suspend();
+
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp) {
+        disp->inv_p = 0;
+        lv_disp_enable_invalidation(disp, true);
+    }
+    epd_sync.state = EPD_STATE_IDLE;
+
+    epd_resume_refresh();
+    printf("[EPD] ownership released (lvgl resumed)\n");
+}
+
+/* 排空刷新队列，不挂起 lvgl(供从 lvgl 上下文进入 HIBERNATION 的路径用)。
+ * 与 take_ownership 同样的 pause + 等 drain + 清 pending，但去掉 suspend。 */
+void epd_wait_refresh_drain(void)
+{
+    epd_pause_refresh();
+
+    uint32_t waited = 0;
+    while ((epd_refresh_requested || epd_refresh_in_progress) && waited < 5000) {
+        OS_MSleep(5);
+        waited += 5;
+    }
+    if (waited >= 5000) {
+        printf("[EPD] wait_refresh_drain: refresh still in progress after 5s, proceeding\n");
+    }
+
+    /* 清掉残留 pending。调用者即将关停外设并进 HIBERNATION，lvgl 不会
+     * 再并发跑 flush_cb，因此不必挂起 lvgl 线程(调用者本身就在 lvgl 上下文)。 */
+    epd_sync.refresh_pending = 0;
+    epd_refresh_requested = 0;
+
+    lv_disp_t *disp = lv_disp_get_default();
+    if (disp) {
+        disp->inv_p = 0;
+    }
+
+    printf("[EPD] refresh drained (lvgl NOT suspended, caller is lvgl ctx)\n");
+}

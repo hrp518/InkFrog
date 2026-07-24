@@ -16,6 +16,8 @@
 #include "epd.h"
 #include "fs/fatfs/ff.h"
 #include "common/framework/fs_ctrl.h"
+#include "settings_storage.h"
+#include "font_warm.h"
 #include "kernel/os/os.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -339,7 +341,7 @@ static int handle_screensaver_upload_raw(int sock, const char *initial_data, int
         ret = recv(sock, buf + received, EPD_BUFFER_SIZE - received, 0);
         if (ret <= 0) {
             HTTP_LOG("screensaver upload recv interrupted: %d", ret);
-            _dma_free(buf, 0);
+            _dma_free(buf, DMAHEAP_PSRAM);
             send_response(sock, "400 Bad Request", "text/plain", "Incomplete body", 15);
             return -1;
         }
@@ -347,7 +349,7 @@ static int handle_screensaver_upload_raw(int sock, const char *initial_data, int
     }
 
     ret = screensaver_save_raw_file((const uint8_t *)buf, EPD_BUFFER_SIZE);
-    _dma_free(buf, 0);
+    _dma_free(buf, DMAHEAP_PSRAM);
     if (ret == 0) {
         send_response(sock, "200 OK", "text/plain", "Screensaver saved", 17);
         return 0;
@@ -501,9 +503,51 @@ static int parse_api_upload_params(const char *path, char *out_path, size_t path
 }
 
 /*
- * PUT /api/upload?path=...&name=...  原始二进制上传（主路径）
- */
-static int handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
+	 * PUT /api/upload?path=...&name=...  原始二进制上传（主路径）
+	 */
+
+/* SD 卡写入重试 + SRAM 中转: SDMMC DMA 直接从 PSRAM 读数据时, 若 WiFi DMA
+ * 同时往 PSRAM 写 TCP 包, 总线冲突导致数据位错乱 -> DCE。
+ * 改为: 先 memcpy 到 SRAM 中转缓冲, SDMMC DMA 从 SRAM 读, 彻底避开 PSRAM。
+ * 同时拆 512B 单块写, 每块间留延时给 WiFi DMA 喘息。 */
+static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
+{
+    static __sram_data uint8_t sram_buf[512];   /* SRAM 中转, 避开 PSRAM 总线 */
+    const uint8_t *p = (const uint8_t *)buf;
+    UINT total = 0;
+    UINT bw = 0;
+    FRESULT fr;
+    int try;
+
+    while (total < len) {
+        UINT chunk = len - total;
+        if (chunk > 512) chunk = 512;
+
+        /* 关键: 从 PSRAM 复制到 SRAM, 让 SDMMC DMA 远离 PSRAM 总线 */
+        memcpy(sram_buf, p + total, chunk);
+
+        for (try = 0; try < 3; try++) {
+            FSIZE_t pos = f_tell(fp);
+            bw = 0;
+            fr = f_write(fp, sram_buf, chunk, &bw);
+            if (fr == FR_OK && bw == chunk) break;
+            printf("[HTTP] upload f_write retry %d: fr=%d bw=%u/%u\r\n",
+                   try, (int)fr, (unsigned)bw, (unsigned)chunk);
+            OS_MSleep(50 * (try + 1));
+            f_lseek(fp, pos);
+        }
+        if (fr != FR_OK || bw != chunk) {
+            if (bw_out) *bw_out = total;
+            return (fr == FR_OK) ? FR_DISK_ERR : fr;
+        }
+        total += chunk;
+        OS_MSleep(2);  /* 块间小延时, 给 Wi-Fi DMA 喘息 */
+    }
+    if (bw_out) *bw_out = total;
+    return FR_OK;
+}
+
+	static int handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
                                  const char *upload_path, const char *filename)
 {
     const char *body;
@@ -553,7 +597,7 @@ static int handle_api_upload_raw(int sock, const char *header_buf, int header_re
         if (chunk > content_len) {
             chunk = content_len;
         }
-        fr = f_write(&fp, body, chunk, &bw);
+        fr = upload_fwrite_retry(&fp, body, chunk, &bw);
         if (fr != FR_OK || (int)bw != chunk) {
             f_close(&fp);
             f_unlink(temp_path);
@@ -592,7 +636,7 @@ static int handle_api_upload_raw(int sock, const char *header_buf, int header_re
             f_unlink(temp_path);
             return -1;
         }
-        fr = f_write(&fp, g_upload_io_buf, n, &bw);
+        fr = upload_fwrite_retry(&fp, g_upload_io_buf, n, &bw);
         if (fr != FR_OK || (int)bw != n) {
             printf("[HTTP] upload f_write fail %d bw=%u\r\n", fr, (unsigned)bw);
             f_close(&fp);
@@ -629,6 +673,21 @@ static int handle_api_upload_raw(int sock, const char *header_buf, int header_re
     }
 
     printf("[HTTP] upload OK %s (%d B)\r\n", final_path, received);
+
+    /* 上传 .ttf 字体到 0:/Font/ 后, 自动设为 reader 默认字体。
+     * 统一"上传位置"和"读取位置": 之前上传字体后 settings.ini 还记着旧路径,
+     * reader 用旧字体而 l1glyf 是给新字体的, 导致 L1 miss 渲染极慢。
+     * 注意: 不在 HTTP 线程里调 font_warm_request —— 预热要读 14MB TTF,
+     * 和 HTTP 并发会卡死。预热会在下次开机时由 boot warm 自动做。 */
+    {
+        const char *ext = strrchr(filename, '.');
+        if (ext && strcasecmp(ext, ".ttf") == 0 &&
+            (strstr(final_path, "0:/Font/") != NULL || strstr(final_path, "/Font/") != NULL)) {
+            printf("[HTTP] font uploaded, updating settings: %s (warm on next boot)\r\n", final_path);
+            settings_set_string("font", "path", final_path);
+        }
+    }
+
     send_response(sock, "200 OK", "text/plain", "Upload OK", 9);
     return 0;
 }
@@ -1135,7 +1194,7 @@ static int send_file_content(int sock, const char *filepath)
     res = f_stat(filepath, &fno);
     if (res != FR_OK) {
         HTTP_LOG("f_stat failed for %s: %d", filepath, res);
-        _dma_free(file_buf, 0);
+        _dma_free(file_buf, DMAHEAP_PSRAM);
         send_response(sock, "404 Not Found", "text/plain", "File not found", 13);
         return -1;
     }
@@ -1146,7 +1205,7 @@ static int send_file_content(int sock, const char *filepath)
     res = f_open(&fp, filepath, FA_READ);
     if (res != FR_OK) {
         HTTP_LOG("f_open failed: %d", res);
-        _dma_free(file_buf, 0);
+        _dma_free(file_buf, DMAHEAP_PSRAM);
         send_response(sock, "500 Internal Server Error", "text/plain", "Cannot open file", 15);
         return -1;
     }
@@ -1166,7 +1225,7 @@ static int send_file_content(int sock, const char *filepath)
     
     if (send(sock, header, header_len, 0) < 0) {
         f_close(&fp);
-        _dma_free(file_buf, 0);
+        _dma_free(file_buf, DMAHEAP_PSRAM);
         return -1;
     }
     
@@ -1181,15 +1240,16 @@ static int send_file_content(int sock, const char *filepath)
         if (sent < 0) {
             HTTP_LOG("send failed, total sent: %d", total_sent);
             f_close(&fp);
-            _dma_free(file_buf, 0);
+            _dma_free(file_buf, DMAHEAP_PSRAM);
             return -1;
         }
         
         total_sent += sent;
+        OS_ThreadYield();  /* 与上传对称，避免长时间霸占 SD/CPU 导致 UI 假死 */
     }
     
     f_close(&fp);
-    _dma_free(file_buf, 0);
+    _dma_free(file_buf, DMAHEAP_PSRAM);
     HTTP_LOG("File sent successfully: %d bytes", total_sent);
     return 0;
 }

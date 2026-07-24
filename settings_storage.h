@@ -43,9 +43,10 @@ extern "C" {
  * @param filepath EPUB文件完整路径 (如 "/政治的人生_XR872DL.epub")
  * @param chapter 章节索引 (从0开始)
  * @param offset 章节内偏移量 (解码后文本的byte offset)
+ * @param pct 全书阅读百分比 (0-100，阅读器渲染时按章节+章内进度估算)
  * @return 0=成功, -1=失败
  */
-int settings_save_bookmark(const char *filepath, int chapter, int offset);
+int settings_save_bookmark(const char *filepath, int chapter, int offset, int pct);
 
 /**
  * @brief 加载EPUB阅读位置
@@ -55,6 +56,13 @@ int settings_save_bookmark(const char *filepath, int chapter, int offset);
  * @return 0=找到书签, -1=无书签或文件不存在
  */
 int settings_load_bookmark(const char *filepath, int *chapter_out, int *offset_out);
+
+/**
+ * @brief 加载全书阅读百分比 (书架显示进度用)
+ * @param filepath EPUB文件完整路径
+ * @return 0-100 百分比；找不到书签或无 pct 字段返回 0
+ */
+int settings_load_bookmark_pct(const char *filepath);
 
 /**
  * @brief 通用: 保存字符串键值

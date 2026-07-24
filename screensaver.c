@@ -25,6 +25,7 @@
 #include "driver/chip/sdmmc/hal_sdhost.h"
 #include "chsc6540.h"
 #include "pm/pm.h"
+#include "charge_mode.h"
 
 extern OS_Thread_t lvgl_thread;
 extern void main_ui_create(void);
@@ -154,10 +155,13 @@ static int screensaver_enter(int force)
      *   ARCH_VER==2 映射: WKIO2=PA6。传字面 2 对应 PA6。
      *   wakeup_io_en 会累加掩码: en=0x4。
      *
-     * PA21 (充电检测) 不再作为唤醒源 -- 充电时 PA21 持续为低电平,
-     * 作为下降沿唤醒源会干扰休眠,且会引发"充上电就开机→自动休眠→
-     * 又开机"的循环。充电唤醒逻辑改由软件层处理。 */
-    HAL_Wakeup_SetIO(2, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);   /* PA6  按键   */
+     * PA21(WKIO7) 下降沿唤醒(插入充电器):
+     *   休眠时 PA21 被上拉为高, 插入充电器拉低 → 下降沿 → 进入充电模式。
+     *   和 PA6 一样用下降沿, 不会循环: 只有高→低才触发, 休眠时正好是高。
+     *   充电模式里会用相反的上升沿(低→高=拔出), 两个状态边沿方向不同不会互串。 */
+    HAL_Wakeup_SetIO(2, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);   /* PA6  按键      */
+    HAL_Wakeup_SetIO(7, WKUPIO_WK_MODE_FALLING_EDGE, GPIO_PULL_UP);   /* PA21 插入充电器 */
+    /* SDK 在 pm_enter_mode→__suspend_enter 内部调 HAL_Wakeup_SetSrc, 这里不用调 */
 
     /* fix-power-saving: 【不手动关 EXT LDO!】
      * 根据 XR872_User_Manual §3.1: EXT LDO 给 VDDIO/GPADC/CODEC 供电,
@@ -254,6 +258,11 @@ void screensaver_task(void)
 
     inactive_ms = lv_disp_get_inactive_time(disp);
     if (inactive_ms >= SCREENSAVER_IDLE_TIMEOUT_MS) {
+        /* 空闲超时: 插着电 → 充电模式(省电), 未充电 → 普通屏保休眠 */
+        if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21) == 0) {
+            printf("[SS] idle timeout + charging -> charge mode\r\n");
+            charge_mode_enter();    /* 不返回 */
+        }
         screensaver_enter(0);
     }
 }

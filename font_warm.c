@@ -7,6 +7,7 @@
 #include "lvgl/lvgl.h"
 #include "lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h"
 #include "fs/fatfs/ff.h"
+#include "loading.h"
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -288,7 +289,11 @@ static void font_warm_timer_cb(lv_timer_t * timer)
         s_cached_path[0] = '\0';
     }
 
+    /* 在 LVGL 线程内同步执行 (LVGL 非线程安全, 后台线程会内存冲突崩溃)。
+     * 预热期间 LVGL 暂停刷新(无 EPD refresh), UI 短暂冻结 ~1s 可接受。 */
+    loading_show("Preparing fonts...");   /* 给用户反馈, 避免误以为卡死 */
     font_warm_run_locked(path);
+    loading_hide();
     s_warm_busy = 0;
 }
 
