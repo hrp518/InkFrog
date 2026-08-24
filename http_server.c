@@ -18,6 +18,7 @@
 #include "common/framework/fs_ctrl.h"
 #include "settings_storage.h"
 #include "font_warm.h"
+#include "sd_recovery.h"
 #include "kernel/os/os.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -35,13 +36,21 @@
 /* 常量定义 - 优化内存使用 */
 #define HTTP_BUF_SIZE 2048
 #define HTTP_MAX_PATH 256
-#define HTTP_RESPONSE_SIZE (16 * 1024)  /* PSRAM HTML 缓冲；文件列表过长时截断 */
-#define HTTP_THREAD_STACK_SIZE 4096     /* 开机预创建线程栈（SRAM），font warm 后无法再 alloc */
+#define HTTP_RESPONSE_SIZE (64 * 1024)  /* PSRAM HTML 缓冲；文件列表整页缓冲 (原来 16K 会把多文件截断) */
+/* 线程栈必须 >= ~10KB: http_server_thread 基栈帧含内联的上传处理 + 长文件名
+ * URL 解析缓冲 (path[1024]) ~2.9KB, handle_api_upload_raw(noinline) 自有帧
+ * ~2.7KB, 上传完成后 settings_set_string() ~1.2KB + FatFs f_open(_USE_LFN=3,
+ * 512B LFN 缓冲 + DIR/FIL 全在栈上) ~1KB, 叠加峰值 ~8KB.
+ * 4096 会在上传完成写 settings 时栈溢出 -> HardFault -> CPSID F 全机静默死机.
+ * 开机预创建（font warm 前）时 SRAM 尚有 ~19KB 富余, 10KB 可容纳. */
+#define HTTP_THREAD_STACK_SIZE 10240
 #define HTTP_UPLOAD_IO_SIZE   (32 * 1024)
 #define HTTP_UPLOAD_CHUNK     4096
 #define HTTP_WORKSPACE_SIZE   (HTTP_BUF_SIZE + HTTP_RESPONSE_SIZE)
-/* 浏览连接用小缓冲省 SRAM；上传单独调大 */
-#define HTTP_SOCK_RCVBUF      1024
+/* 浏览连接用小缓冲省 SRAM；上传单独调大。
+ * RCVBUF 需 ≥ 请求头总长: 长文件名 URL ~830B + 各 header ~200B,
+ * 一次 recv 必须收全 header, 否则长文件名请求被误判 Missing header。 */
+#define HTTP_SOCK_RCVBUF      2048
 #define HTTP_SOCK_SNDBUF      2048
 #define HTTP_UPLOAD_SOCK_RCVBUF 8192
 #define HTTP_UPLOAD_SOCK_SNDBUF 4096
@@ -50,9 +59,17 @@
 #define HTTP_STOP_WAIT_MS       50
 #define HTTP_STOP_WAIT_MAX      40      /* 50ms * 40 = 2s */
 #define HTTP_MIN_SRAM_FREE    2048
+/* 请求行路径缓冲: 必须能容纳最长 URL。文件名最长 255 字符 (FatFs LFN),
+ * UTF-8 下中文每字 3 字节、URL 编码再 ×3 → 仅 name 最长 ~765 字符,
+ * 加上 /api/upload?path=...&name= 前缀与 HTTP 方法/版本行 ~830 字符。
+ * 之前用 256 会截断, parse_request 在截断处找不到结尾空格 → 整个请求
+ * 被 400 拒绝 + RST, 长文件名上传在浏览器端报网络错误 (日志无任何痕迹)。 */
+#define HTTP_URL_PATH_SIZE    1024
 
 /* 上传 I/O 缓冲：静态 PSRAM，避免每次上传 _dma_malloc */
 static uint8_t g_upload_io_buf[HTTP_UPLOAD_IO_SIZE] __attribute__((section(".psram_bss")));
+/* API/屏保上传共用 SRAM recv 缓冲: 4KB. SDMMC DMA 从 SRAM 读避开 PSRAM 总线, 杜绝 DCE. */
+static uint8_t g_api_recv_buf[HTTP_UPLOAD_CHUNK];
 /* HTTP 工作区：静态 PSRAM，start/stop 不再 _dma_malloc */
 static char g_http_workspace[HTTP_WORKSPACE_SIZE] __attribute__((section(".psram_bss")));
 
@@ -103,8 +120,7 @@ static int send_response(int sock, const char *status, const char *content_type,
 static int send_html_response(int sock, const char *html_body);
 static int parse_api_upload_params(const char *path, char *out_path, size_t path_sz,
                                    char *out_name, size_t name_sz);
-static int parse_request_line_path(const char *req, char *path_out, size_t path_sz);
-static int handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
+static int __attribute__((noinline)) handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
                                  const char *upload_path, const char *filename);
 
 static void http_tune_client_socket(int sock)
@@ -298,14 +314,116 @@ static int generate_screensaver_html(char *html_buf, int buf_size)
     return len;
 }
 
-static int handle_screensaver_upload_raw(int sock, const char *initial_data, int initial_len)
+/* 上传数据块写入 + SD 数据错误自动恢复重试。
+ *
+ * f_write/f_sync 返回 FR_DISK_ERR 时, SDMMC 多半已因 DCE 卡死
+ * (日志 cmd 25 DCE → 随后 cmd 16 RTO 重复), 直接重试必然失败。
+ * 正确做法:
+ *   1. 每块写入成功后立即 f_sync —— 目录项/FAT 落盘, 文件大小与
+ *      start 位置保持一致。这是 DCE 后能从断点续写的前提: 恢复重挂后
+ *      磁盘上文件大小 == start, 重开 + f_lseek(start) + 重写本块即可,
+ *      不会产生空洞/覆盖错位。
+ *   2. 失败时: 关文件 → 完整 SD 重建 (sd_recovery 在 LVGL 任务内
+ *      卸载/重装) → 重开临时文件到 start → 重写本块 + 同步。
+ * 最多恢复 2 轮; 仍失败返回 -1, 由上层清理并回 500。 */
+static int upload_chunk_write(FIL *fp, const char *temp_path, const void *buf, UINT len)
 {
-    char *body;
-    char *buf = NULL;
+    FSIZE_t start = f_tell(fp);
+    UINT bw = 0;
+    FRESULT fr = f_write(fp, buf, len, &bw);
+
+    if (fr == FR_OK && bw == len) {
+        fr = f_sync(fp);
+        if (fr == FR_OK) {
+            return 0;
+        }
+        printf("[HTTP] f_sync fail %d after %u B, SD recovery\r\n",
+               (int)fr, (unsigned)len);
+    } else {
+        printf("[HTTP] upload f_write fail fr=%d bw=%u/%u, SD recovery\r\n",
+               (int)fr, (unsigned)bw, (unsigned)len);
+    }
+
+    for (int round = 0; round < 2; round++) {
+        f_close(fp);
+
+        if (sd_recovery_request_wait() != 0) {
+            printf("[HTTP] SD recovery timeout, giving up\r\n");
+            return -1;
+        }
+
+        fr = f_open(fp, temp_path, FA_OPEN_ALWAYS | FA_WRITE);
+        /* 首块失败时 (start==0) 目录项可能还没落盘, 直接重建文件 */
+        if (fr != FR_OK && start == 0) {
+            fr = f_open(fp, temp_path, FA_CREATE_ALWAYS | FA_WRITE);
+        }
+        if (fr != FR_OK) {
+            printf("[HTTP] reopen %s fail %d after recovery\r\n", temp_path, (int)fr);
+            return -1;
+        }
+        fr = f_lseek(fp, start);
+        if (fr != FR_OK) {
+            printf("[HTTP] seek to %u fail %d after recovery\r\n",
+                   (unsigned)start, (int)fr);
+            f_close(fp);
+            return -1;
+        }
+        bw = 0;
+        fr = f_write(fp, buf, len, &bw);
+        if (fr == FR_OK && bw == len) {
+            fr = f_sync(fp);
+            if (fr == FR_OK) {
+                printf("[HTTP] chunk OK after SD recovery\r\n");
+                return 0;
+            }
+        }
+        printf("[HTTP] f_write still fail round %d: fr=%d bw=%u\r\n",
+               round + 1, (int)fr, (unsigned)bw);
+    }
+    return -1;
+}
+
+/* 上传收尾 (最后 sync + 重命名) 带 SD 恢复重试。
+ * 数据已由 upload_chunk_write 逐块同步落盘, 这里最后的 f_sync 是兜底
+ * (清尾部部分扇区); f_rename 是目录操作, 也可能撞上 DCE 卡死, 恢复后重试。 */
+static int upload_finalize(FIL *fp, const char *temp_path, const char *final_path)
+{
+    FRESULT fr;
+
+    fr = f_sync(fp);
+    if (fr != FR_OK) {
+        printf("[HTTP] final f_sync fail %d, SD recovery\r\n", (int)fr);
+        f_close(fp);
+        if (sd_recovery_request_wait() != 0) {
+            return -1;
+        }
+    } else {
+        f_close(fp);
+    }
+
+    for (int round = 0; round < 3; round++) {
+        f_unlink(final_path);
+        fr = f_rename(temp_path, final_path);
+        if (fr == FR_OK) {
+            return 0;
+        }
+        printf("[HTTP] rename fail %d, SD recovery (round %d)\r\n", (int)fr, round);
+        if (sd_recovery_request_wait() != 0) {
+            return -1;
+        }
+    }
+    return -1;
+}
+
+static int __attribute__((noinline)) handle_screensaver_upload_raw(int sock, const char *initial_data, int initial_len)
+{
+    const char *body;
+    FIL fp;
+    FRESULT fr;
     int body_len;
     int content_len;
     int received;
-    int ret;
+    int n;
 
     body = strstr(initial_data, "\r\n\r\n");
     if (!body) {
@@ -314,7 +432,7 @@ static int handle_screensaver_upload_raw(int sock, const char *initial_data, int
     }
 
     body += 4;
-    body_len = initial_len - (body - initial_data);
+    body_len = initial_len - (int)(body - initial_data);
     content_len = parse_content_length(initial_data);
     if (content_len != EPD_BUFFER_SIZE) {
         HTTP_LOG("screensaver upload invalid length: %d", content_len);
@@ -322,41 +440,105 @@ static int handle_screensaver_upload_raw(int sock, const char *initial_data, int
         return -1;
     }
 
-    buf = (char *)_dma_malloc(EPD_BUFFER_SIZE, DMAHEAP_PSRAM);
-    if (!buf) {
-        send_response(sock, "500 Internal Server Error", "text/plain", "No memory", 9);
+    /* 与文件上传一致：调大 TCP 窗口+超时，SRAM 分块 recv，超时重试。
+     * 旧实现沿用浏览 socket 的 1024B 接收窗口 + 2s 超时，且 recv 直接进 PSRAM、
+     * 任何超时/中断都当“Incomplete body”直接失败；慢速 WiFi 下 12KB body
+     * 稍一停顿就被误判，而文件上传有重试所以正常。这里顺带让 SD 写入从 SRAM 读，
+     * 避开 SDMMC DMA 读 PSRAM 的 DCE 风险。 */
+    http_tune_upload_socket(sock);
+
+    fs_ctrl_mount(FS_MNT_DEV_TYPE_SDCARD, 0);
+    f_mkdir(SCREENSAVER_DIR);
+    fr = f_open(&fp, SCREENSAVER_FILE_PATH, FA_CREATE_ALWAYS | FA_WRITE);
+    if (fr != FR_OK) {
+        printf("[HTTP] screensaver f_open fail %d\r\n", fr);
+        send_response(sock, "500 Internal Server Error", "text/plain", "Open failed", 11);
         return -1;
     }
 
     received = 0;
     if (body_len > 0) {
-        if (body_len > EPD_BUFFER_SIZE) {
-            body_len = EPD_BUFFER_SIZE;
+        int chunk = body_len;
+        if (chunk > EPD_BUFFER_SIZE) {
+            chunk = EPD_BUFFER_SIZE;
         }
-        memcpy(buf, body, body_len);
-        received = body_len;
+        if (chunk > HTTP_UPLOAD_CHUNK) {
+            chunk = HTTP_UPLOAD_CHUNK;
+        }
+        memcpy(g_api_recv_buf, body, chunk);
+        if (upload_chunk_write(&fp, SCREENSAVER_FILE_PATH, g_api_recv_buf, chunk) != 0) {
+            f_close(&fp);
+            send_response(sock, "500 Internal Server Error", "text/plain", "Write failed", 12);
+            return -1;
+        }
+        received += chunk;
     }
 
-    while (received < EPD_BUFFER_SIZE) {
-        ret = recv(sock, buf + received, EPD_BUFFER_SIZE - received, 0);
-        if (ret <= 0) {
-            HTTP_LOG("screensaver upload recv interrupted: %d", ret);
-            _dma_free(buf, DMAHEAP_PSRAM);
+    while (received < EPD_BUFFER_SIZE && g_http_running) {
+        int want = EPD_BUFFER_SIZE - received;
+        if (want > HTTP_UPLOAD_CHUNK) {
+            want = HTTP_UPLOAD_CHUNK;
+        }
+        n = recv(sock, g_api_recv_buf, want, 0);
+        if (n < 0) {
+            if (!g_http_running) {
+                printf("[HTTP] screensaver upload aborted (stop) at %d/%d\r\n",
+                       received, EPD_BUFFER_SIZE);
+                f_close(&fp);
+                return -1;
+            }
+            if (http_upload_recv_would_retry()) {
+                OS_ThreadYield();
+                continue;
+            }
+            printf("[HTTP] screensaver upload recv %d errno=%d at %d/%d\r\n",
+                   n, errno, received, EPD_BUFFER_SIZE);
+            f_close(&fp);
             send_response(sock, "400 Bad Request", "text/plain", "Incomplete body", 15);
             return -1;
         }
-        received += ret;
+        if (n == 0) {
+            printf("[HTTP] screensaver upload peer closed at %d/%d\r\n",
+                   received, EPD_BUFFER_SIZE);
+            f_close(&fp);
+            send_response(sock, "400 Bad Request", "text/plain", "Incomplete body", 15);
+            return -1;
+        }
+        if (upload_chunk_write(&fp, SCREENSAVER_FILE_PATH, g_api_recv_buf, n) != 0) {
+            printf("[HTTP] screensaver upload f_write fail (final) at %d/%d\r\n",
+                   received, EPD_BUFFER_SIZE);
+            f_close(&fp);
+            send_response(sock, "500 Internal Server Error", "text/plain", "Write failed", 12);
+            return -1;
+        }
+        received += n;
+        OS_ThreadYield();
     }
 
-    ret = screensaver_save_raw_file((const uint8_t *)buf, EPD_BUFFER_SIZE);
-    _dma_free(buf, DMAHEAP_PSRAM);
-    if (ret == 0) {
-        send_response(sock, "200 OK", "text/plain", "Screensaver saved", 17);
-        return 0;
+    if (!g_http_running || received != EPD_BUFFER_SIZE) {
+        f_close(&fp);
+        send_response(sock, "400 Bad Request", "text/plain", "Incomplete body", 15);
+        return -1;
     }
 
-    send_response(sock, "500 Internal Server Error", "text/plain", "Save failed", 11);
-    return -1;
+    if (f_sync(&fp) != FR_OK) {
+        printf("[HTTP] screensaver final f_sync fail %d, SD recovery\r\n", (int)fr);
+        f_close(&fp);
+        if (sd_recovery_request_wait() == 0) {
+            /* 数据已由逐块 f_sync 落盘, 恢复后文件完整, 视为成功 */
+            printf("[HTTP] screensaver saved after SD recovery\r\n");
+            send_response(sock, "200 OK", "text/plain", "Screensaver saved", 17);
+            return 0;
+        }
+        send_response(sock, "500 Internal Server Error", "text/plain", "Sync failed", 11);
+        return -1;
+    }
+    f_close(&fp);
+
+    printf("[HTTP] screensaver saved %u bytes to %s\r\n",
+           (unsigned int)EPD_BUFFER_SIZE, SCREENSAVER_FILE_PATH);
+    send_response(sock, "200 OK", "text/plain", "Screensaver saved", 17);
+    return 0;
 }
 
 static int http_build_paths(const char *upload_path, const char *filename,
@@ -436,34 +618,12 @@ static void http_ensure_dir(const char *dir)
     }
 }
 
-static int parse_request_line_path(const char *req, char *path_out, size_t path_sz)
-{
-    const char *p = req;
-    int i;
-
-    while (*p && *p != ' ') {
-        p++;
-    }
-    if (*p != ' ') {
-        return -1;
-    }
-    while (*p == ' ') {
-        p++;
-    }
-    i = 0;
-    while (*p && *p != ' ' && *p != '\r' && *p != '\n' && i < (int)path_sz - 1) {
-        path_out[i++] = *p++;
-    }
-    path_out[i] = '\0';
-    return (i > 0) ? 0 : -1;
-}
-
 static int parse_api_upload_params(const char *path, char *out_path, size_t path_sz,
                                    char *out_name, size_t name_sz)
 {
     const char *q = strchr(path, '?');
-    const char *p;
-    char tmp[HTTP_MAX_PATH];
+    const char *p, *end;
+    size_t len;
 
     if (!q || !out_path || !out_name) {
         return -1;
@@ -471,26 +631,31 @@ static int parse_api_upload_params(const char *path, char *out_path, size_t path
     out_path[0] = '\0';
     out_name[0] = '\0';
 
+    /* 注意: parse_request 已对整条 URL 做过 url_decode, 查询值也是解码后的。
+     * 文件名里可能含字面 '&' (如 "xxx&yyy.epub"), 所以不能用 strcspn("&") 切,
+     * 而是按参数标记 "&name="/"&path=" 切 —— 文件名里几乎不可能出现该子串。
+     * 解码后 name 最长 ~255 字符 (FatFs LFN), 直接拷贝到调用方缓冲。 */
     p = strstr(q, "path=");
     if (p) {
-        int i = 0;
         p += 5;
-        while (*p && *p != '&' && i < (int)sizeof(tmp) - 1) {
-            tmp[i++] = *p++;
-        }
-        tmp[i] = '\0';
-        url_decode(out_path, tmp);
+        end = strstr(p, "&name=");
+        if (end == NULL) end = strstr(p, "&path=");
+        if (end == NULL) end = p + strlen(p);
+        len = (size_t)(end - p);
+        if (len >= path_sz) len = path_sz - 1;
+        memcpy(out_path, p, len);
+        out_path[len] = '\0';
     }
-
     p = strstr(q, "name=");
     if (p) {
-        int i = 0;
         p += 5;
-        while (*p && *p != '&' && i < (int)sizeof(tmp) - 1) {
-            tmp[i++] = *p++;
-        }
-        tmp[i] = '\0';
-        url_decode(out_name, tmp);
+        end = strstr(p, "&name=");
+        if (end == NULL) end = strstr(p, "&path=");
+        if (end == NULL) end = p + strlen(p);
+        len = (size_t)(end - p);
+        if (len >= name_sz) len = name_sz - 1;
+        memcpy(out_name, p, len);
+        out_name[len] = '\0';
     }
 
     if (!out_path[0] || !out_name[0]) {
@@ -506,48 +671,7 @@ static int parse_api_upload_params(const char *path, char *out_path, size_t path
 	 * PUT /api/upload?path=...&name=...  原始二进制上传（主路径）
 	 */
 
-/* SD 卡写入重试 + SRAM 中转: SDMMC DMA 直接从 PSRAM 读数据时, 若 WiFi DMA
- * 同时往 PSRAM 写 TCP 包, 总线冲突导致数据位错乱 -> DCE。
- * 改为: 先 memcpy 到 SRAM 中转缓冲, SDMMC DMA 从 SRAM 读, 彻底避开 PSRAM。
- * 同时拆 512B 单块写, 每块间留延时给 WiFi DMA 喘息。 */
-static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
-{
-    static __sram_data uint8_t sram_buf[512];   /* SRAM 中转, 避开 PSRAM 总线 */
-    const uint8_t *p = (const uint8_t *)buf;
-    UINT total = 0;
-    UINT bw = 0;
-    FRESULT fr;
-    int try;
-
-    while (total < len) {
-        UINT chunk = len - total;
-        if (chunk > 512) chunk = 512;
-
-        /* 关键: 从 PSRAM 复制到 SRAM, 让 SDMMC DMA 远离 PSRAM 总线 */
-        memcpy(sram_buf, p + total, chunk);
-
-        for (try = 0; try < 3; try++) {
-            FSIZE_t pos = f_tell(fp);
-            bw = 0;
-            fr = f_write(fp, sram_buf, chunk, &bw);
-            if (fr == FR_OK && bw == chunk) break;
-            printf("[HTTP] upload f_write retry %d: fr=%d bw=%u/%u\r\n",
-                   try, (int)fr, (unsigned)bw, (unsigned)chunk);
-            OS_MSleep(50 * (try + 1));
-            f_lseek(fp, pos);
-        }
-        if (fr != FR_OK || bw != chunk) {
-            if (bw_out) *bw_out = total;
-            return (fr == FR_OK) ? FR_DISK_ERR : fr;
-        }
-        total += chunk;
-        OS_MSleep(2);  /* 块间小延时, 给 Wi-Fi DMA 喘息 */
-    }
-    if (bw_out) *bw_out = total;
-    return FR_OK;
-}
-
-	static int handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
+static int __attribute__((noinline)) handle_api_upload_raw(int sock, const char *header_buf, int header_recv_len,
                                  const char *upload_path, const char *filename)
 {
     const char *body;
@@ -559,7 +683,6 @@ static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
     int body_len;
     int received;
     int n;
-    UINT bw;
 
     body = strstr(header_buf, "\r\n\r\n");
     if (!body) {
@@ -597,8 +720,13 @@ static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
         if (chunk > content_len) {
             chunk = content_len;
         }
-        fr = upload_fwrite_retry(&fp, body, chunk, &bw);
-        if (fr != FR_OK || (int)bw != chunk) {
+        if (chunk > HTTP_UPLOAD_CHUNK) {
+            chunk = HTTP_UPLOAD_CHUNK;
+        }
+        /* header 里的 body 在 PSRAM 工作区, SDMMC DMA 直读 PSRAM 有 DCE 风险,
+         * 先转存 SRAM 缓冲再写。 */
+        memcpy(g_api_recv_buf, body, chunk);
+        if (upload_chunk_write(&fp, temp_path, g_api_recv_buf, chunk) != 0) {
             f_close(&fp);
             f_unlink(temp_path);
             send_response(sock, "500 Internal Server Error", "text/plain", "Write failed", 12);
@@ -612,7 +740,7 @@ static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
         if (want > HTTP_UPLOAD_CHUNK) {
             want = HTTP_UPLOAD_CHUNK;
         }
-        n = recv(sock, g_upload_io_buf, want, 0);
+        n = recv(sock, g_api_recv_buf, want, 0);
         if (n < 0) {
             if (!g_http_running) {
                 printf("[HTTP] upload aborted (stop) at %d/%d\r\n", received, content_len);
@@ -636,9 +764,9 @@ static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
             f_unlink(temp_path);
             return -1;
         }
-        fr = upload_fwrite_retry(&fp, g_upload_io_buf, n, &bw);
-        if (fr != FR_OK || (int)bw != n) {
-            printf("[HTTP] upload f_write fail %d bw=%u\r\n", fr, (unsigned)bw);
+        if (upload_chunk_write(&fp, temp_path, g_api_recv_buf, n) != 0) {
+            printf("[HTTP] upload f_write fail (final) at %d/%d\r\n",
+                   received, content_len);
             f_close(&fp);
             f_unlink(temp_path);
             send_response(sock, "500 Internal Server Error", "text/plain", "Write failed", 12);
@@ -655,20 +783,9 @@ static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
         return -1;
     }
 
-    if (f_sync(&fp) != FR_OK) {
-        f_close(&fp);
+    if (upload_finalize(&fp, temp_path, final_path) != 0) {
         f_unlink(temp_path);
-        send_response(sock, "500 Internal Server Error", "text/plain", "Sync failed", 11);
-        return -1;
-    }
-    f_close(&fp);
-
-    f_unlink(final_path);
-    fr = f_rename(temp_path, final_path);
-    if (fr != FR_OK) {
-        printf("[HTTP] upload rename fail %d\r\n", fr);
-        f_unlink(temp_path);
-        send_response(sock, "500 Internal Server Error", "text/plain", "Rename failed", 13);
+        send_response(sock, "500 Internal Server Error", "text/plain", "Finalize failed", 15);
         return -1;
     }
 
@@ -684,7 +801,11 @@ static int upload_fwrite_retry(FIL *fp, const void *buf, UINT len, UINT *bw_out)
         if (ext && strcasecmp(ext, ".ttf") == 0 &&
             (strstr(final_path, "0:/Font/") != NULL || strstr(final_path, "/Font/") != NULL)) {
             printf("[HTTP] font uploaded, updating settings: %s (warm on next boot)\r\n", final_path);
-            settings_set_string("font", "path", final_path);
+            if (settings_set_string("font", "path", final_path) == 0) {
+                printf("[HTTP] settings saved OK: font/path=%s\r\n", final_path);
+            } else {
+                printf("[HTTP] WARN: settings save failed\r\n");
+            }
         }
     }
 
@@ -810,6 +931,10 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         ".upload-item-status.uploading { color: #17a2b8; }\n"
         ".upload-item-status.completed { color: #28a745; }\n"
         ".upload-item-status.error { color: #dc3545; }\n"
+        ".upload-item-status.cancelled { color: #6c757d; }\n"
+        ".cancel-btn { margin-left: 8px; padding: 3px 10px; border: none; border-radius: 3px; background: #dc3545; color: white; cursor: pointer; font-size: 0.8em; }\n"
+        ".cancel-btn:hover { background: #c82333; }\n"
+        ".cancel-btn:disabled { background: #ccc; cursor: default; }\n"
         ".progress-bar-bg { width: 100%%; height: 20px; background: #e9ecef; border-radius: 4px; overflow: hidden; }\n"
         ".progress-bar-fill { height: 100%%; background: linear-gradient(90deg, #4CAF50, #45a049); transition: width 0.3s ease; width: 0%%; }\n"
         ".progress-text { text-align: center; font-size: 0.75em; color: #666; margin-top: 2px; }\n"
@@ -845,6 +970,15 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         len += snprintf(html_buf + len, buf_size - len,
             "<a class=\"btn-back\" href=\"/?path=%s\">⬅️ 返回上级目录</a>\n", parent_path);
     }
+
+    /* 快捷目录按钮: 传书 → /Inkbook, 传字体 → /Font */
+    len += snprintf(html_buf + len, buf_size - len,
+        "<div style=\"margin-top:8px;\">\n"
+        "  <a href=\"/?path=/Inkbook\" style=\"display:inline-block;padding:8px 14px;"
+        "background:#8B4513;color:#fff;text-decoration:none;border-radius:6px;margin-right:8px;\">📚 传书</a>\n"
+        "  <a href=\"/?path=/Font\" style=\"display:inline-block;padding:8px 14px;"
+        "background:#2563eb;color:#fff;text-decoration:none;border-radius:6px;\">🔤 传字体</a>\n"
+        "</div>\n");
     
     /* ================= 开始替换部分 ================= */
     
@@ -867,10 +1001,17 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "var selectedFiles = [];\n"
         "var currentUploadIndex = 0;\n"
         "var isUploading = false;\n"
+        "var activeXhr = null;\n"
+        "var cancelled = {};\n"
         "function updateFileList() {\n"
+        "    if (isUploading) return;\n"
         "    var input = document.getElementById('fileInput');\n"
         "    var display = document.getElementById('fileListDisplay');\n"
-        "    selectedFiles = Array.from(input.files);\n"
+        "    var picked = Array.from(input.files);\n"
+        "    if (picked.length > 0) {\n"
+        "        selectedFiles = picked;\n"
+        "        input.value = '';\n"
+        "    }\n"
         "    display.innerHTML = '';\n"
         "    selectedFiles.forEach(function(file, index) {\n"
         "        var chip = document.createElement('span');\n"
@@ -885,6 +1026,7 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    }\n"
         "}\n"
         "function removeFile(index) {\n"
+        "    if (isUploading) return;\n"
         "    selectedFiles.splice(index, 1);\n"
         "    updateFileList();\n"
         "}\n"
@@ -927,10 +1069,36 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    xhr.upload.addEventListener('progress',function(e){\n"
         "        if(e.lengthComputable)setItemProgress(itemId,e.loaded,e.total);},false);\n"
         "    xhr.addEventListener('load',function(){\n"
+        "        if(activeXhr===xhr)activeXhr=null;\n"
+        "        disableCancelBtn(itemId,'Done');\n"
         "        if(xhr.status===200){setItemStatus(itemId,'completed','OK');setItemProgress(itemId,1,1);}\n"
         "        else setItemStatus(itemId,'error','Failed');done();},false);\n"
-        "    xhr.addEventListener('error',function(){setItemStatus(itemId,'error','Error');done();},false);\n"
+        "    xhr.addEventListener('error',function(){\n"
+        "        if(activeXhr===xhr)activeXhr=null;\n"
+        "        disableCancelBtn(itemId,'Failed');\n"
+        "        setItemStatus(itemId,'error','Error');done();},false);\n"
+        "    xhr.addEventListener('abort',function(){\n"
+        "        if(activeXhr===xhr)activeXhr=null;\n"
+        "        disableCancelBtn(itemId,'Cancelled');\n"
+        "        setItemStatus(itemId,'cancelled','Cancelled');done();},false);\n"
+        "    activeXhr=xhr;\n"
         "    xhr.send(file);}\n"
+        "function disableCancelBtn(itemId,txt){\n"
+        "    var cb=document.getElementById(itemId+'-cancel');\n"
+        "    if(cb){cb.disabled=true;cb.innerText=txt;}}\n"
+        "function cancelItem(index){\n"
+        "    if (!isUploading || index < currentUploadIndex) return;\n"
+        "    if (cancelled[index]) return;\n"
+        "    cancelled[index] = true;\n"
+        "    var itemId='upload-item-'+index;\n"
+        "    if (index === currentUploadIndex) {\n"
+        "        if (activeXhr) { setItemStatus(itemId,'cancelled','Cancelling...'); activeXhr.abort(); return; }\n"
+        "        if (window.L1GlyfBuilder && L1GlyfBuilder.abortActive) { setItemStatus(itemId,'cancelled','Cancelling...'); L1GlyfBuilder.abortActive(); return; }\n"
+        "        return;\n"
+        "    }\n"
+        "    setItemStatus(itemId,'cancelled','Cancelled');\n"
+        "    disableCancelBtn(itemId,'Cancelled');\n"
+        "}\n"
         "function startUpload() {\n"
         "    if (selectedFiles.length === 0) {\n"
         "        alert('\\u8BF7\\u5148\\u9009\\u62E9\\u6587\\u4EF6\\uFF01');\n"
@@ -947,6 +1115,10 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "}\n"
         "function uploadNextFile() {\n"
         "    if (currentUploadIndex >= selectedFiles.length) {\n"
+        "        selectedFiles = selectedFiles.filter(function(_,i){return !cancelled[i];});\n"
+        "        cancelled = {};\n"
+        "        currentUploadIndex = 0;\n"
+        "        activeXhr = null;\n"
         "        var progressDiv = document.getElementById('uploadProgress');\n"
         "        progressDiv.innerHTML += '<div style=\"color:#28a745;font-weight:bold;margin-top:10px;\">\\u2713 All files uploaded!</div>';\n"
         "        isUploading = false;\n"
@@ -964,6 +1136,7 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "        '<div class=\"upload-item-header\">' +\n"
         "            '<span class=\"upload-item-name\">' + file.name + '</span>' +\n"
         "            '<span class=\"upload-item-status uploading\">Pending...</span>' +\n"
+        "            '<button type=\"button\" class=\"cancel-btn\" id=\"' + itemId + '-cancel\" onclick=\"cancelItem(' + currentUploadIndex + ')\">Cancel</button>' +\n"
         "        '</div>' +\n"
         "        '<div class=\"progress-bar-bg\">' +\n"
         "            '<div class=\"progress-bar-fill\" id=\"' + itemId + '-bar\">0' + String.fromCharCode(37) + '</div>' +\n"
@@ -973,15 +1146,22 @@ static int generate_file_list_html(char *html_buf, int buf_size, const char *dir
         "    if (currentUploadIndex === 0) progressDiv.innerHTML = '<h4>Progress</h4>' + itemHtml;\n"
         "    else progressDiv.innerHTML += itemHtml;\n"
         "    var advance = function(){currentUploadIndex++;setTimeout(uploadNextFile,0);};\n"
+        "    if (cancelled[currentUploadIndex]) {\n"
+        "        setItemStatus(itemId,'cancelled','Cancelled');\n"
+        "        disableCancelBtn(itemId,'Cancelled');\n"
+        "        advance();\n"
+        "        return;\n"
+        "    }\n"
         "    if (isFontDir(currentPath) && isTtfFile(file.name) && window.L1GlyfBuilder) {\n"
         "        setItemStatus(itemId,'uploading','Build L1...');\n"
         "        L1GlyfBuilder.uploadTtfWithCache(file,currentPath,{\n"
+        "            isCancelled:function(){return cancelled[currentUploadIndex]||false;},\n"
         "            onBuilt:function(st){var t=document.getElementById(itemId+'-text');\n"
         "                if(t)t.textContent='cache '+st.cached+' glyphs, '+formatSize(st.totalBytes);},\n"
         "            onPhase:function(ph,nm){setItemStatus(itemId,'uploading',ph==='l1glyf'?'Up '+nm:'Up '+nm);},\n"
         "            onProgress:function(l,t){setItemProgress(itemId,l,t);}\n"
         "        }).then(function(){setItemStatus(itemId,'completed','OK+cache');advance();})\n"
-        "          .catch(function(e){setItemStatus(itemId,'error',String(e));advance();});\n"
+        "          .catch(function(e){setItemStatus(itemId,cancelled[currentUploadIndex]?'cancelled':'error',cancelled[currentUploadIndex]?'Cancelled':String(e));advance();});\n"
         "        return;\n"
         "    }\n"
         "    setItemStatus(itemId,'uploading','Uploading...');\n"
@@ -1103,7 +1283,16 @@ static int send_response(int sock, const char *status, const char *content_type,
     
     send(sock, header, header_len, 0);
     if (body && body_len > 0) {
-        send(sock, body, body_len, 0);
+        /* lwIP 的 send 可能只发一部分, 必须循环直到发完或出错,
+         * 否则大 body (文件列表整页) 会被静默截断。 */
+        int sent = 0;
+        while (sent < body_len) {
+            int n = send(sock, body + sent, body_len - sent, 0);
+            if (n <= 0) {
+                break;
+            }
+            sent += n;
+        }
     }
     
     return 0;
@@ -1285,7 +1474,7 @@ static char *find_binary_boundary(char *buf, int buf_len, const char *boundary, 
  * PSRAM优化：当启用PSRAM时，使用PSRAM作为接收缓冲区，
  * 避免大文件上传时消耗宝贵的内部SRAM堆内存
  */
-static int handle_file_upload_streaming(int sock, const char *boundary,
+static int __attribute__((noinline)) handle_file_upload_streaming(int sock, const char *boundary,
                                         const char *initial_data, int initial_len,
                                         char *filename, const char *upload_path)
 {
@@ -1505,16 +1694,16 @@ static int parse_request(const char *req, char *method, char *path, char *versio
 
     /* 1. 安全提取 Method */
     i = 0;
-    while (*p && *p != ' ' && i < 31) {
+    while (*p && *p != ' ' && i < 63) {
         method[i++] = *p++;
     }
     method[i] = '\0';
     if (*p != ' ') return -1;
     while (*p == ' ') p++; /* 跳过空格 */
 
-    /* 2. 安全提取 Path */
+    /* 2. 安全提取 Path (必须容纳完整 URL; 截断会导致找不到结尾空格而误拒) */
     i = 0;
-    while (*p && *p != ' ' && i < 255) {
+    while (*p && *p != ' ' && i < HTTP_URL_PATH_SIZE - 1) {
         path[i++] = *p++;
     }
     path[i] = '\0';
@@ -1523,7 +1712,7 @@ static int parse_request(const char *req, char *method, char *path, char *versio
 
     /* 3. 安全提取 Version (遇到 \r, \n 或空格停止) */
     i = 0;
-    while (*p && *p != ' ' && *p != '\r' && *p != '\n' && i < 15) {
+    while (*p && *p != ' ' && *p != '\r' && *p != '\n' && i < 31) {
         version[i++] = *p++;
     }
     version[i] = '\0';
@@ -1614,8 +1803,8 @@ static int http_server_alloc_buffers(void)
      int client_sock;
      struct sockaddr_in server_addr, client_addr;
      socklen_t addr_len = sizeof(client_addr);
-     int recv_len;
-     char method[32], path[256], version[16];
+    int recv_len;
+    char method[64], path[HTTP_URL_PATH_SIZE], version[32];
 
      (void)arg;
      HTTP_LOG("Worker thread ready (idle until start)");
@@ -1733,9 +1922,9 @@ static int http_server_alloc_buffers(void)
                                strncmp(path, "/api/upload", 11) == 0) {
                         char up_path[HTTP_MAX_PATH];
                         char up_name[128];
-                        char raw_path[256];
-                        if (parse_request_line_path(g_http_buffer, raw_path, sizeof(raw_path)) != 0 ||
-                            parse_api_upload_params(raw_path, up_path, sizeof(up_path),
+                        /* parse_request 已对整条 URL url_decode, 这里直接解析
+                         * 解码后的查询串 (path/name 值), 无需再取原始请求行 */
+                        if (parse_api_upload_params(path, up_path, sizeof(up_path),
                                                     up_name, sizeof(up_name)) != 0) {
                             send_response(client_sock, "400 Bad Request", "text/plain",
                                           "Bad upload query", 16);
@@ -1838,6 +2027,7 @@ static int http_server_alloc_buffers(void)
                 }
             } else {
                 /* 解析失败 */
+                printf("[HTTP] bad request: parse fail (len=%d)\r\n", recv_len);
                 send_response(client_sock, "400 Bad Request", "text/plain",
                            "Bad Request", 12);
             }

@@ -3,6 +3,7 @@
  ../../../../project/common/prj_conf_opt.h \
  ../../../../project/demo/FontExp/prj_config.h \
  ../../../../project/demo/FontExp/font_warm.h \
+ ../../../../project/demo/FontExp/boot_screen.h \
  ../../../../project/demo/FontExp/font_priority_loader.h \
  ../../../../project/demo/FontExp/lvgl/lvgl.h \
  ../../../../project/demo/FontExp/lvgl/src/misc/lv_log.h \
@@ -211,13 +212,16 @@
  ../../../../include/kernel/os/os_queue.h \
  ../../../../include/kernel/os/os_semaphore.h \
  ../../../../include/kernel/os/os_mutex.h \
- ../../../../include/kernel/os/os_timer.h
+ ../../../../include/kernel/os/os_timer.h \
+ ../../../../project/demo/FontExp/loading.h
 
 ../../../../project/common/prj_conf_opt.h:
 
 ../../../../project/demo/FontExp/prj_config.h:
 
 ../../../../project/demo/FontExp/font_warm.h:
+
+../../../../project/demo/FontExp/boot_screen.h:
 
 ../../../../project/demo/FontExp/font_priority_loader.h:
 
@@ -642,3 +646,5 @@
 ../../../../include/kernel/os/os_mutex.h:
 
 ../../../../include/kernel/os/os_timer.h:
+
+../../../../project/demo/FontExp/loading.h:

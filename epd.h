@@ -116,6 +116,8 @@ const uint8_t *EPD_GetLargeGlyph(char c);
 
 /* Draw text string centered on screen */
 void EPD_DrawStringCentered(const char *text);
+/* 在指定 y 处水平居中绘制字符串, 支持放大 (scale) 与字距 (advance) */
+void EPD_DrawStringScaled(const char *text, uint16_t y, uint8_t scale, uint16_t advance);
 
 /* Animation Demos */
 void EPD_Demo_DrawingAnimation(void);

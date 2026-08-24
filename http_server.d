@@ -26,6 +26,9 @@
  ../../../../include/types.h \
  ../../../../project/common/framework/sys_ctrl/observer.h \
  ../../../../project/common/framework/sys_ctrl/looper.h \
+ ../../../../project/demo/FontExp/settings_storage.h \
+ ../../../../project/demo/FontExp/font_warm.h \
+ ../../../../project/demo/FontExp/sd_recovery.h \
  ../../../../include/net/lwip-1.4.1/lwip/sockets.h \
  ../../../../include/net/lwip-1.4.1/lwip/opt.h \
  ../../../../include/net/lwip-1.4.1/lwipopts.h \
@@ -100,6 +103,12 @@
 ../../../../project/common/framework/sys_ctrl/observer.h:
 
 ../../../../project/common/framework/sys_ctrl/looper.h:
+
+../../../../project/demo/FontExp/settings_storage.h:
+
+../../../../project/demo/FontExp/font_warm.h:
+
+../../../../project/demo/FontExp/sd_recovery.h:
 
 ../../../../include/net/lwip-1.4.1/lwip/sockets.h:
 

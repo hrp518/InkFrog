@@ -56,9 +56,11 @@ static uint8_t back_btn_pressed = 0;  // 返回按键按下标志
 static void (*back_btn_callback)(void) = NULL;  // 返回按键回调函数
 
 // 滑动检测相关
+static int32_t swipe_press_x = 0;    // 触摸按下的X坐标
 static int32_t swipe_press_y = 0;    // 触摸按下的Y坐标
-static int32_t swipe_delta_y = 0;     // 触摸释放时的滑动距离
-static void (*swipe_callback)(int32_t delta_y) = NULL;  // 滑动回调函数
+static int32_t swipe_delta_x = 0;     // 触摸释放时的横向滑动距离 (press_x - release_x, 左滑>0)
+static int32_t swipe_delta_y = 0;     // 触摸释放时的纵向滑动距离
+static void (*swipe_callback)(int32_t delta_x, int32_t delta_y) = NULL;  // 滑动回调函数
 static uint8_t swipe_recorded = 0;    // 是否已记录起始位置
 
 // 滑动区域边界（由UI层设置）
@@ -116,7 +118,7 @@ uint8_t touch_check_back_btn(void) {
  * 导出函数：注册滑动回调（delta_y: 负数=上滑, 正数=下滑）
  *===================*/
 
-void touch_register_swipe_callback(void (*callback)(int32_t delta_y)) {
+void touch_register_swipe_callback(void (*callback)(int32_t delta_x, int32_t delta_y)) {
     swipe_callback = callback;
 }
 
@@ -213,11 +215,12 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
                 return;
             }
             
-            // 滑动检测：只在第一次按下时记录起始Y
+            // 滑动检测：只在第一次按下时记录起始X/Y
             if (!swipe_recorded) {
+                swipe_press_x = (int32_t)x;
                 swipe_press_y = (int32_t)y;
                 swipe_recorded = 1;
-                printf("[TOUCH] Touch pressed at (%d,%d), swipe start Y=%d\n", x, y, swipe_press_y);
+                printf("[TOUCH] Touch pressed at (%d,%d), swipe start X=%d Y=%d\n", x, y, swipe_press_x, swipe_press_y);
             }
             
             // 【EPD协同】通知EPD触摸按下（会阻断刷新直到释放）
@@ -233,18 +236,21 @@ static void touch_read_cb(lv_indev_drv_t *drv, lv_indev_data_t *data)
             // 滑动检测：计算滑动距离并通知回调（仅在触摸区域内）
             if (swipe_area_enabled && swipe_area_y2 > 0) {
                 if (swipe_press_y >= swipe_area_y1 && swipe_press_y <= swipe_area_y2) {
+                    swipe_delta_x = swipe_press_x - (int32_t)last_x;
                     swipe_delta_y = swipe_press_y - (int32_t)last_y;
                 } else {
+                    swipe_delta_x = 0;
                     swipe_delta_y = 0;
                 }
             } else {
+                swipe_delta_x = swipe_press_x - (int32_t)last_x;
                 swipe_delta_y = swipe_press_y - (int32_t)last_y;
             }
-            printf("[TOUCH] Touch released, press_y=%d, release_y=%d, swipe_delta=%d\n",
-                   swipe_press_y, last_y, swipe_delta_y);
-            if (swipe_callback != NULL && swipe_delta_y != 0) {
-                printf("[TOUCH] Calling swipe callback with delta=%d\n", swipe_delta_y);
-                swipe_callback(swipe_delta_y);
+            printf("[TOUCH] Touch released, press=(%d,%d) release=(%d,%d), swipe_dx=%d swipe_dy=%d\n",
+                   swipe_press_x, swipe_press_y, last_x, last_y, swipe_delta_x, swipe_delta_y);
+            if (swipe_callback != NULL && (swipe_delta_x != 0 || swipe_delta_y != 0)) {
+                printf("[TOUCH] Calling swipe callback dx=%d dy=%d\n", swipe_delta_x, swipe_delta_y);
+                swipe_callback(swipe_delta_x, swipe_delta_y);
             }
             swipe_recorded = 0;  // 重置滑动记录
             

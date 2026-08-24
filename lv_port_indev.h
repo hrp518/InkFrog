@@ -45,9 +45,9 @@ uint8_t touch_check_back_btn(void);
 
 /**
  * 注册滑动回调函数
- * @param callback 回调函数，delta_y > 0 表示上滑，delta_y < 0 表示下滑
+ * @param callback 回调函数，delta_x>0 左滑、delta_y>0 上滑（均为按下-释放）
  */
-void touch_register_swipe_callback(void (*callback)(int32_t delta_y));
+void touch_register_swipe_callback(void (*callback)(int32_t delta_x, int32_t delta_y));
 
 /**
  * 获取并清除累积的滑动距离

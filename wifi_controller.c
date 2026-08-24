@@ -16,6 +16,7 @@
 #include "kernel/os/os.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "common/framework/net_ctrl.h"  /* net_sys_onoff(0) 完整关闭 Sys3 */
 
 #define WC_DBG 1
 #if WC_DBG
@@ -299,8 +300,10 @@ static void wc_task(void *arg)
 
         switch (g_wifi.phase) {
         case WLAN_PHASE_NO_CONFIG:
-            WC_TRACE_LOG("[TRACE] branch=NO_CONFIG, sleeping 1s");
-            wc_sleep_interruptible(1000);
+            /* 无配置时低频轮询(30s)即可——用户保存WiFi后会通过
+             * wifi_controller_request_retry() 中断本sleep并立即加载新INI。
+             * 1s轮询纯粹浪费SD IO, 每秒读settings.ini毫无意义。 */
+            wc_sleep_interruptible(30000);
             wc_load_config_from_ini();
             if (!g_wifi.enabled) {
                 wc_set_phase(WLAN_PHASE_DISCONNECTED);
@@ -493,6 +496,25 @@ void wifi_controller_poweroff(void)
     }
     WC_LOG("Sys3 %s (waited %dms)",
            HAL_PRCM_IsSys3Alive() ? "STILL ALIVE" : "powered off", wait_ms);
+
+    /* 【2026-08 修复】Sys3 若仍存活,【不要】调 net_sys_onoff(0) 完整拆除!
+     *
+     * 实测: net_sys_onoff(0) (net_close→wlan_stop→wlan_detach) 会把 WLAN
+     * 驱动及其 PM 注册结构拆到半释放状态, 紧接着 pm_enter_mode(HIBERNATION)
+     * 的 dpm_suspend_noirq 走设备挂起链时踩到已破坏的 PM 列表项 → 跳到垃圾
+     * 地址 (flash 数据区) → hard fault UNDEFINSTR, 整机卡死。
+     * 两个崩溃日志的共同点都是本函数打印了 "Sys3 STILL ALIVE" 后调用了
+     * net_sys_onoff(0)。
+     *
+     * 历史: 旧代码想用 net_sys_onoff(0) 强制关 Sys3 省电, 但:
+     *   - 作者注释已记录 "SDK 在 pm_enter_mode 内部 net_sys_onoff(0) 会崩
+     *     (UNDEFINSTR)";
+     *   - 手动提前调用同样破坏 WLAN PM 状态, 只是崩溃延迟到 pm_enter_mode。
+     * Sys3 未掉电只多耗一点休眠电流, 远好于休眠必崩。若确实需要省电,
+     * 应修 SDK 的 wlan_detach/PM 注销, 而不是在这里调用它。 */
+    if (HAL_PRCM_IsSys3Alive()) {
+        WC_LOG("Sys3 still alive after wlan_sta_disable, continuing (no net_sys_onoff)");
+    }
 }
 
 void wifi_controller_register_cb(WLAN_PhaseCb_t cb, void *user_data)

@@ -47,6 +47,17 @@ static uint8_t g_tx_data[CHSC6540_CMD_LEN];
 /* Initialization flag */
 static uint8_t g_initialized = 0;
 
+/*
+ * 触摸仿射校准状态 (display = raw * num / den + off)
+ * 默认恒等映射 (1000/1000/0), 未校准时透传原始坐标。
+ */
+static int32_t s_cal_sx_num = 1000, s_cal_sx_den = 1000, s_cal_sx_off = 0;
+static int32_t s_cal_sy_num = 1000, s_cal_sy_den = 1000, s_cal_sy_off = 0;
+
+/* 最近一次成功读取的原始坐标 (校准前), 供校准 UI 采样用 */
+static uint16_t s_last_raw_x = 0;
+static uint16_t s_last_raw_y = 0;
+
 /**
  * @brief Initialize GPIO for CHSC6540 (RST and INT)
  */
@@ -214,17 +225,54 @@ int CHSC6540_ReadTouchData(uint16_t *x, uint16_t *y)
     /* Parse first touch point (at data[2..6]) */
     /* X axis: directly use data[2] */
     *x = g_rx_data[2];
-    
+
     /* Y axis: data[5] high 4 bits as high byte, data[3] as low byte */
     *y = ((uint16_t)(g_rx_data[5] & 0xF0) << 4) | (uint16_t)g_rx_data[3];
-    
-    /* Clamp to screen bounds */
-    if (*x > CHSC6540_MAX_X) *x = CHSC6540_MAX_X;
-    if (*y > CHSC6540_MAX_Y) *y = CHSC6540_MAX_Y;
-    
+
+    /* 保存原始坐标 (校准前), 供触摸校准 UI 采样 */
+    s_last_raw_x = *x;
+    s_last_raw_y = *y;
+
+    /* 应用仿射校准: display = raw * num / den + off */
+    int32_t dx = ((int32_t)*x * s_cal_sx_num) / s_cal_sx_den + s_cal_sx_off;
+    int32_t dy = ((int32_t)*y * s_cal_sy_num) / s_cal_sy_den + s_cal_sy_off;
+
+    /* Clamp to screen bounds (display 坐标 0..MAX-1) */
+    if (dx < 0) dx = 0;
+    if (dx > CHSC6540_MAX_X - 1) dx = CHSC6540_MAX_X - 1;
+    if (dy < 0) dy = 0;
+    if (dy > CHSC6540_MAX_Y - 1) dy = CHSC6540_MAX_Y - 1;
+    *x = (uint16_t)dx;
+    *y = (uint16_t)dy;
+
     printf("[CHSC6540] Touch: X=%d, Y=%d, num=%d\n", *x, *y, num_touches);
-    
+
     return num_touches;
+}
+
+/* ==================== 触摸校准接口 ==================== */
+
+void CHSC6540_SetCalibration(int32_t sx_num, int32_t sx_den, int32_t sx_off,
+                             int32_t sy_num, int32_t sy_den, int32_t sy_off)
+{
+    if (sx_den <= 0) sx_den = 1;
+    if (sy_den <= 0) sy_den = 1;
+    s_cal_sx_num = sx_num; s_cal_sx_den = sx_den; s_cal_sx_off = sx_off;
+    s_cal_sy_num = sy_num; s_cal_sy_den = sy_den; s_cal_sy_off = sy_off;
+    printf("[CHSC6540] Calibration set: x=(%d/%d)+%d y=(%d/%d)+%d\n",
+           (int)sx_num, (int)sx_den, (int)sx_off,
+           (int)sy_num, (int)sy_den, (int)sy_off);
+}
+
+void CHSC6540_ResetCalibration(void)
+{
+    CHSC6540_SetCalibration(1000, 1000, 0, 1000, 1000, 0);
+}
+
+void CHSC6540_GetLastRaw(uint16_t *x, uint16_t *y)
+{
+    if (x) *x = s_last_raw_x;
+    if (y) *y = s_last_raw_y;
 }
 
 /**

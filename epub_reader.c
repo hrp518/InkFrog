@@ -355,16 +355,30 @@ static bool extract_file_at_raw_offset(mz_zip_archive *zip, int raw_idx, void *b
     } else {
         EPUB_ERR("extract_at_raw: unsupported compression method %u\n", (unsigned)comp_method);
     }
+    EPUB_LOG("extract_diag[%d]: inflate done ok=%d out=%u stage=%p dst=%p\n",
+             raw_idx, ok, (unsigned)*out_size, work_buf, buf);
 
     if(ok && stage_buf) {
+        EPUB_LOG("extract_diag[%d]: memcpy dst %u bytes...\n", raw_idx, (unsigned)*out_size);
         memcpy(buf, work_buf, *out_size);
+        EPUB_LOG("extract_diag[%d]: memcpy done, sync psram...\n", raw_idx);
         epub_sync_psram_write(buf, *out_size);
+        EPUB_LOG("extract_diag[%d]: sync done\n", raw_idx);
     } else if(ok && epub_ptr_in_psram(buf, *out_size) && !epub_ptr_in_bump(buf)) {
+        EPUB_LOG("extract_diag[%d]: no-stage sync psram...\n", raw_idx);
         epub_sync_psram_write(buf, *out_size);
+        EPUB_LOG("extract_diag[%d]: no-stage sync done\n", raw_idx);
     }
 
+    EPUB_LOG("extract_diag[%d]: dma_free comp=%p ...\n", raw_idx, comp_buf);
     epub_dma_free(comp_buf);
-    if(stage_is_dma) epub_dma_free(stage_buf);
+    EPUB_LOG("extract_diag[%d]: dma_free comp done (stage_is_dma=%d)\n", raw_idx, stage_is_dma);
+    if(stage_is_dma) {
+        EPUB_LOG("extract_diag[%d]: dma_free stage...\n", raw_idx);
+        epub_dma_free(stage_buf);
+        EPUB_LOG("extract_diag[%d]: dma_free stage done\n", raw_idx);
+    }
+    EPUB_LOG("extract_diag[%d]: extract returning ok=%d\n", raw_idx, ok);
     return ok;
 }
 
@@ -703,8 +717,84 @@ static bool parse_opf_with_expat(const char *data, int size, EpubReader *reader)
 
     xhtml_parser_set_callbacks(parser, opf_start_cb, opf_end_cb, opf_char_cb, &ctx);
     bool ok = xhtml_parser_parse(parser, data, size);
+    if (!ok) {
+        /* 记录失败原因, 供打开失败时的 UI 提示与回退判断 */
+        snprintf(reader->last_error, sizeof(reader->last_error),
+                 "OPF解析失败: %s", xhtml_parser_get_error(parser));
+    }
     xhtml_parser_destroy(parser);
     return ok;
+}
+
+/* 文件名是否 XHTML 章节 (.xhtml/.html/.htm, 不区分大小写) */
+static bool raw_name_is_xhtml(const char *nm)
+{
+    size_t l = strlen(nm);
+    if (l >= 6 && strcasecmp(nm + l - 6, ".xhtml") == 0) return true;
+    if (l >= 5 && strcasecmp(nm + l - 5, ".html")  == 0) return true;
+    if (l >= 4 && strcasecmp(nm + l - 4, ".htm")   == 0) return true;
+    return false;
+}
+
+/* 失败回退: OPF 无法解析时, 用 raw-scan 枚举 base_path 下所有 .xhtml/.html
+ * 章节文件, 按文件名排序作为阅读顺序, 保证书籍仍能打开阅读。
+ * 成功返回 true 并填好 reader->spine。 */
+static bool opf_fallback_build_spine(EpubReader *reader)
+{
+    raw_scan_build_index(&reader->zip_archive);
+    if (s_raw_count <= 0) return false;
+
+    const char *base = reader->book.base_path;
+    size_t base_len = base[0] ? strlen(base) : 0;
+    int n = 0;
+    for (int i = 0; i < s_raw_count; i++) {
+        const char *nm = s_raw_entries[i].name;
+        if (!raw_name_is_xhtml(nm)) continue;
+        if (base_len && strncasecmp(nm, base, base_len) != 0) continue;
+        n++;
+    }
+    if (n == 0) return false;
+
+    const char **names = (const char **)psram_malloc(sizeof(char *) * (size_t)n);
+    if (!names) return false;
+    int idx = 0;
+    for (int i = 0; i < s_raw_count; i++) {
+        const char *nm = s_raw_entries[i].name;
+        if (!raw_name_is_xhtml(nm)) continue;
+        if (base_len && strncasecmp(nm, base, base_len) != 0) continue;
+        names[idx++] = nm;
+    }
+    /* 按文件名排序(插入排序, n<=256 足够) */
+    for (int i = 1; i < n; i++) {
+        const char *tmp = names[i];
+        int j = i - 1;
+        while (j >= 0 && strcasecmp(names[j], tmp) > 0) { names[j + 1] = names[j]; j--; }
+        names[j + 1] = tmp;
+    }
+
+    if (n > EPUB_MAX_SPINE_COUNT) n = EPUB_MAX_SPINE_COUNT;
+    reader->spine_count = n;
+    for (int i = 0; i < n; i++) {
+        strncpy(reader->spine[i].href, names[i], sizeof(reader->spine[i].href) - 1);
+        reader->spine[i].href[sizeof(reader->spine[i].href) - 1] = '\0';
+        snprintf(reader->spine[i].id, sizeof(reader->spine[i].id), "ch%d", i);
+        EPUB_LOG("  fb_spine[%d]=%s\n", i, names[i]);
+    }
+    psram_free(names);
+
+    /* 书名回退: 用 zip 文件名(去路径/扩展名) */
+    if (reader->book.title[0] == '\0') {
+        const char *fp = reader->book.file_path;
+        const char *slash = strrchr(fp, '/');
+        const char *bn = slash ? slash + 1 : fp;
+        size_t l = strlen(bn);
+        if (l > 5 && strcasecmp(bn + l - 5, ".epub") == 0) l -= 5;
+        if (l >= sizeof(reader->book.title)) l = sizeof(reader->book.title) - 1;
+        memcpy(reader->book.title, bn, l);
+        reader->book.title[l] = '\0';
+        EPUB_LOG("Fallback title: '%s'\n", reader->book.title);
+    }
+    return true;
 }
 
 EpubReader* epub_reader_create(void) {
@@ -815,10 +905,18 @@ bool epub_reader_open(EpubReader *reader, const char *filepath) {
     }
 
     if (!parse_opf_with_expat(opf_data, opf_size, reader)) {
-        EPUB_ERR("Failed to parse OPF\n");
-        mz_zip_reader_end(&reader->zip_archive);
-        f_close(&reader->archive_fp);
-        return false;
+        /* 原因已写入 last_error; 先尝试 raw-scan 回退, 保证书籍仍能打开 */
+        EPUB_ERR("Failed to parse OPF (%s), trying raw-scan fallback\n", reader->last_error);
+        reader->spine_count = 0;
+        if (!opf_fallback_build_spine(reader)) {
+            EPUB_ERR("Raw-scan fallback failed too, aborting\n");
+            mz_zip_reader_end(&reader->zip_archive);
+            f_close(&reader->archive_fp);
+            return false;
+        }
+        reader->fallback_spine = true;
+        EPUB_LOG("Fallback spine: OPF parse failed, using %d raw chapters\n",
+                 reader->spine_count);
     }
 
     if (reader->spine_count == 0) {
@@ -940,6 +1038,11 @@ void epub_reader_destroy(EpubReader *reader) {
 const char* epub_reader_get_title(EpubReader *reader) { return reader ? reader->book.title : ""; }
 int epub_reader_get_chapter_count(EpubReader *reader) { return reader ? reader->spine_count : 0; }
 int epub_reader_get_toc_count(EpubReader *reader) { return reader ? reader->toc_count : 0; }
+const char* epub_reader_get_last_error(EpubReader *reader)
+{
+    return (reader && reader->last_error[0]) ? reader->last_error : "未知错误";
+}
+bool epub_reader_is_fallback_spine(EpubReader *reader) { return reader ? reader->fallback_spine : false; }
 EpubTocEntry* epub_reader_get_toc(EpubReader *reader, int index) {
     if (!reader || index < 0 || index >= reader->toc_count) return NULL;
     return &reader->toc[index];

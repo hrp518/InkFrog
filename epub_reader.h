@@ -74,6 +74,8 @@ typedef struct {
     EpubTocEntry toc[EPUB_MAX_TOC_COUNT];
     int toc_count;
     bool loaded;
+    bool fallback_spine;      /* OPF 解析失败后使用 raw-scan 回退 spine */
+    char last_error[160];     /* 最近一次打开/解析失败的原因(供 UI 提示) */
     
     FIL archive_fp;
     mz_zip_archive zip_archive;
@@ -98,6 +100,9 @@ int epub_reader_read_chapter(EpubReader *reader, int chapter_index, char *buffer
 int epub_reader_jump_to_toc(EpubReader *reader, int toc_index);
 
 int epub_reader_read_chapter_full(EpubReader *reader, int chapter_index, char *out_buf, int buf_size);
+
+const char* epub_reader_get_last_error(EpubReader *reader);
+bool epub_reader_is_fallback_spine(EpubReader *reader);
 
 #ifdef __cplusplus
 }

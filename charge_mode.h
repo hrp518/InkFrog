@@ -36,17 +36,17 @@ bool charge_mode_enabled(void);
 void charge_mode_set_enabled(bool en);
 
 /*
- * 冷启动周期入口 (PA21 上升沿/下降沿或 WKTIMER 唤醒后调用)。
- * 检查 PA21 电平决定：还在充电→刷新电量界面→再睡；已拔出→清标志回普通休眠。
- * 不返回 (最终都进 HIBERNATION)。
- * 前置：platform_init_level0() + EPD_GPIO_Init_Public() 已完成。
+ * 冷启动充电入口(最小初始化版本, 从 main() 早判调用)。
+ * 前置: platform_init_level0 + EPD_GPIO_Init_Public 已完成。
+ * 渲染充电画面 → 进入轮询循环(不休眠, MCU 活跃)。
+ * PA6 按下时 return, 调用方继续正常启动。
  */
-void charge_mode_cycle(void);
+void charge_mode_run_minimal(void);
 
 /*
  * 主动进入充电模式 (由屏保/普通模式在 disp_task 上下文调用)。
- * 内部：设 magic + 渲染首帧"充电中/充满了" + 关外设 + 配唤醒 + HIBERNATION。
- * 不返回。
+ * 关外设 → 渲染充电画面 → 进入轮询循环(不休眠)。
+ * PA6 按下时 return 到调用方。
  */
 void charge_mode_enter(void);
 

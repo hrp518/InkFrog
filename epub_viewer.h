@@ -111,9 +111,11 @@ bool epub_viewer_next_page(EpubViewer *viewer);
  * @brief 跳转到指定章节
  * @param viewer 视图句柄
  * @param chapter_index 章节索引
+ * @param init_offset 章内起始偏移(0x03制marker前的字符偏移)，无锚点时使用
+ * @param anchor 章内锚点id(如 "sigil_toc_id_10"), 可为NULL表示从头
  * @return true 成功，false 失败
  */
-bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset);
+bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset, const char *anchor);
 
 /**
  * @brief 显示目录
@@ -175,6 +177,13 @@ void epub_viewer_set_filepath(EpubViewer *viewer, const char *filepath);
  * @return int 当前read_offset
  */
 int epub_viewer_get_read_offset(EpubViewer *viewer);
+
+/**
+ * @brief 计算全书阅读百分比 (0-100)
+ * @param viewer 视图句柄
+ * @return 全书进度百分比：(当前章 + 章内进度) / 总章数 * 100
+ */
+int epub_viewer_get_overall_pct(EpubViewer *viewer);
 
 /**
  * @brief 设置阅读偏移量（用于恢复书签位置）

@@ -47,4 +47,20 @@ void settings_font_select_open(lv_obj_t *return_screen);
  */
 void settings_wifi_on_phase_change(WLAN_Phase_t phase);
 
+/**
+ * @brief 触摸校准测试界面（调试用）
+ *
+ * 画 3×4 网格按钮覆盖屏幕，点击任意按钮时打印：
+ *   - LVGL 收到的触摸坐标 (data->point)
+ *   - 按钮在屏幕上的实际区域坐标 (lv_obj_get_coords)
+ * 用于验证触摸面板坐标与 LVGL 渲染坐标是否一致（排查"按G出V"错位）。
+ */
+void settings_touch_test_open(void);
+
+/**
+ * @brief 打开“关于”界面（两层：固件信息 → 作者信息）
+ * @param return_screen 返回时加载的屏幕（当前实现返回设置主页）
+ */
+void settings_about_open(lv_obj_t *return_screen);
+
 #endif /* SETTINGS_SCREEN_H */

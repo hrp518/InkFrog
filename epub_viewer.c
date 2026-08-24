@@ -42,7 +42,7 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
 #define CONTENT_HEIGHT (SCREEN_HEIGHT - 18)
 /* 工具栏 */
-#define TOOLBAR_HEIGHT    130
+#define TOOLBAR_HEIGHT    138
 #define TOOLBAR_TRIGGER_Y 130
 
 /* 字体大小挡位配置（5挡） */
@@ -340,6 +340,30 @@ static void filter_unsupported_chars(char *str) {
 
 /* 用于过滤<head>内的<title>等元数据文本 */
 static bool s_decode_in_head = false;
+/* 图片/媒体标签深度计数器: 进入 img/svg/figure 等标签时 +1, 退出时 -1。
+ * 深度>0 时, 包装标签(p/div 等)不发 \n, 字符数据也丢弃, 避免空白行。 */
+static int s_skip_media_depth = 0;
+
+/* 目录锚点跳转: goto_chapter 携带的目标 id 与解析时记录的解码偏移。
+ * 一本“纲(chapter)”含多个锚点小节(如 sigil_toc_id_N)时, 跳目录必须
+ * 定位到对应小节, 否则会落到章首。解析前置目标, 遇匹配 id 记录偏移。 */
+static char s_target_anchor[80];
+static int  s_target_anchor_offset = -1;
+
+/* 判断是否为图片/媒体相关标签(不渲染, 应跳过) */
+static bool is_media_tag(const char *name) {
+    return strcmp(name, "img") == 0 ||
+           strcmp(name, "image") == 0 ||
+           strcmp(name, "svg") == 0 ||
+           strcmp(name, "picture") == 0 ||
+           strcmp(name, "figure") == 0 ||
+           strcmp(name, "video") == 0 ||
+           strcmp(name, "audio") == 0 ||
+           strcmp(name, "canvas") == 0 ||
+           strcmp(name, "iframe") == 0 ||
+           strcmp(name, "object") == 0 ||
+           strcmp(name, "embed") == 0;
+}
 
 static void decode_start_cb(const char *name, const char **atts, void *user_data) {
     EpubViewer *v = (EpubViewer *)user_data;
@@ -350,8 +374,37 @@ static void decode_start_cb(const char *name, const char **atts, void *user_data
         s_decode_in_head = true;
         return;
     }
+    /* <html> 根标签: 每章重新解析时重置静态状态（防止上一章的残留值污染） */
+    if (strcmp(name, "html") == 0) {
+        s_decode_in_head = false;
+        s_skip_media_depth = 0;
+        return;
+    }
+    /* <body> 标签也重置（EPUB 可能没有显式 <html> 根元素） */
+    if (strcmp(name, "body") == 0) {
+        s_skip_media_depth = 0;
+    }
     /* 在<head>内时忽略所有内容 */
     if (s_decode_in_head) return;
+
+    /* 图片/媒体标签: 进入跳过模式, 不发任何标记 */
+    if (is_media_tag(name)) {
+        s_skip_media_depth++;
+        return;
+    }
+    /* 在媒体标签内部时, 忽略所有子标签 */
+    if (s_skip_media_depth > 0) return;
+
+    /* 目录锚点: 若本标签带目标 id, 记录当前解码写入位置(即该小节标题起点)。
+     * atts 是 name/value 交替、以 NULL 结尾的数组。 */
+    if (s_target_anchor[0] && atts) {
+        for (int i = 0; atts[i] != NULL && atts[i + 1] != NULL; i += 2) {
+            if (strcmp(atts[i], "id") == 0 && strcmp(atts[i + 1], s_target_anchor) == 0) {
+                s_target_anchor_offset = v->decoded_text_len;
+                break;
+            }
+        }
+    }
 
     int remaining = DECODED_TEXT_BUF_SIZE - v->decoded_text_len - 10;
     if (remaining < 3) return;
@@ -387,6 +440,14 @@ static void decode_end_cb(const char *name, void *user_data) {
     /* 在<head>内时忽略 */
     if (s_decode_in_head) return;
 
+    /* 退出媒体标签: 减深度, 不发 \n */
+    if (is_media_tag(name)) {
+        if (s_skip_media_depth > 0) s_skip_media_depth--;
+        return;
+    }
+    /* 在媒体标签内部时, 忽略所有结束标签 */
+    if (s_skip_media_depth > 0) return;
+
     int remaining = DECODED_TEXT_BUF_SIZE - v->decoded_text_len - 10;
     if (remaining < 1) return;
 
@@ -405,6 +466,8 @@ static void decode_char_cb(const char *data, int len, void *user_data) {
 
     /* 在<head>内时忽略所有字符数据（如<title>文本） */
     if (s_decode_in_head) return;
+    /* 在媒体标签内部时, 丢弃字符数据 */
+    if (s_skip_media_depth > 0) return;
 
     if (v->decoded_text_len + len >= DECODED_TEXT_BUF_SIZE - 10) {
         len = DECODED_TEXT_BUF_SIZE - 10 - v->decoded_text_len;
@@ -689,16 +752,18 @@ static void update_display(EpubViewer *viewer) {
     }
     #endif
 
-    /* 更新百分比指示器 */
-    float pct = get_read_percentage(viewer);
+    /* 更新百分比指示器：与保存/书架一致，用全书百分比（而非章内百分比），
+     * 避免右上角与书架显示不一致 */
+    float pct = get_read_percentage(viewer);   /* 章内百分比，仅用于下方 RENDER_DBG 诊断 */
+    int overall_pct = epub_viewer_get_overall_pct(viewer);
     char pct_str[16];
-    snprintf(pct_str, sizeof(pct_str), "%.2f%%", pct);
+    snprintf(pct_str, sizeof(pct_str), "%d%%", overall_pct);
     if (viewer->pct_indicator) lv_label_set_text(viewer->pct_indicator, pct_str);
 
-    /* 更新进度条 */
+    /* 更新进度条（全书百分比） */
     if (viewer->progress_bar) {
         int bar_max = SCREEN_WIDTH - 20;
-        int bar_width = (int)((float)bar_max * pct / 100.0f);
+        int bar_width = bar_max * overall_pct / 100;
         if (bar_width < 0) bar_width = 0;
         if (bar_width > bar_max) bar_width = bar_max;
         lv_obj_set_width(viewer->progress_bar, bar_width);
@@ -791,7 +856,8 @@ EpubViewer* epub_viewer_create(EpubReader *reader) {
 static void update_toolbar_info(EpubViewer *viewer) {
     if (!viewer || !viewer->toolbar) return;
 
-    float pct = get_read_percentage(viewer);
+    /* 右上角百分比：与保存/书架一致用全书百分比 */
+    int overall_pct = epub_viewer_get_overall_pct(viewer);
 
     /* 更新标题 */
     if (viewer->toolbar_title && viewer->reader) {
@@ -806,7 +872,7 @@ static void update_toolbar_info(EpubViewer *viewer) {
     /* 更新百分比 */
     if (viewer->toolbar_pct_label) {
         char buf[16];
-        snprintf(buf, sizeof(buf), "%.2f%%", pct);
+        snprintf(buf, sizeof(buf), "%d%%", overall_pct);
         lv_label_set_text(viewer->toolbar_pct_label, buf);
     }
 }
@@ -835,18 +901,18 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_label_set_text(viewer->toolbar_title, "EPUB");
     lv_obj_set_style_text_font(viewer->toolbar_title, ui_font, 0);
     lv_obj_set_style_text_color(viewer->toolbar_title, lv_color_black(), 0);
-    lv_obj_set_pos(viewer->toolbar_title, 4, 4);
-    lv_obj_set_size(viewer->toolbar_title, 130, 16);
+    lv_obj_set_pos(viewer->toolbar_title, 70, 4);
+    lv_obj_set_size(viewer->toolbar_title, 95, 16);
 
     viewer->toolbar_pct_label = lv_label_create(viewer->toolbar);
-    lv_label_set_text(viewer->toolbar_pct_label, "0.00%");
+    lv_label_set_text(viewer->toolbar_pct_label, "0%");
     lv_obj_set_style_text_font(viewer->toolbar_pct_label, ui_font, 0);
     lv_obj_set_style_text_color(viewer->toolbar_pct_label, lv_color_make(0x66, 0x66, 0x66), 0);
-    lv_obj_set_pos(viewer->toolbar_pct_label, 140, 4);
+    lv_obj_set_pos(viewer->toolbar_pct_label, 172, 4);
 
     lv_obj_t *close_btn = lv_btn_create(viewer->toolbar);
-    lv_obj_set_size(close_btn, 22, 22);
-    lv_obj_set_pos(close_btn, 212, 2);
+    lv_obj_set_size(close_btn, 60, 30);
+    lv_obj_set_pos(close_btn, 2, 2);
     lv_obj_set_style_bg_color(close_btn, lv_color_white(), 0);
     lv_obj_set_style_border_width(close_btn, 1, 0);
     lv_obj_set_style_border_color(close_btn, lv_color_make(0x99, 0x99, 0x99), 0);
@@ -859,9 +925,11 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_obj_set_style_text_font(close_lbl, ui_font, 0);
     lv_obj_center(close_lbl);
 
-    /* 第2行：按钮组（返回书架/目录），删除了上一章/下一章按钮 */
-    int btn_w = 112, btn_h = 26, btn_y = 28, gap = 8;
-    int btn_x = 4;
+    /* 第2行：按钮组（返回书架/目录），删除了上一章/下一章按钮
+     * Home/目录高度 = 首页功能磁贴(84px)的一半 = 42px
+     * 宽度收窄并居中, 避免 112pxx2 顶到 240px 屏幕右缘造成截断 */
+    int btn_w = 104, btn_h = 42, btn_y = 28, gap = 8;
+    int btn_x = 8;
 
     /* 返回书架 */
     lv_obj_t *btn_back = lv_btn_create(viewer->toolbar);
@@ -901,12 +969,12 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_label_set_text(goto_label, "Jump");
     lv_obj_set_style_text_font(goto_label, ui_font, 0);
     lv_obj_set_style_text_color(goto_label, lv_color_black(), 0);
-    lv_obj_set_pos(goto_label, 4, 62);
+    lv_obj_set_pos(goto_label, 4, 76);   /* Home/目录加高后下移 */
 
     /* 百分比输入框 */
     viewer->toolbar_goto_ta = lv_textarea_create(viewer->toolbar);
     lv_obj_set_size(viewer->toolbar_goto_ta, 80, 24);
-    lv_obj_set_pos(viewer->toolbar_goto_ta, 40, 60);
+    lv_obj_set_pos(viewer->toolbar_goto_ta, 40, 74);   /* Home/目录加高后下移 */
     lv_textarea_set_text(viewer->toolbar_goto_ta, "0.00");
     lv_textarea_set_accepted_chars(viewer->toolbar_goto_ta, "0123456789.");
     lv_textarea_set_max_length(viewer->toolbar_goto_ta, 6);
@@ -921,18 +989,18 @@ static void create_toolbar(EpubViewer *viewer) {
     lv_label_set_text(pct_sign, "%");
     lv_obj_set_style_text_font(pct_sign, ui_font, 0);
     lv_obj_set_style_text_color(pct_sign, lv_color_black(), 0);
-    lv_obj_set_pos(pct_sign, 124, 64);
+    lv_obj_set_pos(pct_sign, 124, 78);   /* Home/目录加高后下移 */
 
     /* 章节信息（移到右侧） */
     lv_obj_t *chap_label = lv_label_create(viewer->toolbar);
     lv_label_set_text(chap_label, "Ch.1");
     lv_obj_set_style_text_font(chap_label, ui_font, 0);
     lv_obj_set_style_text_color(chap_label, lv_color_make(0x99, 0x99, 0x99), 0);
-    lv_obj_set_pos(chap_label, 150, 64);
+    lv_obj_set_pos(chap_label, 150, 78);   /* Home/目录加高后下移 */
 
     /* 第4行：字体大小调节按钮（5挡） */
     static const char *font_labels[FONT_SIZE_COUNT] = {"S", "s", "M", "L", "XL"};
-    int fs_btn_w = 38, fs_btn_h = 24, fs_btn_y = 92;
+    int fs_btn_w = 38, fs_btn_h = 24, fs_btn_y = 104;   /* 上面两行下移后，字体行随之下移 */
     int fs_total_w = FONT_SIZE_COUNT * fs_btn_w + (FONT_SIZE_COUNT - 1) * 4;
     int fs_start_x = (SCREEN_WIDTH - fs_total_w) / 2;
 
@@ -986,20 +1054,44 @@ static void toggle_toolbar(EpubViewer *viewer) {
 
 /* ========== 跳转键盘界面 ========== */
 
-/* 自定义数字键盘映射：替换FontAwesome符号为ASCII文本（lv_font_misans_16不含FontAwesome图标） */
+/* 自定义数字键盘映射：替换FontAwesome符号为ASCII文本（lv_font_misans_16不含FontAwesome图标）。
+ * 注意: 默认 lv_keyboard_def_event_cb 只认识 LV_SYMBOL_* 符号串 (如 LV_SYMBOL_BACKSPACE
+ * = "\xEF\x95\x9A"), 文本 "Del"/"OK" 和裸 "\x11"/"\x12" 都不认识 —— 会被当文本打进
+ * textarea, 又被 accepted_chars("0123456789.") 过滤, 表现为按了没反应。
+ * 所以键盘用 goto_kb_event_cb 自定义回调 (与 settings_screen.c 的 wifi_kb_event_cb
+ * 同模式), 确认只留底部 Go 按钮, 键盘上不再放 OK。 */
 static const char * const kb_num_map[] = {
     "1", "2", "3", "Del", "\n",
-    "4", "5", "6", "OK", "\n",
-    "7", "8", "9", "\x11", "\n",     /* \x11=LV_KEYBOARD_BACKSPACE */
-    "+/-", "0", ".", "\x12", ""      /* \x12=LV_KEYBOARD_ENTER/OK */
+    "4", "5", "6", ".",   "\n",
+    "7", "8", "9", "0",   ""
 };
 
 static const lv_btnmatrix_ctrl_t kb_num_ctrl[] = {
     1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1,
-    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1,
-    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1,
-    1, 1, 1, LV_KEYBOARD_CTRL_BTN_FLAGS | 1
+    1, 1, 1, 1,
+    1, 1, 1, 1
 };
+
+static void goto_kb_event_cb(lv_event_t *e)
+{
+    lv_obj_t *kb = lv_event_get_target(e);
+    lv_keyboard_t *keyboard = (lv_keyboard_t *)kb;
+    uint16_t btn_id = lv_btnmatrix_get_selected_btn(kb);
+    if (btn_id == LV_BTNMATRIX_BTN_NONE) return;
+    const char *txt = lv_btnmatrix_get_btn_text(kb, btn_id);
+    if (!txt) return;
+
+    if (strcmp(txt, "Del") == 0) {
+        if (keyboard->ta) {
+            lv_textarea_del_char(keyboard->ta);
+        }
+        return;
+    }
+    /* 数字/小数点 → 输入 textarea (accepted_chars 再兜底过滤一次) */
+    if (keyboard->ta) {
+        lv_textarea_add_text(keyboard->ta, txt);
+    }
+}
 
 static void show_goto_keyboard(EpubViewer *viewer) {
     if (!viewer) return;
@@ -1041,7 +1133,11 @@ static void show_goto_keyboard(EpubViewer *viewer) {
     lv_obj_set_size(viewer->goto_kb, 230, 150);
     lv_obj_align(viewer->goto_kb, LV_ALIGN_BOTTOM_MID, 0, -35);
     lv_keyboard_set_map(viewer->goto_kb, LV_KEYBOARD_MODE_NUMBER, kb_num_map, kb_num_ctrl);
+    lv_keyboard_set_mode(viewer->goto_kb, LV_KEYBOARD_MODE_NUMBER); /* 关键: 必须切到数字模式, 否则显示默认完整键盘 */
     lv_keyboard_set_textarea(viewer->goto_kb, viewer->goto_ta);
+    /* 移除默认 def_event_cb (不认识 "Del" 会当文本敲), 换成自定义处理 */
+    lv_obj_remove_event_cb(viewer->goto_kb, lv_keyboard_def_event_cb);
+    lv_obj_add_event_cb(viewer->goto_kb, goto_kb_event_cb, LV_EVENT_VALUE_CHANGED, NULL);
     epd_disable_all_animations_recursive(viewer->goto_kb);
 
     /* 取消按钮 */
@@ -1174,13 +1270,21 @@ void epub_viewer_destroy(EpubViewer *viewer) {
 
 /* ========== 章节加载 ========== */
 
-bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset) {
+bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_offset, const char *anchor) {
 	if (!viewer || !viewer->reader) return false;
     if (chapter_index < 0 || chapter_index >= viewer->reader->spine_count) return false;
 
     viewer->current_chapter = chapter_index;
 
-    VIEW_LOG("Goto chapter %d...\n", chapter_index);
+    /* 目录锚点目标: 解析时记录匹配 id 的解码偏移(未匹配时 offset 保持 -1) */
+    s_target_anchor[0] = '\0';
+    s_target_anchor_offset = -1;
+    if (anchor && anchor[0]) {
+        strncpy(s_target_anchor, anchor, sizeof(s_target_anchor) - 1);
+        s_target_anchor[sizeof(s_target_anchor) - 1] = '\0';
+    }
+
+    VIEW_LOG("Goto chapter %d... anchor=%s\n", chapter_index, s_target_anchor[0] ? s_target_anchor : "(none)");
 
     /* loading: 整章 inflate + 分页 + 首页渲染可能数百 ms ~ 1s+ */
     loading_show("Loading chapter...");
@@ -1235,6 +1339,19 @@ bool epub_viewer_goto_chapter(EpubViewer *viewer, int chapter_index, int init_of
     /* 设置百分比定位参数 */
     viewer->chapter_len = viewer->decoded_text_len;
     viewer->read_offset = (init_offset > 0 && init_offset < viewer->decoded_text_len) ? init_offset : 0;
+    /* 目录锚点优先: 定位到该 id 小节(标题起点) */
+    if (s_target_anchor_offset >= 0 && s_target_anchor_offset < viewer->decoded_text_len) {
+        viewer->read_offset = s_target_anchor_offset;
+        /* 过滤可能使偏移落在某多字节字符中间, 对齐到 UTF-8 边界 */
+        const char *fbuf = viewer->decoded_text_buf;
+        while (viewer->read_offset < viewer->decoded_text_len &&
+               (fbuf[viewer->read_offset] & 0xC0) == 0x80) viewer->read_offset++;
+        VIEW_LOG("Anchor '%s' found at offset %d\n", s_target_anchor, s_target_anchor_offset);
+    } else if (s_target_anchor[0]) {
+        VIEW_ERR("Anchor '%s' not found, staying at chapter start\n", s_target_anchor);
+    }
+    s_target_anchor[0] = '\0';
+    s_target_anchor_offset = -1;
     viewer->page_end_offset = 0;
     viewer->prev_page_start = 0;
     history_clear(viewer);
@@ -1256,7 +1373,7 @@ static void next_page_handler(EpubViewer *viewer) {
     if (viewer->page_end_offset >= viewer->chapter_len) {
         /* 尝试下一章 */
         if (viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
-            epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1, 0);
+            epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1, 0, NULL);
         }
         return;
     }
@@ -1310,7 +1427,7 @@ static void prev_page_handler(EpubViewer *viewer) {
     } else {
         /* 已在章节开头，尝试上一章 */
         if (viewer->reader && viewer->current_chapter > 0) {
-            epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1, 0);
+            epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1, 0, NULL);
             /* 跳到上一章末尾附近 */
             int back = viewer->chapter_len - ESTIMATED_PAGE_BYTES;
             if (back < 0) back = 0;
@@ -1365,15 +1482,12 @@ static void content_area_event_cb(lv_event_t *e) {
         return;
     }
 
-    /* 左1/3 → 上一页 */
+    /* 左1/3 → 上一页；中间 + 右 2/3 → 下一页 */
     if (x < SCREEN_WIDTH / 3) {
         prev_page_handler(viewer);
-    }
-    /* 右1/3 → 下一页 */
-    else if (x > SCREEN_WIDTH * 2 / 3) {
+    } else {
         next_page_handler(viewer);
     }
-    /* 中间1/3 → 无操作 */
 }
 
 /* ========== 工具栏回调 ========== */
@@ -1456,7 +1570,7 @@ static void prev_chapter_cb(lv_event_t *e) {
     if (!viewer) return;
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
     if (viewer->reader && viewer->current_chapter > 0) {
-        epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1, 0);
+        epub_viewer_goto_chapter(viewer, viewer->current_chapter - 1, 0, NULL);
     }
 }
 
@@ -1465,7 +1579,7 @@ static void next_chapter_cb(lv_event_t *e) {
     if (!viewer) return;
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
     if (viewer->reader && viewer->current_chapter < viewer->reader->spine_count - 1) {
-        epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1, 0);
+        epub_viewer_goto_chapter(viewer, viewer->current_chapter + 1, 0, NULL);
     }
 }
 
@@ -1477,6 +1591,40 @@ static void goto_ta_clicked_cb(lv_event_t *e) {
     /* 关闭工具栏并弹出键盘 */
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
     show_goto_keyboard(viewer);
+}
+
+/* 按整本书记录百分比(0~10000, 输入=全书百分比)跳转。
+ * 与右上角显示的 epub_viewer_get_overall_pct 同一基准:
+ * 目标 = 第几章 + 章内偏移 */
+static void goto_book_pct(EpubViewer *viewer, int pct_x100) {
+    if (!viewer || !viewer->reader) return;
+    int sc = viewer->reader->spine_count;
+    if (sc <= 0) return;
+    if (pct_x100 < 0) pct_x100 = 0;
+    if (pct_x100 > 10000) pct_x100 = 10000;
+
+    /* 全书线性位置 0..sc */
+    float target = (float)pct_x100 * (float)sc / 10000.0f;
+    int chapter = (int)target;
+    if (chapter >= sc) chapter = sc - 1;
+    if (chapter < 0) chapter = 0;
+    float intra = target - (float)chapter;
+    if (intra < 0.0f) intra = 0.0f;
+    if (intra > 1.0f) intra = 1.0f;
+
+    /* 加载目标章节(内部会渲染 offset=0 并关闭 loading) */
+    if (!epub_viewer_goto_chapter(viewer, chapter, 0, NULL)) return;
+
+    /* 章内偏移 = intra * 本章解码长度, UTF-8 对齐 */
+    int off = (viewer->chapter_len > 0) ? (int)(intra * (float)viewer->chapter_len) : 0;
+    if (off < 0) off = 0;
+    if (off >= viewer->chapter_len) off = viewer->chapter_len - 1;
+    const char *buf = viewer->decoded_text_buf;
+    while (off < viewer->chapter_len && (buf[off] & 0xC0) == 0x80) off++;
+
+    viewer->read_offset = off;
+    history_clear(viewer);
+    update_display(viewer);
 }
 
 static void goto_btn_cb(lv_event_t *e) {
@@ -1496,19 +1644,13 @@ static void goto_btn_cb(lv_event_t *e) {
     if (pct > 100.0f) pct = 100.0f;
 
     int pct_x100 = (int)(pct * 100 + 0.5f);
-    int new_offset = pct_to_offset(viewer, pct_x100);
-    printf("[GOTO_BTN] pct=%.2f pct_x100=%d new_offset=%d chapter_len=%d\n",
-           pct, pct_x100, new_offset, viewer->chapter_len);
+    printf("[GOTO_BTN] pct=%.2f pct_x100=%d (整书百分比)\n", pct, pct_x100);
 
     /* 关闭工具栏 */
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
 
-    /* 清空历史 */
-    history_clear(viewer);
-
-    /* 跳转 */
-    viewer->read_offset = new_offset;
-    update_display(viewer);
+    /* 按整书百分比跳转 */
+    goto_book_pct(viewer, pct_x100);
 }
 
 /* goto键盘界面的回调 - 需要在函数外能访问viewer */
@@ -1534,22 +1676,16 @@ static void goto_confirm_cb(lv_event_t *e) {
     if (pct > 100.0f) pct = 100.0f;
 
     int pct_x100 = (int)(pct * 100 + 0.5f);
-    int new_offset = pct_to_offset(viewer, pct_x100);
-    printf("[GOTO_CONFIRM] pct=%.2f pct_x100=%d new_offset=%d chapter_len=%d\n",
-           pct, pct_x100, new_offset, viewer->chapter_len);
+    printf("[GOTO_CONFIRM] pct=%.2f pct_x100=%d (整书百分比)\n", pct, pct_x100);
 
     /* 清理键盘界面 */
     cleanup_goto_screen(viewer);
 
-    /* 清空历史 */
-    history_clear(viewer);
-
     /* 关闭工具栏 */
     if (viewer->toolbar_visible) toggle_toolbar(viewer);
 
-    /* 跳转 */
-    viewer->read_offset = new_offset;
-    update_display(viewer);
+    /* 按整书百分比跳转 */
+    goto_book_pct(viewer, pct_x100);
 }
 
 /* ========== 目录 ========== */
@@ -1593,11 +1729,11 @@ void epub_viewer_show_toc(EpubViewer *viewer) {
     lv_label_set_text(toc_title, "目录");
     lv_obj_set_style_text_font(toc_title, ui_font, 0);
     lv_obj_set_style_text_color(toc_title, lv_color_black(), 0);
-    lv_obj_align(toc_title, LV_ALIGN_LEFT_MID, 4, 0);
+    lv_obj_align(toc_title, LV_ALIGN_LEFT_MID, 70, 0);
 
     lv_obj_t *toc_close_btn = lv_btn_create(header);
-    lv_obj_set_size(toc_close_btn, 22, 22);
-    lv_obj_align(toc_close_btn, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_set_size(toc_close_btn, 60, 30);
+    lv_obj_align(toc_close_btn, LV_ALIGN_TOP_LEFT, 2, 0);
     lv_obj_set_style_bg_color(toc_close_btn, lv_color_white(), 0);
     lv_obj_set_style_border_width(toc_close_btn, 1, 0);
     lv_obj_set_style_border_color(toc_close_btn, lv_color_make(0x99, 0x99, 0x99), 0);
@@ -1672,9 +1808,17 @@ static void toc_item_cb(lv_event_t *e) {
     if (toc_idx < 0) return;
 
     int chapter = -1;
+    const char *anchor = NULL;
     if (viewer->reader) {
+        /* 目录条目可能是 "x.html#id" 形式: 取 # 后的锚点用于章内定位 */
+        EpubTocEntry *te = epub_reader_get_toc(viewer->reader, toc_idx);
+        if (te) {
+            const char *h = strchr(te->href, '#');
+            if (h && h[1]) anchor = h + 1;
+        }
         chapter = epub_reader_jump_to_toc(viewer->reader, toc_idx);
-        printf("[TOC_UI] click toc[%d] -> chapter=%d\n", toc_idx, chapter);
+        printf("[TOC_UI] click toc[%d] -> chapter=%d anchor=%s\n",
+               toc_idx, chapter, anchor ? anchor : "(none)");
     }
 
     /* 必须先藏起目录再 goto：否则 update_display/lv_refr_now 时遮罩仍盖住全文，
@@ -1687,7 +1831,7 @@ static void toc_item_cb(lv_event_t *e) {
     }
 
     if (chapter >= 0) {
-        epub_viewer_goto_chapter(viewer, chapter, 0);
+        epub_viewer_goto_chapter(viewer, chapter, 0, anchor);
     } else {
         printf("[TOC_UI] jump failed (unmapped spine)\n");
     }

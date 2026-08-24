@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -85,6 +86,28 @@ void clock_mode_set_enabled(bool en);
  * (表示本次按下应被忽略，避免唤醒后立刻又进休眠)。否则返回 false。
  */
 bool clock_consume_boot_key_guard(void);
+
+/*
+ * 休眠时钟唤醒精度(分钟)。持久化在 /settings.ini [clock] interval_min。
+ * 支持 1/3/5/10/15/30/60，若读到非法值回退默认 1。
+ * clock_set_interval_min 返回 0=成功, -1=失败。
+ */
+int clock_get_interval_min(void);
+int clock_set_interval_min(int minutes);
+
+/*
+ * 休眠时钟横屏模式。持久化在 /settings.ini [clock] landscape (1=横屏, 0=竖屏)。
+ * 横屏: 内容旋转 90° 显示, 设备横置阅读。返回 0/1, 默认 0。
+ */
+int clock_get_landscape(void);
+int clock_set_landscape(int on);
+
+/*
+ * 读取当前 RTC 时钟并格式化为 "HH:MM:SS"。
+ * 供"未连接WiFi"时进入休眠时钟前的确认对话框显示(让用户判断时间是否可信)。
+ * 返回 0 成功, -1 失败。
+ */
+int clock_format_rtc_time(char *out, size_t sz);
 
 #ifdef __cplusplus
 }

@@ -211,6 +211,7 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
  ../../../../project/demo/FontExp/settings_storage.h \
  ../../../../project/demo/FontExp/lv_port_disp.h \
+ ../../../../project/demo/FontExp/loading.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOS.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOSConfig.h \
  ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/projdefs.h \
@@ -648,6 +649,8 @@
 ../../../../project/demo/FontExp/settings_storage.h:
 
 ../../../../project/demo/FontExp/lv_port_disp.h:
+
+../../../../project/demo/FontExp/loading.h:
 
 ../../../../include/kernel/FreeRTOS/FreeRTOSv8.2.3/FreeRTOS.h:
 

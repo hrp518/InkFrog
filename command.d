@@ -81,7 +81,18 @@
  ../../../../project/common/cmd/cmd_fs.h \
  ../../../../project/common/cmd/cmd_xz.h \
  ../../../../project/common/cmd/cmd_console.h \
- ../../../../project/common/cmd/cmd_json.h
+ ../../../../project/common/cmd/cmd_json.h \
+ ../../../../project/common/framework/fs_ctrl.h \
+ ../../../../project/common/framework/sys_ctrl/sys_ctrl.h \
+ ../../../../project/common/framework/sys_ctrl/event_queue.h \
+ ../../../../project/common/framework/sys_ctrl/publisher.h \
+ ../../../../include/sys/list.h ../../../../include/sys/defs.h \
+ ../../../../include/types.h \
+ ../../../../project/common/framework/sys_ctrl/observer.h \
+ ../../../../project/common/framework/sys_ctrl/looper.h \
+ ../../../../include/fs/fatfs/ff.h ../../../../include/fs/fatfs/integer.h \
+ ../../../../include/fs/fatfs/ffconf.h \
+ ../../../../project/demo/FontExp/sd_recovery.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -250,3 +261,29 @@
 ../../../../project/common/cmd/cmd_console.h:
 
 ../../../../project/common/cmd/cmd_json.h:
+
+../../../../project/common/framework/fs_ctrl.h:
+
+../../../../project/common/framework/sys_ctrl/sys_ctrl.h:
+
+../../../../project/common/framework/sys_ctrl/event_queue.h:
+
+../../../../project/common/framework/sys_ctrl/publisher.h:
+
+../../../../include/sys/list.h:
+
+../../../../include/sys/defs.h:
+
+../../../../include/types.h:
+
+../../../../project/common/framework/sys_ctrl/observer.h:
+
+../../../../project/common/framework/sys_ctrl/looper.h:
+
+../../../../include/fs/fatfs/ff.h:
+
+../../../../include/fs/fatfs/integer.h:
+
+../../../../include/fs/fatfs/ffconf.h:
+
+../../../../project/demo/FontExp/sd_recovery.h:

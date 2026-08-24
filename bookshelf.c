@@ -17,6 +17,7 @@
 #include "wlan_manager.h"
 #include "fs/fatfs/ff.h"
 #include "lvgl/lvgl.h"
+#include "loading.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -32,7 +33,7 @@ LV_FONT_DECLARE(lv_font_misans_16);
 
 #define BS_SCREEN_W       240
 #define BS_SCREEN_H       415
-#define BS_HEADER_H       30
+#define BS_HEADER_H       36
 #define BS_FOOTER_H       16
 #define BS_MARGIN_X       8
 #define BS_MARGIN_Y       4
@@ -74,17 +75,13 @@ static lv_obj_t *g_page_label = NULL;
 static lv_obj_t *g_grid = NULL;
 static lv_obj_t *g_dots_box = NULL;
 
-static int16_t g_press_x = 0;
-static int16_t g_press_y = 0;
-static uint8_t g_pressing = 0;
-
 static void bs_rebuild_ui(void);
 static void bs_scan_library(void);
 static void bs_fill_meta(BookEntry *b);
 static int bs_calc_progress(const BookEntry *b);
 static void bs_open_book(BookEntry *b);
 static void bs_goto_page(int page);
-static void bs_swipe_handler(int32_t delta_y);
+static void bs_swipe_handler(int32_t delta_x, int32_t delta_y);
 static void bs_physical_back(void);
 
 static int str_ieq_ext(const char *name, const char *ext)
@@ -198,8 +195,10 @@ static void bs_fill_meta(BookEntry *b)
         return;
     }
 
-    /* 已有 metadata 缓存则跳过打开 EPUB（省时省内存） */
-    if (have_title && b->chapter_count > 0) {
+    /* 已有 title 缓存即跳过打开 EPUB。注意: 不能把跳过条件挂在 chapter_count>0 上——
+     * spine_count 为 0 的书(chapters 只在 >0 时才写缓存)每次都会因 chapter_count==0
+     * 而重新打开+解析 EPUB, 与是否新书无关, 导致每次进书架都慢/卡。 */
+    if (have_title) {
         return;
     }
 
@@ -228,25 +227,9 @@ static void bs_fill_meta(BookEntry *b)
 
 static int bs_calc_progress(const BookEntry *b)
 {
-    if (b->kind == BS_KIND_EPUB) {
-        /* EPUB：直接读阅读器渲染时存入的全书百分比 */
-        return settings_load_bookmark_pct(b->filepath);
-    }
-    /* TXT：暂无整书书签体系，有 bookmark 则按 offset 粗估 */
-    int ch = 0, off = 0;
-    if (settings_load_bookmark(b->filepath, &ch, &off) != 0) {
-        return 0;
-    }
-    if (ch > 0 || off > 0) {
-        if (off > 0 && off < 1000000) {
-            int p = off / 10000; /* 粗略 */
-            if (p > 99) p = 99;
-            if (p < 1) p = 1;
-            return p;
-        }
-        return 1;
-    }
-    return 0;
+    /* EPUB / TXT 统一：读阅读器渲染时存入的全书百分比（pct 字段）。
+     * txt_viewer 每翻页按 read_offset/文件大小 计算并保存 pct，精确。 */
+    return settings_load_bookmark_pct(b->filepath);
 }
 
 static void bs_scan_library(void)
@@ -341,6 +324,10 @@ static void bs_open_book(BookEntry *b)
     } else {
         file_manager_open_txt(b->filepath, bookshelf_show);
     }
+
+    /* 阅读期间物理返回交由 FM 处理器接管: 它负责存书签并通过
+     * g_reader_ui_return(=bookshelf_show) 正确回到书架, 而不是误回主页 */
+    fm_assign_physical_back();
 }
 
 static void bs_back_cb(lv_event_t *e)
@@ -349,12 +336,25 @@ static void bs_back_cb(lv_event_t *e)
     bookshelf_close();
 }
 
-static void bs_swipe_handler(int32_t delta_y)
+static void bs_swipe_handler(int32_t delta_x, int32_t delta_y)
 {
-    if (delta_y > BS_SWIPE_TH) {
-        bs_goto_page(g_page + 1);
-    } else if (delta_y < -BS_SWIPE_TH) {
-        bs_goto_page(g_page - 1);
+    int32_t adx = delta_x < 0 ? -delta_x : delta_x;
+    int32_t ady = delta_y < 0 ? -delta_y : delta_y;
+
+    if (adx > ady && adx > BS_SWIPE_TH) {
+        /* 横向为主: 左滑(dx>0) 下一页, 右滑(dx<0) 上一页 */
+        if (delta_x > 0) {
+            bs_goto_page(g_page + 1);
+        } else {
+            bs_goto_page(g_page - 1);
+        }
+    } else if (ady > BS_SWIPE_TH) {
+        /* 纵向为主: 上滑(dy>0) 下一页, 下滑(dy<0) 上一页 */
+        if (delta_y > 0) {
+            bs_goto_page(g_page + 1);
+        } else {
+            bs_goto_page(g_page - 1);
+        }
     }
 }
 
@@ -362,38 +362,6 @@ static void bs_physical_back(void)
 {
     printf("[BS] physical back → home\n");
     bookshelf_close();
-}
-
-static void bs_touch_cb(lv_event_t *e)
-{
-    lv_event_code_t code = lv_event_get_code(e);
-    lv_indev_t *indev = lv_indev_get_act();
-    if (!indev) return;
-
-    lv_point_t pt;
-    lv_indev_get_point(indev, &pt);
-
-    if (code == LV_EVENT_PRESSED) {
-        g_press_x = pt.x;
-        g_press_y = pt.y;
-        g_pressing = 1;
-        /* 网格区域允许驱动层纵向滑动 */
-        int y1 = BS_HEADER_H;
-        int y2 = BS_SCREEN_H - BS_FOOTER_H;
-        touch_set_swipe_area((int16_t)y1, (int16_t)y2);
-    } else if (code == LV_EVENT_RELEASED && g_pressing) {
-        g_pressing = 0;
-        int16_t dx = (int16_t)(pt.x - g_press_x);
-        int16_t dy = (int16_t)(pt.y - g_press_y);
-        /* 左右滑：|dx| 更大时翻页；上下交给 swipe_handler */
-        if (BS_ABS(dx) >= BS_ABS(dy) && BS_ABS(dx) > 36) {
-            if (dx < 0) {
-                bs_goto_page(g_page + 1);
-            } else {
-                bs_goto_page(g_page - 1);
-            }
-        }
-    }
 }
 
 static void bs_update_dots(void)
@@ -529,11 +497,8 @@ static void bs_rebuild_ui(void)
         epd_disable_all_animations_recursive(g_bs_screen);
     }
 
-    /* 注册书架触摸回调（close 时会移除，故每次重建都重新挂；
-     * 先 remove 防止多次进出书架导致回调叠加） */
-    lv_obj_remove_event_cb(g_bs_screen, bs_touch_cb);
-    lv_obj_add_event_cb(g_bs_screen, bs_touch_cb, LV_EVENT_PRESSED, NULL);
-    lv_obj_add_event_cb(g_bs_screen, bs_touch_cb, LV_EVENT_RELEASED, NULL);
+    /* 滑动翻页全部交给驱动层 touch 回调(bs_swipe_handler), 取消 LVGL 事件判滑 */
+    touch_set_swipe_area((int16_t)BS_HEADER_H, (int16_t)(BS_SCREEN_H - BS_FOOTER_H));
 
     /* 顶栏 */
     lv_obj_t *header = lv_obj_create(g_bs_screen);
@@ -549,7 +514,7 @@ static void bs_rebuild_ui(void)
     epd_disable_all_animations_recursive(header);
 
     lv_obj_t *back = lv_btn_create(header);
-    lv_obj_set_size(back, 60, 26);
+    lv_obj_set_size(back, 60, 30);
     lv_obj_align(back, LV_ALIGN_LEFT_MID, 4, 0);
     lv_obj_set_style_bg_color(back, lv_color_white(), 0);
     lv_obj_set_style_border_width(back, 1, 0);
@@ -602,6 +567,35 @@ static void bs_rebuild_ui(void)
     touch_register_swipe_callback(bs_swipe_handler);
     touch_register_back_btn_callback(bs_physical_back);
     touch_set_swipe_area(BS_HEADER_H, BS_SCREEN_H - BS_FOOTER_H);
+}
+
+/* 进书架时"先出遮罩、下一拍再解析"的延时与定时器。
+ * 不能同步解析: EPD 硬件刷新需持 epd_lock, 而它是被 LVGL 主线程占着, 同步
+ * 解析期间屏幕完全无法刷新, 点多少次都没反馈(看起来像卡死)。跨 tick 分两步,
+ * 全留在 LVGL 线程, 不引入后台线程, 规避 FATFS/LVGL 内存管理并发冲突。 */
+#define BS_LIB_DELAY_MS   80
+static lv_timer_t * s_bs_lib_timer = NULL;
+
+static void bs_library_task_cb(lv_timer_t * t)
+{
+    (void)t;
+    s_bs_lib_timer = NULL;
+    bookshelf_init();
+    loading_hide();
+}
+
+void bookshelf_begin_load(void)
+{
+    if(s_bs_lib_timer) {
+        lv_timer_del(s_bs_lib_timer);
+        s_bs_lib_timer = NULL;
+    }
+    /* 1) 先推"正在解析..."遮罩并请求刷新, 让 EPD 把反馈刷上去; */
+    loading_show("Parsing books...");
+    epd_mark_refresh_pending();
+    /* 2) 下一拍真正扫描/解析(此时遮罩已上屏, 解析期间用户看到的是"解析中")。 */
+    s_bs_lib_timer = lv_timer_create(bs_library_task_cb, BS_LIB_DELAY_MS, NULL);
+    lv_timer_set_repeat_count(s_bs_lib_timer, 1);
 }
 
 void bookshelf_init(void)
@@ -666,7 +660,6 @@ void bookshelf_close(void)
      * 保留 g_bs_screen 对象，复用为首页屏（与 file_manager_close 一致）。
      * 下次 bookshelf_init 时 bs_rebuild_ui 会检测并复用该屏。 */
     if (g_bs_screen) {
-        lv_obj_remove_event_cb(g_bs_screen, bs_touch_cb);  /* 摘除书架触摸回调，避免污染首页 */
         lv_obj_clean(g_bs_screen);
     }
 

@@ -180,6 +180,56 @@ static void preprocess_html_entities(char *buf, int *len) {
     *len = wp;
 }
 
+/* 把 XML 中非法的裸 '&'（不是 &name; / &#digits; 实体引用）替换为 &amp;。
+ * 典型场景: <meta>Before Sunrise & Before Sunset</meta> 里的裸 &, Expat 会报
+ * "not well-formed (invalid token)" 导致 OPF/章节解析失败。
+ * out==NULL 时只统计所需长度, 不写入; 返回 -1 表示 out 空间不足。 */
+static int sanitize_ampersands(const char *in, int in_len, char *out, int out_cap)
+{
+    int rp = 0, wp = 0;
+    while (rp < in_len) {
+        if (in[rp] == '&') {
+            /* 判断是否为合法实体引用 */
+            int k = rp + 1;
+            int ok = 0;
+            if (k < in_len && in[k] == '#') {
+                int d = k + 1;
+                if (d < in_len && (in[d] == 'x' || in[d] == 'X')) d++;
+                while (d < in_len &&
+                       ((in[d] >= '0' && in[d] <= '9') ||
+                        (in[d] >= 'a' && in[d] <= 'f') ||
+                        (in[d] >= 'A' && in[d] <= 'F'))) d++;
+                if (d < in_len && in[d] == ';') ok = 1;
+            } else {
+                int n0 = k;
+                while (k < in_len &&
+                       ((in[k] >= 'a' && in[k] <= 'z') ||
+                        (in[k] >= 'A' && in[k] <= 'Z') || in[k] == '_')) k++;
+                if (k > n0 && k < in_len && in[k] == ';') ok = 1;
+            }
+            if (ok) {
+                if (out) { if (wp + 1 > out_cap) return -1; out[wp] = '&'; }
+                wp++; rp++;
+                continue;
+            }
+            /* 裸 '&' -> "&amp;" */
+            if (out) {
+                if (wp + 5 > out_cap) return -1;
+                memcpy(out + wp, "&amp;", 5);
+            }
+            wp += 5; rp++;
+            continue;
+        }
+        if (out) {
+            if (wp + 1 > out_cap) return -1;
+            out[wp] = in[rp];
+        }
+        wp++; rp++;
+    }
+    if (out) out[wp] = '\0';
+    return wp;
+}
+
 bool xhtml_parser_parse(XhtmlParser *parser, const char *xml_data, int xml_len) {
     if (!parser || !xml_data || xml_len <= 0) {
         XHTML_ERR("Invalid parse parameters\n");
@@ -196,7 +246,29 @@ bool xhtml_parser_parse(XhtmlParser *parser, const char *xml_data, int xml_len) 
     XML_SetElementHandler(parser->expat_parser, expat_start_element, expat_end_element);
     XML_SetCharacterDataHandler(parser->expat_parser, expat_char_data);
 
-    enum XML_Status status = XML_Parse(parser->expat_parser, xml_data, xml_len, 1);
+    /* 先扫描裸 '&'; 仅当存在时才拷贝转义副本再解析, 否则直接用原缓冲(零开销) */
+    const char *parse_data = xml_data;
+    int parse_len = xml_len;
+    char *sanitized = NULL;
+    int need = sanitize_ampersands(xml_data, xml_len, NULL, 0);
+    if (need > xml_len) {
+        sanitized = (char *)psram_malloc((size_t)need + 1);
+        if (!sanitized) {
+            XHTML_ERR("Failed to alloc sanitize buffer (%d bytes)\n", need);
+            return false;
+        }
+        if (sanitize_ampersands(xml_data, xml_len, sanitized, need + 1) < 0) {
+            psram_free(sanitized);
+            XHTML_ERR("Sanitize buffer overflow\n");
+            return false;
+        }
+        parse_data = sanitized;
+        parse_len = need;
+        XHTML_LOG("Sanitized bare '&' (%d->%d bytes)\n", xml_len, need);
+    }
+
+    enum XML_Status status = XML_Parse(parser->expat_parser, parse_data, parse_len, 1);
+    if (sanitized) psram_free(sanitized);
 
     if (status != XML_STATUS_OK) {
         parser->has_error = true;

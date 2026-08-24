@@ -73,6 +73,11 @@ void lv_tiny_ttf_bitmap_page_end(void);
 void lv_tiny_ttf_reset_dsc_l2_cache(void);
 int lv_tiny_ttf_get_l2_hits(void);
 
+/* DSC 路径耗时统计（诊断加载时间构成用；l2=缓存命中, metrics=L1 命中, stbtt=后备光栅化） */
+void lv_tiny_ttf_get_dsc_timing(uint32_t *l2_ms, uint32_t *l2_cnt,
+                                uint32_t *metrics_ms, uint32_t *metrics_cnt,
+                                uint32_t *stbtt_ms, uint32_t *stbtt_cnt);
+
 /* Release shared L1/metrics/table caches after EPUB reader closes */
 void lv_tiny_ttf_release_reader_cache(void);
 

@@ -233,6 +233,18 @@ SECTIONS
         *lv_txt_ap.o (.text .text.* .rodata .rodata.*)
         *lv_style.o (.text .text.* .rodata .rodata.*)
         *lv_style_gen.o (.text .text.* .rodata .rodata.*)
+        /* Stage-3 XIP whitelist: 默认字体/内嵌JS/XML解析/压缩库
+         * (2026-08-12 曾为腾 SRAM 移入 PSRAM, 但 PSRAM 取指/取数慢,
+         *  且 misans 是 LV_FONT_DEFAULT, 阅读器每条文本路径都会回退查它;
+         *  改放 XIP: 不占 SRAM, 不走 PSRAM 慢总线, 休眠安全——挂起链
+         *  在 flashc_suspend 之后才掉电, SDK 代码本就运行在 .xip。
+         *  任务栈仍全部留在 SRAM (08-12 修复的前提不变)。 */
+        *project/demo/FontExp/lv_font_misans_16.o (.text .text.* .rodata .rodata.*)
+        *project/demo/FontExp/http_l1glyf_js.o (.text .text.* .rodata .rodata.*)
+        *project/demo/FontExp/third_party/expat/xmltok.o (.text .text.* .rodata .rodata.*)
+        *project/demo/FontExp/third_party/expat/xmlparse.o (.text .text.* .rodata .rodata.*)
+        *project/demo/FontExp/third_party/expat/xmlrole.o (.text .text.* .rodata .rodata.*)
+        *project/demo/FontExp/third_party/miniz/miniz.o (.text .text.* .rodata .rodata.*)
         *(.xip_text* .xip_rodata*)
         . = ALIGN(4);
         __xip_end__ = .;
@@ -252,6 +264,16 @@ SECTIONS
         *project/demo/FontExp/level1_data.o (.text* .rodata*)
         *project/demo/FontExp/level2_data.o (.text* .rodata*)
         *project/demo/FontExp/level3_data.o (.text* .rodata*)
+        /* ===== 休眠崩溃修复 (2026-08-12): 任务栈必须留在 SRAM =====
+         * 原因: SRAM .text 过大把堆挤到只剩 ~940B, disp_task/lvgl_task
+         * (最后创建) 的 40KB 栈落入 PSRAM; 休眠挂起链跑在 PSRAM 栈上,
+         * 链内 psram_suspend/psramc_suspend 重配 PSRAM 时栈被破坏 →
+         * 返回地址变垃圾 → hard fault (PC=PSRAM 栈地址, 多份崩溃日志)。
+         * 修复思路保留: 大数据/代码不能占 SRAM, 栈必须留在 SRAM。
+         * 原移入 PSRAM 的 6 个对象 (lv_font_misans_16/http_l1glyf_js/
+         * expat×3/miniz) 已改放 .xip 段 (flash XIP, 见 .xip 的
+         * Stage-3 whitelist): 同样不占 SRAM (栈空间不受影响),
+         * 且不走 PSRAM 慢总线, 休眠同样安全。 */
         /* ===== 第一步：LVGL高级代码迁移到PSRAM ===== */
         /* 扩展控件 (extra/widgets/) */
         *lv_win.o (.text* .rodata*)

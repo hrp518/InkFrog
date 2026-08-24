@@ -241,7 +241,13 @@
  ../../../../project/demo/FontExp/settings_screen.h \
  ../../../../project/demo/FontExp/font_warm.h \
  ../../../../project/demo/FontExp/time_sync.h \
- ../../../../project/demo/FontExp/settings_storage.h
+ ../../../../project/demo/FontExp/settings_storage.h \
+ ../../../../project/demo/FontExp/bookshelf.h \
+ ../../../../project/demo/FontExp/clock_mode.h \
+ ../../../../project/demo/FontExp/charge_mode.h \
+ ../../../../project/demo/FontExp/loading.h \
+ ../../../../project/demo/FontExp/boot_screen.h \
+ ../../../../project/demo/FontExp/sd_recovery.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -736,3 +742,15 @@
 ../../../../project/demo/FontExp/time_sync.h:
 
 ../../../../project/demo/FontExp/settings_storage.h:
+
+../../../../project/demo/FontExp/bookshelf.h:
+
+../../../../project/demo/FontExp/clock_mode.h:
+
+../../../../project/demo/FontExp/charge_mode.h:
+
+../../../../project/demo/FontExp/loading.h:
+
+../../../../project/demo/FontExp/boot_screen.h:
+
+../../../../project/demo/FontExp/sd_recovery.h:

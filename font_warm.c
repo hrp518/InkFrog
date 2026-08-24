@@ -1,4 +1,5 @@
 #include "font_warm.h"
+#include "boot_screen.h"
 #include "font_priority_loader.h"
 #include "settings_screen.h"
 #include "settings_storage.h"
@@ -12,7 +13,7 @@
 #include <string.h>
 #include <strings.h>
 
-#define FONT_WARM_BOOT_DELAY_MS  5000
+#define FONT_WARM_BOOT_DELAY_MS  0
 #define FONT_WARM_RETRY_MS       3000
 #define FONT_WARM_PRELOAD_SIZE   16
 
@@ -20,6 +21,30 @@ static char s_cached_path[256];
 static char s_pending_path[256];
 static lv_timer_t * s_warm_timer;
 static volatile int s_warm_busy;
+static volatile int s_reader_active;
+
+static void font_warm_normalize_path(char * path);
+
+void font_warm_reader_active(bool active)
+{
+    s_reader_active = active ? 1 : 0;
+}
+
+void font_warm_mark_loaded(const char * ttf_path)
+{
+    if(ttf_path && ttf_path[0]) {
+        strncpy(s_cached_path, ttf_path, sizeof(s_cached_path) - 1);
+        s_cached_path[sizeof(s_cached_path) - 1] = '\0';
+        font_warm_normalize_path(s_cached_path);
+    }
+    /* 阅读器已完成 L1 预热(共享缓存正被其引用), 取消后续 warm, 避免
+     * 二次初始化共享缓存把字体搞坏 / 重复读 SD 加载。 */
+    if(s_warm_timer) {
+        lv_timer_del(s_warm_timer);
+        s_warm_timer = NULL;
+    }
+    printf("[FONT_WARM] Reader marked warm: %s\n", s_cached_path);
+}
 
 static void font_warm_normalize_path(char * path)
 {
@@ -246,6 +271,40 @@ static void font_warm_run_locked(const char * path)
     }
 }
 
+/* 开机同步预热: 必须在 lv_init() 之后、首页构建/刷屏之前调用(main 线程, 尚无
+ * 并发 LVGL, 线程安全)。SD/PSRAM 就绪即可读 TTF。整个加载耗在被开机画面(EPD
+ * 上仍是 boot 位图, 首页尚未刷上来)遮罩, 因此不弹 "Preparing fonts..." 遮罩。
+ * 返回是否已就绪。 */
+int font_warm_run_boot(const char * ttf_path)
+{
+    char path[256];
+
+    if(ttf_path && ttf_path[0]) {
+        strncpy(path, ttf_path, sizeof(path) - 1);
+        path[sizeof(path) - 1] = '\0';
+    } else if(font_warm_resolve_reader_path(path, sizeof(path)) != 0) {
+        printf("[FONT_WARM] No TTF to warm at boot\n");
+        return 0;
+    }
+    font_warm_normalize_path(path);
+
+    if(font_warm_is_ready() && font_warm_path_matches(path)) {
+        printf("[FONT_WARM] Already warm for %s\n", path);
+        return 1;
+    }
+    if(font_warm_is_ready()) {
+        lv_tiny_ttf_release_reader_cache();
+        s_cached_path[0] = '\0';
+    }
+
+    /* boot 阶段 LVGL 尚未启动, 屏幕还停在开机画面 —— 把状态行从
+     * "booting..." 换成字体加载提示, 让 ~1-2s 的 L1 预载有可见反馈 */
+    boot_screen_set_status("preparing TTF Font");
+
+    font_warm_run_locked(path);
+    return font_warm_is_ready();
+}
+
 static void font_warm_timer_cb(lv_timer_t * timer)
 {
     (void)timer;
@@ -257,14 +316,22 @@ static void font_warm_timer_cb(lv_timer_t * timer)
         lv_timer_set_repeat_count(s_warm_timer, 1);
         return;
     }
-    if(g_wifi.phase == WLAN_PHASE_CONNECTING) {
-        printf("[FONT_WARM] WiFi connecting, retry in 1s\n");
-        s_warm_timer = lv_timer_create(font_warm_timer_cb, 1000, NULL);
+    /* 注意: 不要再因 "WiFi 正在连接" 而推迟预热。开机预热的目的是把 ~1s 的字形
+     * 加载藏进开机画面遮罩里, 而 WiFi 关联(~4.6s)恰恰和这个遮罩窗口重叠 —— 若
+     * 这里 defer, 预热会被推到首页已显示之后, 用户就会看到 "Preparing fonts..."
+     * 遮罩。直接跑即可, 预加载只占 LVGL 线程 + 少量 PSRAM, 与 WPA 关联基本不冲突。 */
+    if(s_warm_busy) return;
+    s_warm_busy = 1;
+
+    if(s_reader_active) {
+        /* 阅读器正在用共享 L1 缓存, 绝不能释放/重初始化(否则阅读器字体被破坏),
+         * 也不重复预加载; 稍后重试, 等阅读器释放字体后再预热。 */
+        printf("[FONT_WARM] reader active, defer warm\n");
+        s_warm_busy = 0;
+        s_warm_timer = lv_timer_create(font_warm_timer_cb, FONT_WARM_RETRY_MS, NULL);
         lv_timer_set_repeat_count(s_warm_timer, 1);
         return;
     }
-    if(s_warm_busy) return;
-    s_warm_busy = 1;
 
     char path[256];
     if(s_pending_path[0]) {

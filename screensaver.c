@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include "screensaver.h"
+#include "sd_recovery.h"
 #include "lvgl/lvgl.h"
 #include "fs/fatfs/ff.h"
 #include "common/framework/fs_ctrl.h"
@@ -17,6 +18,7 @@
 #include "wifi_controller.h"
 #include "driver/chip/hal_wakeup.h"
 #include "driver/chip/hal_prcm.h"
+#include "driver/chip/hal_nvic.h"   /* HAL_NVIC_CPUReset() */
 #include "pm/pm.h"
 #include "driver/chip/hal_gpio.h"
 #include "driver/chip/hal_i2c.h"
@@ -26,6 +28,7 @@
 #include "chsc6540.h"
 #include "pm/pm.h"
 #include "charge_mode.h"
+#include "loading.h"
 
 extern OS_Thread_t lvgl_thread;
 extern void main_ui_create(void);
@@ -44,7 +47,6 @@ static int screensaver_load_to_framebuffer(void)
     FIL fp;
     FRESULT fr;
     UINT br = 0;
-    uint32_t i;
 
     fr = f_open(&fp, SCREENSAVER_FILE_PATH, FA_READ);
     if (fr != FR_OK) {
@@ -57,15 +59,6 @@ static int screensaver_load_to_framebuffer(void)
     if (fr != FR_OK || br != EPD_BUFFER_SIZE) {
         printf("[SS] read failed: fr=%d br=%u\n", fr, (unsigned int)br);
         return -1;
-    }
-
-    /*
-     * 当前网页编辑器导出的 1bpp 极性与设备侧直接显示到 EPD 的极性相反。
-     * 为了兼容已经保存在 SD 卡上的 screensaver.bin,这里在加载时统一翻转一次。
-     * 这样用户不需要删除旧文件重传,现有屏保也能直接正常显示。
-     */
-    for (i = 0; i < EPD_BUFFER_SIZE; i++) {
-        framebuffer[i] ^= 0xFF;
     }
 
     return 0;
@@ -82,24 +75,17 @@ static int screensaver_enter(int force)
         printf("[SS] HTTP running, refusing to enter hibernation\n");
         return -1;
     }
-
-    /* 取 EPD/framebuffer 独占所有权 (GPT clock 方案 §六)：
-     * 之前 screensaver_enter 直接改 framebuffer 并 EPD_3IN52_Display()，
-     * 而此时 lvgl_task 仍每 5ms 跑 flush_cb，存在 framebuffer 在传输中被
-     * 修改的竞争。take 后 lvgl 线程被挂起，可安全操作 framebuffer。 */
-    epd_take_ownership();
-
-    /* 尝试加载屏保图片 */
-    if (screensaver_load_to_framebuffer() == 0) {
-        has_image = 1;
+    if (sd_format_is_busy()) {
+        printf("[SS] SD formatting in progress, refusing to enter hibernation\n");
+        return -1;
     }
 
-    /* 无图片时:显示 Tuwa Reader 文字 */
-    if (!has_image) {
-        printf("[SS] no image, showing Tuwa Reader text\n");
-        EPD_DrawStringCentered("Tuwa Reader");
-    }
+    /* 休眠前立即显示 "Going to sleep..." 遮罩并推屏 (与充电模式进界面前的
+     * 反馈共用同一段逻辑, 详见 screensaver_show_sleep_overlay). */
+    screensaver_show_sleep_overlay();
 
+    /* 渲染用户屏保（复用公开 API：加载图片或 fallback 文字 + 推屏 + deep sleep） */
+    has_image = screensaver_render_to_epd();
     printf("[SS] entering hibernation (has_image=%d, force=%d)\n", has_image, force);
 
     /* ====== fix-power-saving v2: WiFi 手动下电 + 屏蔽 SDK 重复 teardown ======
@@ -119,12 +105,6 @@ static int screensaver_enter(int force)
     /* 3. 手动 wlan_sta_disable + while(IsSys3Alive()) 等协处理器掉电 */
     wifi_controller_poweroff();
 
-    /* 4. EPD deep sleep (原版在 cg_flush_task 里做, 我们在这做) */
-    EPD_3IN52_Init();
-    EPD_3IN52_Display();
-    EPD_Sleep();
-    printf("[SS] EPD entered deep sleep\n");
-
     /* 5. 触摸 + I2C0 下电 (新增, 原版由驱动框架 suspend 链处理) */
     CHSC6540_DeInit();
     printf("[SS] Touch controller deinitialized\n");
@@ -133,21 +113,20 @@ static int screensaver_enter(int force)
     HAL_ADC_DeInit();
     printf("[SS] ADC deinitialized\n");
 
-    /* 7. SD 卡: unmount + 卡 deinit + SDC 控制器 deinit (原版 "spi deinit") */
-    printf("[SS] Unmount SD card filesystem\n");
+    /* 7. SD 卡: 只卸载文件系统, 【不拆 SDC 控制器/不注销 SDC PM ops】。
+     *
+     * 修复 (2026-08): 之前这里 mmc_card_deinit + HAL_SDC_Deinit(0) 会把
+     * _mci_host[0] 清零并 pm_unregister_ops(SDC_DEV) 注销 SDC 的 PM 注册,
+     * 带着被改动的 DPM 列表进 pm_enter_mode(HIBERNATION), ROM 的
+     * dpm_suspend_noirq 挂起链会踩到损坏项 → hard fault (PC 跳到 flash
+     * 芯片表数据区, UFSR=0x2), 三份崩溃日志(休眠/充电拔插头/时钟模式)
+     * 的共同点都是本函数/对应路径调了 HAL_SDC_Deinit。ead13f1 时期
+     * "外设断电 #if 0" 休眠正常也佐证。
+     *
+     * 现在保持 SDC 注册 + 主机有效, 由 ROM 的 __mci_suspend 在挂起链里
+     * 给 SD 下电; 文件系统在此卸载, 唤醒(冷启动)后重新挂载。 */
+    printf("[SS] Unmount SD card filesystem (keep SDC registered)\n");
     f_mount(NULL, "0:", 0);
-
-    printf("[SS] Deinit SD card\n");
-    struct mmc_card *card = mmc_card_open(0);
-    if (card != NULL) {
-        if (mmc_card_present(card)) {
-            mmc_card_deinit(card);
-        }
-        mmc_card_close(0);
-    }
-
-    printf("[SS] Deinit SD controller (spi deinit)\n");
-    HAL_SDC_Deinit(0);
 
     /* 配置唤醒源:
      *   WKIO2 = PA06  -> 翻页/唤醒按键 (下降沿唤醒)
@@ -176,9 +155,39 @@ static int screensaver_enter(int force)
      * 已下电的外设(WiFi/触摸/ADC/SD)不受 EXT LDO 影响,省电效果保留。 */
 
     /* 进入 MCU hibernation */
+    pm_diag_dump_noirq_list();   /* 诊断: 挂起链崩溃排查 (进链前 noirq 链表状态) */
     pm_enter_mode(PM_MODE_HIBERNATION);
 
+    /* pm_enter_mode(HIBERNATION) 成功时永不返回；能走到这里说明休眠失败。
+     * 此时所有外设 (WiFi/SD/触摸/ADC) 已被本函数提前拆除，设备处于半死状态。
+     * 复位是最干净的恢复方式——冷启动 3 秒内完成。 */
+    printf("[SS] pm_enter_mode FAILED, resetting chip\n");
+    OS_MSleep(100);  /* 让串口把最后一条日志发完 */
+    HAL_NVIC_CPUReset();
+    while (1);       /* unreachable */
+
     return 0;
+}
+
+void screensaver_show_sleep_overlay(void)
+{
+    /* 休眠前立即显示 "Going to sleep..." 让用户感知到已触发动作.
+     * loading_show 用 LVGL overlay 渲染到 framebuffer(lv_refr_now),
+     * 然后 epd_mark_refresh_pending 让 disp_task 异步推屏.
+     * 但紧接着 epd_take_ownership 会挂起 LVGL + 清 pending 标志,
+     * 所以我们在 take 之后手动把 framebuffer(已有 loading 画面)推到 EPD. */
+    loading_show("Going to sleep...");
+
+    /* 取 EPD/framebuffer 独占所有权 (GPT clock 方案 §六)。
+     * take 后 LVGL 被挂起, 但 framebuffer 里 loading 画面的像素还在,
+     * 我们立刻推到 EPD 让用户看到反馈. */
+    epd_take_ownership();
+
+    /* 立即推屏: framebuffer 里已有 loading_show 渲染的 "Going to sleep..." overlay.
+     * 不用 EPD_3IN52_Init (会调 EPD_3IN52_Clear 白屏), 直接用 Display 推 GC 全刷.
+     * 屏是从 LVGL 的 DU 模式切到 GC, 可能有短暂闪烁, 但 loading 文字立刻可见. */
+    EPD_3IN52_Display();
+    printf("[SS] sleep overlay displayed\n");
 }
 
 static void screensaver_exit(void)
@@ -311,6 +320,31 @@ int screensaver_has_image(void)
 {
     FILINFO fno;
     return (f_stat(SCREENSAVER_FILE_PATH, &fno) == FR_OK && !(fno.fattrib & AM_DIR) && fno.fsize == EPD_BUFFER_SIZE);
+}
+
+/* 渲染用户屏保到 EPD 并进入 deep sleep（充电模式拔出充电器等场景复用）。
+ * 与 screensaver_enter() 的屏保显示分支完全一致：
+ *   - 有 /ScreenSaver/screensaver.bin 则加载到 framebuffer
+ *   - 无图则居中显示 "Tuwa Reader" 文字
+ *   - 推屏 + EPD deep sleep
+ * 调用方需先确保 SD 已挂载（fs_ctrl_mount）才能读到用户自定义屏保图。 */
+int screensaver_render_to_epd(void)
+{
+    int has_image = 0;
+
+    if (screensaver_load_to_framebuffer() == 0) {
+        has_image = 1;
+    }
+    if (!has_image) {
+        printf("[SS] no image, showing Tuwa Reader text\n");
+        EPD_DrawStringCentered("Tuwa Reader");
+    }
+
+    /* 推屏保画面到 EPD，再 deep sleep 保持画面（防烧屏） */
+    EPD_3IN52_Display();
+    EPD_Sleep();
+    printf("[SS] screensaver rendered to EPD (has_image=%d), deep sleep\n", has_image);
+    return has_image;
 }
 
 int screensaver_save_raw_file(const uint8_t *data, uint32_t len)

@@ -309,7 +309,24 @@ static void show_progress_overlay(const char *fname, uint32_t size)
         lv_obj_center(lbl);
     }
 
+    /* 点击「确认更新」后第一时间把「请勿断电」画面推上屏 (加载遮罩同样式)。
+     * 仅 epd_mark_refresh_pending 只会把刷新排队, 且紧接的
+     * prepare_network_for_ota 会阻塞 lvgl_task 数百 ms(停 HTTP/断 WiFi),
+     * 期间 LVGL 不再重绘, 用户点击后迟迟看不到更新提示。
+     * 这里强制同步渲染到 framebuffer + 标记 pending, disp_task 立刻推 EPD。 */
+    lv_obj_invalidate(s_overlay);
+    lv_refr_now(NULL);
     epd_mark_refresh_pending();
+
+    /* 若同步渲染被 EPD 刷新抑制 (epd_refresh_in_progress 时 _lv_disp_refr_timer
+     * 直接返回, inv_p 未被消费), 登记延迟重绘: 由 lvgl_task 在刷新结束后补渲染,
+     * 否则遮罩画面永远不上屏。 */
+    {
+        lv_disp_t *disp = lv_disp_get_default();
+        if (disp && disp->inv_p > 0) {
+            epd_request_rerender();
+        }
+    }
 }
 
 static void show_alert(const char *title, const char *msg)
@@ -348,6 +365,11 @@ static void ota_task(void *arg)
     (void)arg;
 
     FM_OTA_LOG("task start url=%s", s_file_url);
+
+    /* 先把 fm_ota_start 里 show_progress_overlay 排队的「正在更新」overlay
+     * 刷新到墨水屏，再暂停刷新/写 Flash；否则下面的 epd_pause_refresh()
+     * 会把这个刚排队的 pending 吞掉，点击确认后迟迟看不到更新画面。 */
+    epd_wait_refresh_idle(2500);
 
     /* 暂停墨水刷新，避免写 Flash 期间 DU 与 OTA erase 互斥拖死/踩堆 */
     epd_pause_refresh();
@@ -452,10 +474,11 @@ int fm_ota_start(const char *filepath)
     fname = strrchr(s_fat_path, '/');
     fname = fname ? fname + 1 : s_fat_path;
 
-    prepare_network_for_ota();
+    /* 先显示「正在更新」overlay，再停 wifi / 起 OTA 线程；
+     * 否则停 wifi 那几百毫秒里屏幕无任何反馈。而 ota_task 内会
+     * epd_wait_refresh_idle() 等这次刷新真正上屏后才暂停/写 Flash。 */
     show_progress_overlay(fname, size);
-    /* 先刷出「准备更新」画面，再进入写 Flash */
-    OS_MSleep(50);
+    prepare_network_for_ota();
 
     s_ota_busy = 1;
     if (OS_ThreadCreate(&s_ota_thread, "fm_ota", ota_task, NULL,

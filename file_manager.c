@@ -28,6 +28,8 @@
 /* EPUB阅读器支持 */
 #include "epub_reader.h"
 #include "epub_viewer.h"
+/* TXT阅读器支持（与 epub_viewer 同构的分页阅读体验） */
+#include "txt_viewer.h"
 #include "settings_storage.h"
 #include "font_priority_loader.h"
 #include "loading.h"
@@ -49,8 +51,6 @@ static char current_path[256] = "/";
 static lv_obj_t *fm_screen = NULL;
 static lv_obj_t *fm_list = NULL;
 static lv_obj_t *path_label = NULL;
-static lv_obj_t *viewer_screen = NULL;
-static lv_obj_t *viewer_textarea = NULL;
 static char selected_filepath[512] __attribute__((section(".psram_bss")));
 
 /*====================
@@ -98,6 +98,9 @@ static char ttf_file_path[256] = {0};
 static EpubReader *g_epub_reader = NULL;
 static EpubViewer *g_epub_viewer = NULL;
 
+/* TXT阅读器相关（与 epub 对偶，二者不同时存活） */
+static TxtViewer *g_txt_viewer = NULL;
+
 /*====================
  *   函数声明
  *====================*/
@@ -105,6 +108,7 @@ static EpubViewer *g_epub_viewer = NULL;
 static void refresh_file_list(const char *dir_path);
 static void show_file_action_menu(const char *filename);
 static void open_text_viewer(const char *filepath);
+static void async_open_txt_viewer_wrapper(void *arg);
 static void show_delete_confirm(const char *filepath);
 static void close_action_dialog(void);
 static void show_rename_keyboard(void *user_data);
@@ -176,9 +180,11 @@ void file_manager_print_memory_stats(const char *tag)
 
 /* 滑动区域回调 - 由驱动层在释放时调用（lv_port_indev.c）
  * delta_y > 0: 上滑（下一页）, delta_y < 0: 下滑（上一页）
+ * delta_x 横向距离，翻页器只按纵向翻页，忽略 x。
  */
-static void swipe_handler(int32_t delta_y)
+static void swipe_handler(int32_t delta_x, int32_t delta_y)
 {
+    (void)delta_x;
     printf("[FM] Swipe: delta=%d, page=%d/%d\n", delta_y, current_page, total_pages);
     
     if (delta_y > SWIPE_THRESHOLD) {
@@ -251,6 +257,21 @@ static void physical_back_btn_handler(void)
             }
         }
         /* 保存书签后统一走 file_manager_show 恢复 FM */
+        touch_register_swipe_callback(swipe_handler);
+        file_manager_show();
+        return;
+    }
+
+    /* TXT viewer 正在显示：保存书签后关闭，恢复 FM/书架
+     * （txt_viewer 每翻页已自动存书签，这里再存一次确保当前位置） */
+    if (g_txt_viewer) {
+        printf("[FM] Physical back: TXT viewer active, closing\n");
+        if (selected_filepath[0] != '\0') {
+            int off = txt_viewer_get_read_offset(g_txt_viewer);
+            int pct = txt_viewer_get_overall_pct(g_txt_viewer);
+            settings_save_bookmark(selected_filepath, 0, off, pct);
+            printf("[FM] TXT bookmark saved: off=%d pct=%d%%\n", off, pct);
+        }
         touch_register_swipe_callback(swipe_handler);
         file_manager_show();
         return;
@@ -331,29 +352,6 @@ static void file_btn_cb(lv_event_t *e)
     }
 }
 
-static void viewer_back_cb(lv_event_t *e)
-{
-    (void)e;
-    if (viewer_textarea) {
-        lv_obj_del(viewer_textarea);
-        viewer_textarea = NULL;
-    }
-    if (viewer_screen) {
-        lv_obj_del(viewer_screen);
-        viewer_screen = NULL;
-    }
-    if (g_txt_ui_return) {
-        void (*cb)(void) = g_txt_ui_return;
-        g_txt_ui_return = NULL;
-        cb();
-        return;
-    }
-    if (fm_screen) {
-        lv_disp_load_scr(fm_screen);
-    }
-    epd_mark_refresh_pending();
-}
-
 static void delete_confirm_cb(lv_event_t *e)
 {
     lv_obj_t *btn = lv_event_get_target(e);
@@ -384,7 +382,8 @@ static void action_btn_cb(lv_event_t *e)
     close_action_dialog();
     
     if (btn_idx == 0) {
-        open_text_viewer(selected_filepath);
+        g_txt_ui_return = NULL; /* 返回文件管理器 */
+        lv_async_call(async_open_txt_viewer_wrapper, selected_filepath);
     } else if (btn_idx == 1) {
         show_delete_confirm(selected_filepath);
     } else if (btn_idx == 2) {
@@ -1312,93 +1311,77 @@ static void show_file_action_menu(const char *filename)
 
 static void open_text_viewer(const char *filepath)
 {
-    FRESULT res;
-    FIL fp;
-    UINT br;
-    static char text_content[2048] __attribute__((section(".psram_bss")));
-    
-    printf("[FONT] Attempting to open: '%s' (len=%d)\n", filepath, (int)strlen(filepath));
-    res = f_open(&fp, filepath, FA_READ);
-    if (res != FR_OK) {
-        printf("[FM] Failed to open file: %s, error: %d\n", filepath, res);
+    printf("[FM] Opening TXT: %s\n", filepath);
+
+    /* 与 epub 一致：腾 PSRAM（停 HTTP、释放文件列表、准备字体） */
+    reader_stop_http_if_running();
+    fm_suspend_for_reader();
+
+    file_manager_print_memory_stats("before_prepare_reader_fonts(txt)");
+    file_manager_prepare_reader_fonts();
+    file_manager_print_memory_stats("after_prepare_reader_fonts(txt)");
+
+    /* 销毁前一个 txt viewer（若有） */
+    if (g_txt_viewer) {
+        txt_viewer_destroy(g_txt_viewer);
+        g_txt_viewer = NULL;
+    }
+
+    g_txt_viewer = txt_viewer_create(filepath);
+    if (!g_txt_viewer) {
+        printf("[FM] Failed to create TXT viewer\n");
+        fm_resume_after_reader();
+        loading_hide();
         return;
     }
-    
-    memset(text_content, 0, sizeof(text_content));
-    res = f_read(&fp, text_content, sizeof(text_content) - 1, &br);
-    f_close(&fp);
 
-    if (res != FR_OK) {
-        printf("[FM] Failed to read file, error: %d\n", res);
+    /* 关闭回调：统一走 file_manager_show，再按 g_txt_ui_return 分流 */
+    txt_viewer_set_close_cb(g_txt_viewer, file_manager_show);
+
+    txt_viewer_show(g_txt_viewer);
+
+    /* 恢复上次阅读位置（一次性渲染） */
+    int saved_chapter = 0, saved_offset = 0;
+    if (settings_load_bookmark(filepath, &saved_chapter, &saved_offset) == 0) {
+        printf("[FM] Restoring TXT bookmark: off=%d\n", saved_offset);
+        txt_viewer_goto_offset(g_txt_viewer, saved_offset);
+    } else {
+        txt_viewer_goto_offset(g_txt_viewer, 0);
+    }
+
+    loading_hide();   /* TXT 打开 + 首页渲染完成, 关闭 loading */
+}
+
+/* 阶段2：loading 遮罩上屏后执行真正的打开。
+ * 打开流程全程持 EPD 锁（lvgl_task 循环内），若立即执行，disp_task 拿不到锁，
+ * "Opening TXT..." 遮罩要等打开结束才上屏——先让遮罩刷完再打开。 */
+static void txt_open_stage2_cb(lv_timer_t *timer)
+{
+    extern volatile uint8_t epd_refresh_in_progress;
+    if (epd_refresh_in_progress) {
+        /* 遮罩的 EPD 刷新还在进行，稍后再试 */
+        lv_timer_set_period(timer, 200);
+        lv_timer_reset(timer);
         return;
     }
+    lv_timer_del(timer);
+    open_text_viewer(selected_filepath);
+}
 
-    /* 各类空白字符 → 半角空格，避免字体无字模显示成方框
-     * 覆盖: U+0009 Tab, U+00A0 NBSP, U+2000-200D, U+202F/205F,
-     *       U+3000 全角空格, U+FEFF BOM */
-    {
-        size_t i = 0, w = 0;
-        while (text_content[i] && w < sizeof(text_content) - 1) {
-            uint32_t u = 0;
-            int cl = 0;
-            unsigned char b0 = (unsigned char)text_content[i];
-            if (b0 < 0x80) { u = b0; cl = 1; }
-            else if ((b0 & 0xE0) == 0xC0 && text_content[i+1]) {
-                u = ((b0 & 0x1F) << 6) | ((unsigned char)text_content[i+1] & 0x3F); cl = 2;
-            } else if ((b0 & 0xF0) == 0xE0 && text_content[i+1] && text_content[i+2]) {
-                u = ((b0 & 0x0F) << 12) | (((unsigned char)text_content[i+1] & 0x3F) << 6)
-                   | ((unsigned char)text_content[i+2] & 0x3F); cl = 3;
-            } else if ((b0 & 0xF8) == 0xF0 && text_content[i+1] && text_content[i+2] && text_content[i+3]) {
-                u = ((b0 & 0x07) << 18) | (((unsigned char)text_content[i+1] & 0x3F) << 12)
-                   | (((unsigned char)text_content[i+2] & 0x3F) << 6) | ((unsigned char)text_content[i+3] & 0x3F); cl = 4;
-            } else { u = b0; cl = 1; }
+/* 阶段1：点击后立即渲染 "Opening TXT..." 遮罩并标记 EPD 刷新，让 disp_task
+ * 尽快上屏，延迟 ~800ms 再真正打开（打开时字体加载/排版持锁，遮罩会挡住反馈）。 */
+static void open_text_viewer_stage1(void)
+{
+    printf("[FM] Opening TXT: %s\n", selected_filepath);
+    loading_show("Opening TXT...");
+    lv_timer_t *t = lv_timer_create(txt_open_stage2_cb, 800, NULL);
+    if (t) lv_timer_set_repeat_count(t, 1);
+}
 
-            if (u == 0x09 || u == 0x00A0 || u == 0x3000 || u == 0x202F ||
-                u == 0x205F || u == 0xFEFF || (u >= 0x2000 && u <= 0x200D)) {
-                text_content[w++] = ' ';
-                i += cl;
-            } else {
-                for (int k = 0; k < cl && w < sizeof(text_content) - 1; k++)
-                    text_content[w++] = text_content[i++];
-            }
-        }
-        text_content[w] = '\0';
-    }
-    
-    viewer_screen = lv_obj_create(NULL);
-    
-    lv_obj_t *back_btn = lv_btn_create(viewer_screen);
-    lv_obj_set_size(back_btn, 60, 30);
-    lv_obj_align(back_btn, LV_ALIGN_TOP_LEFT, 5, 5);
-    fm_apply_static_btn_style(back_btn, 1, 0);
-    
-    lv_obj_t *back_label = lv_label_create(back_btn);
-    lv_label_set_text(back_label, "返回");
-    lv_obj_set_style_text_font(back_label, get_reader_font(), 0);
-    lv_obj_add_event_cb(back_btn, viewer_back_cb, LV_EVENT_CLICKED, NULL);
-    
-    const char *fname = strrchr(filepath, '/');
-    if (fname) fname++; else fname = filepath;
-    
-    lv_obj_t *title = lv_label_create(viewer_screen);
-    lv_label_set_text(title, fname);
-    lv_obj_set_style_text_font(title, get_reader_font(), 0);
-    lv_label_set_long_mode(title, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(title, 160);
-    lv_obj_align_to(title, back_btn, LV_ALIGN_OUT_RIGHT_MID, 5, 0);
-    
-    viewer_textarea = lv_textarea_create(viewer_screen);
-    lv_obj_set_size(viewer_textarea, 230, 340);
-    lv_obj_align(viewer_textarea, LV_ALIGN_BOTTOM_MID, 0, -10);
-    epd_disable_all_animations_recursive(viewer_textarea);
-    
-    lv_textarea_set_text(viewer_textarea, text_content);
-    lv_textarea_set_cursor_pos(viewer_textarea, 0);
-    lv_obj_set_style_text_font(viewer_textarea, get_reader_font(), 0);
-    lv_obj_add_flag(viewer_textarea, LV_OBJ_FLAG_SCROLLABLE);
-    
-    lv_disp_load_scr(viewer_screen);
-    epd_mark_refresh_pending();
+static void async_open_txt_viewer_wrapper(void *arg)
+{
+    (void)arg;
+    open_text_viewer_stage1();
 }
 
 /*====================
@@ -1463,9 +1446,32 @@ static void show_ota_confirm(const char *filepath)
  *   EPUB阅读器
  *====================*/
 
+/* 阶段2：loading 遮罩上屏后执行真正的 EPUB 打开（同 TXT，见 txt_open_stage2_cb） */
+static void epub_open_stage2_cb(lv_timer_t *timer)
+{
+    extern volatile uint8_t epd_refresh_in_progress;
+    if (epd_refresh_in_progress) {
+        lv_timer_set_period(timer, 200);
+        lv_timer_reset(timer);
+        return;
+    }
+    lv_timer_del(timer);
+    open_epub_viewer(selected_filepath);
+}
+
+/* 阶段1：立即显示 "Opening EPUB..." 遮罩，延迟后再真正打开 */
+static void open_epub_stage1(void)
+{
+    printf("[FM] Opening EPUB: %s\n", selected_filepath);
+    loading_show("Opening EPUB...");
+    lv_timer_t *t = lv_timer_create(epub_open_stage2_cb, 800, NULL);
+    if (t) lv_timer_set_repeat_count(t, 1);
+}
+
 static void async_open_epub_wrapper(void *arg)
 {
-    open_epub_viewer((const char *)arg);
+    (void)arg;
+    open_epub_stage1();
 }
 
 static int ensure_ttf_path_discovered(void)
@@ -1550,6 +1556,8 @@ static int ensure_reader_font_loaded(void)
     print_memory_stats_internal("after_create_file_font");
     if (custom_ttf_font != NULL) {
         custom_ttf_font->fallback = &lv_font_misans_16;
+        /* 通知 font_warm: 阅读器现正使用共享 L1 缓存, 不得释放/重初始化 */
+        font_warm_reader_active(true);
         font_priority_loader_init();
         font_priority_loader_set_font(custom_ttf_font);
         if (lv_tiny_ttf_level1_ready() && font_warm_path_matches(ttf_file_path)) {
@@ -1560,6 +1568,11 @@ static int ensure_reader_font_loaded(void)
             if (loaded <= 0) {
                 printf("[FONT] Level1 preload failed (%d), keep TTF for stbtt streaming\n", loaded);
             }
+        }
+        /* 共享缓存已就绪且被阅读器引用: 标记 warm 并取消后续 boot warm,
+         * 避免二次加载破坏字体 / 重复预热。 */
+        if (lv_tiny_ttf_level1_ready()) {
+            font_warm_mark_loaded(ttf_file_path);
         }
         return 0;
     }
@@ -1590,6 +1603,8 @@ static void release_reader_fonts(void)
         lv_tiny_ttf_destroy(custom_ttf_font);
         custom_ttf_font = NULL;
     }
+    /* 阅读器不再占用共享 L1 缓存, 允许 font_warm 之后再预热 */
+    font_warm_reader_active(false);
     /* 保留开机预热的共享 L1 缓存，下次开书不再读 SD */
     ttf_load_attempted = false;
     font_priority_loader_set_font(NULL);
@@ -1597,12 +1612,77 @@ static void release_reader_fonts(void)
 #endif
 }
 
+/*====================
+ *   打开失败提示对话框 (模态, 点任意处关闭)
+ *====================*/
+
+extern const lv_font_t lv_font_montserrat_12;
+static lv_obj_t *g_fm_err_dialog = NULL;
+
+static void fm_err_dialog_dismiss_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_fm_err_dialog) {
+        lv_obj_del(g_fm_err_dialog);
+        g_fm_err_dialog = NULL;
+        epd_mark_refresh_pending();
+    }
+}
+
+static void fm_show_error_dialog(const char *title, const char *msg)
+{
+    if (g_fm_err_dialog) {
+        lv_obj_del(g_fm_err_dialog);
+        g_fm_err_dialog = NULL;
+    }
+
+    /* 全屏遮罩: 点任意处关闭 (与 http 对话框一致) */
+    lv_obj_t *bg = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_90, 0);
+    lv_obj_add_flag(bg, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(bg, fm_err_dialog_dismiss_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *box = lv_obj_create(bg);
+    lv_obj_set_size(box, 210, 150);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(box, lv_color_white(), 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_border_color(box, lv_color_black(), 0);
+    lv_obj_set_style_radius(box, 8, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *t = lv_label_create(box);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_font(t, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(t, lv_color_black(), 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 10);
+
+    lv_obj_t *m = lv_label_create(box);
+    lv_label_set_long_mode(m, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(m, 190);
+    lv_label_set_text(m, msg);
+    lv_obj_set_style_text_font(m, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(m, lv_color_black(), 0);
+    lv_obj_align(m, LV_ALIGN_TOP_MID, 0, 42);
+
+    lv_obj_t *hint = lv_label_create(box);
+    lv_label_set_text(hint, "点按任意处关闭");
+    lv_obj_set_style_text_font(hint, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(hint, lv_color_make(90, 90, 90), 0);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -8);
+
+    g_fm_err_dialog = bg;
+    printf("[FM] Error dialog: %s - %s\n", title, msg);
+    epd_mark_refresh_pending();
+}
+
 static void open_epub_viewer(const char *filepath)
 {
     printf("[FM] Opening EPUB: %s\n", filepath);
-
-    /* loading: WiFi 断开(500ms) + EPUB 解析 + 首页渲染要数秒, 先给反馈 */
-    loading_show("Opening EPUB...");
 
     /* 【内存优化】EPUB 打开时强制断开 WiFi, 释放 SRAM 给 inflate / 缓存
      * 现象: EPUB 开启后立即 inflate 申请 32KB 失败 (heap exhausted),
@@ -1645,15 +1725,20 @@ static void open_epub_viewer(const char *filepath)
         printf("[FM] Failed to create EPUB reader\n");
         fm_resume_after_reader();
         loading_hide();
+        fm_show_error_dialog("无法打开 EPUB", "创建阅读器失败(内存不足)");
         return;
     }
 
     if (!epub_reader_open(g_epub_reader, filepath)) {
+        char reason[192];
+        strncpy(reason, epub_reader_get_last_error(g_epub_reader), sizeof(reason) - 1);
+        reason[sizeof(reason) - 1] = '\0';
         printf("[FM] Failed to open EPUB file\n");
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
         fm_resume_after_reader();
         loading_hide();
+        fm_show_error_dialog("无法打开 EPUB", reason);
         return;
     }
 
@@ -1688,9 +1773,9 @@ static void open_epub_viewer(const char *filepath)
     if (settings_load_bookmark(filepath, &saved_chapter, &saved_offset) == 0) {
         printf("[FM] Restoring bookmark: ch=%d off=%d (single render)\n", saved_chapter, saved_offset);
         /* goto_chapter直接使用saved_offset，只渲染一次 */
-        epub_viewer_goto_chapter(g_epub_viewer, saved_chapter, saved_offset);
+        epub_viewer_goto_chapter(g_epub_viewer, saved_chapter, saved_offset, NULL);
     } else {
-        epub_viewer_goto_chapter(g_epub_viewer, 0, 0);
+        epub_viewer_goto_chapter(g_epub_viewer, 0, 0, NULL);
     }
 
     loading_hide();   /* EPUB 打开 + 首页渲染完成, 关闭 loading */
@@ -1700,9 +1785,20 @@ static void open_epub_viewer(const char *filepath)
  *   关闭文件管理器
  *====================*/
 
+/* 把物理返回键处理交回 FM 处理器。
+ * 书架打开阅读器后调用, 使阅读中按物理返回能通过 g_reader_ui_return
+ * 回到正确来源界面(书架/FM), 而不是误回主页。 */
+void fm_assign_physical_back(void)
+{
+    touch_register_back_btn_callback(physical_back_btn_handler);
+}
+
 void file_manager_close(void)
 {
     printf("[FM] Closing File Manager...\n");
+
+    /* 清理物理返回回调, 回到主页后不再响应返回键 */
+    touch_register_back_btn_callback(NULL);
 
     /* XR872 修复: 退出 FM 恢复 WiFi 重试
      * 进入 FM/EPUB 时设了 fm_paused=1 让 wc_task 暂停, 退出时清掉并重启 WiFi */
@@ -1716,10 +1812,8 @@ void file_manager_close(void)
     touch_clear_swipe_callback();
     
     /* 删除所有FM相关对象 */
-    if (viewer_textarea) { lv_obj_del(viewer_textarea); viewer_textarea = NULL; }
-    if (viewer_screen) { lv_obj_del(viewer_screen); viewer_screen = NULL; }
     if (fm_list) { lv_obj_del(fm_list); fm_list = NULL; }
-    
+
     /* 清理epub资源 */
     if (g_epub_viewer) {
         epub_viewer_destroy(g_epub_viewer);
@@ -1728,6 +1822,12 @@ void file_manager_close(void)
     if (g_epub_reader) {
         epub_reader_destroy(g_epub_reader);
         g_epub_reader = NULL;
+    }
+
+    /* 清理txt阅读器资源 */
+    if (g_txt_viewer) {
+        txt_viewer_destroy(g_txt_viewer);
+        g_txt_viewer = NULL;
     }
     
     /* 清理分页系统资源 */
@@ -1761,32 +1861,49 @@ static void file_manager_show_async(void *user_data)
 {
     (void)user_data;
 
-    printf("[FM] Return from EPUB (cleanup)...\n");
+    printf("[FM] Return from reader (cleanup)...\n");
 
     g_rendering_in_progress = 0;
 
-    EpubViewer *v = g_epub_viewer;
-    EpubReader *r = g_epub_reader;
+    EpubViewer *ev = g_epub_viewer;
+    EpubReader *er = g_epub_reader;
+    TxtViewer *tv = g_txt_viewer;
     g_epub_viewer = NULL;
     g_epub_reader = NULL;
+    g_txt_viewer = NULL;
 
-    if (v) {
-        epub_viewer_set_close_cb(v, NULL);
-        epub_viewer_destroy(v);
+    if (ev) {
+        epub_viewer_set_close_cb(ev, NULL);
+        epub_viewer_destroy(ev);
     }
-    if (r) {
+    if (er) {
         printf("[FM] Destroying EPUB reader (return from EPUB)\n");
-        epub_reader_destroy(r);
+        epub_reader_destroy(er);
+    }
+    if (tv) {
+        printf("[FM] Destroying TXT viewer (return from TXT)\n");
+        txt_viewer_set_close_cb(tv, NULL);
+        txt_viewer_destroy(tv);
     }
 
     release_reader_fonts();
     fm_resume_after_reader();
 
-    /* 书架等外部调用方：清理后回到其 UI */
+    /* 书架等外部调用方：清理后回到其 UI（EPUB / TXT 共用同一路径） */
     if (g_reader_ui_return) {
         void (*cb)(void) = g_reader_ui_return;
         g_reader_ui_return = NULL;
         printf("[FM] Returning to external UI after EPUB\n");
+        cb();
+        epd_resume_refresh();
+        epd_mark_refresh_pending();
+        g_fm_show_pending = 0;
+        return;
+    }
+    if (g_txt_ui_return) {
+        void (*cb)(void) = g_txt_ui_return;
+        g_txt_ui_return = NULL;
+        printf("[FM] Returning to external UI after TXT\n");
         cb();
         epd_resume_refresh();
         epd_mark_refresh_pending();
@@ -1805,6 +1922,7 @@ static void file_manager_show_async(void *user_data)
     lv_disp_load_scr(fm_screen);
 
     touch_register_swipe_callback(swipe_handler);
+    touch_register_back_btn_callback(physical_back_btn_handler);
 
     refresh_file_list(current_path);
 
@@ -1840,7 +1958,8 @@ void file_manager_open_txt(const char *filepath, void (*on_ui_return)(void))
     strncpy(selected_filepath, filepath, sizeof(selected_filepath) - 1);
     selected_filepath[sizeof(selected_filepath) - 1] = '\0';
     g_txt_ui_return = on_ui_return;
-    open_text_viewer(selected_filepath);
+    /* 异步打开，让调用方（动作对话框等）先拆除自己 */
+    lv_async_call(async_open_txt_viewer_wrapper, selected_filepath);
 }
 
 void file_manager_show(void)
@@ -1903,7 +2022,7 @@ void file_manager_init(void)
     
     lv_obj_t *close_btn = lv_btn_create(fm_screen);
     lv_obj_set_size(close_btn, 60, 30);  // 增大按钮尺寸以提高点击准确率
-    lv_obj_align(close_btn, LV_ALIGN_TOP_RIGHT, -2, 2);
+    lv_obj_align(close_btn, LV_ALIGN_TOP_LEFT, 2, 2);
     epd_disable_animations(close_btn);
     
     lv_obj_t *close_label = lv_label_create(close_btn);

@@ -69,6 +69,32 @@ void file_manager_print_memory_stats(const char *tag);
 
 void epd_disable_all_animations_recursive(lv_obj_t *obj);
 
+/**
+ * @brief 打开 EPUB（复用 FM 阅读器管道）
+ * @param filepath FatFs 路径
+ * @param on_ui_return 关闭阅读器后的 UI 回调；NULL 则返回文件管理器
+ */
+void file_manager_open_epub(const char *filepath, void (*on_ui_return)(void));
+
+/**
+ * @brief 打开 TXT 简易查看器
+ * @param filepath FatFs 路径
+ * @param on_ui_return 点「返回」后的回调；NULL 则返回文件管理器屏幕
+ */
+void file_manager_open_txt(const char *filepath, void (*on_ui_return)(void));
+
+/**
+ * @brief 从阅读器返回时的统一清理入口（书架/FM 共用）
+ *        通常由 EPUB close_cb 触发，外部也可在需要时调用。
+ */
+void file_manager_show(void);
+
+/**
+ * @brief 把物理返回键处理交回 FM 处理器
+ *        书架打开阅读器后调用, 使阅读中按物理返回能正确回到来源界面。
+ */
+void fm_assign_physical_back(void);
+
 #ifdef __cplusplus
 }
 #endif

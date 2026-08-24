@@ -65,4 +65,33 @@ int CHSC6540_ScanDevice(void);
  */
 void CHSC6540_DeInit(void);
 
+/*
+ * ==================== 触摸坐标仿射校准 ====================
+ * 面板原始坐标范围 > 屏幕分辨率, 驱动不做映射直接透传给 LVGL
+ * 会导致"按 G 出 V"这类错位, 且底部/右侧误差随坐标增大。
+ * 校准映射:  display = raw * num / den + off   (每个轴独立)
+ * 默认恒等 (num=den=1000, off=0), 不校准时行为不变。
+ * =======================================================
+ */
+
+/**
+ * @brief 设置触摸校准参数 (每轴: display = raw * num / den + off)
+ * @param sx_num,sx_den,sx_off  X 轴比例分子/分母/偏移
+ * @param sy_num,sy_den,sy_off  Y 轴比例分子/分母/偏移
+ */
+void CHSC6540_SetCalibration(int32_t sx_num, int32_t sx_den, int32_t sx_off,
+                             int32_t sy_num, int32_t sy_den, int32_t sy_off);
+
+/**
+ * @brief 重置为恒等映射 (关闭校准)
+ */
+void CHSC6540_ResetCalibration(void);
+
+/**
+ * @brief 获取最近一次成功读取的原始(未校准)坐标
+ * @param x Pointer to store raw X
+ * @param y Pointer to store raw Y
+ */
+void CHSC6540_GetLastRaw(uint16_t *x, uint16_t *y);
+
 #endif /* _CHSC6540_H_ */

@@ -5,7 +5,7 @@
   3.52 寸 E-Ink · LVGL 图形库 · EPUB/TXT 阅读 · WiFi 传书 · 低功耗待机
 </p>
 <p align="center">
-  <img src="https://img.shields.io/badge/version-V0.9a-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/version-V0.9A-blue?style=flat-square" alt="Version">
   <img src="https://img.shields.io/badge/chip-XR872-orange?style=flat-square" alt="Chip">
   <img src="https://img.shields.io/badge/display-3.7%22%20E--Ink-lightgrey?style=flat-square" alt="Display">
   <img src="https://img.shields.io/badge/GUI-LVGL-02D3A9?style=flat-square" alt="GUI">

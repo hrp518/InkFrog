@@ -1,7 +1,5 @@
 ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.o: \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.c \
- ../../../../project/common/prj_conf_opt.h \
- ../../../../project/demo/FontExp/prj_config.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/../../../lvgl.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/../../../../lvgl.h \
@@ -201,10 +199,6 @@
  ../../../../include/types.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/stb_rect_pack.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/stb_truetype_htcw.h
-
-../../../../project/common/prj_conf_opt.h:
-
-../../../../project/demo/FontExp/prj_config.h:
 
 ../../../../project/demo/FontExp/lvgl/src/extra/libs/tiny_ttf/lv_tiny_ttf.h:
 

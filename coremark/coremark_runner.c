@@ -8,6 +8,8 @@
 #include "coremark_runner.h"
 #include "kernel/os/os.h"
 #include "lvgl/lvgl.h"
+#include "lv_port_disp.h"
+#include "lv_port_indev.h"
 #include "epd.h"
 #include <stdio.h>
 #include <string.h>
@@ -24,11 +26,17 @@ extern float coremark_get_score(void);
 static OS_Thread_t g_coremark_thread;
 static volatile float g_final_score = 0.0f;
 
+/* 结果页返回 (屏幕返回与物理返回共用) */
+static void coremark_back_do(void) {
+    printf("[CoreMark] Back triggered\n");
+    main_ui_create();
+    epd_mark_refresh_pending();
+}
+
 static void coremark_back_btn_cb(lv_event_t *e) {
     (void)e;
     printf("[CoreMark] Back button clicked\n");
-    main_ui_create();
-    epd_mark_refresh_pending();
+    coremark_back_do();
 }
 
 static void show_result_screen(float score) {
@@ -88,11 +96,22 @@ static void show_result_screen(float score) {
     lv_obj_align(btn_back_label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_add_event_cb(btn_back, coremark_back_btn_cb, LV_EVENT_CLICKED, NULL);
 
+    /* 绑定物理返回键: 与结果屏 Back 按钮等效 */
+    touch_register_back_btn_callback(coremark_back_do);
+
     printf("[CoreMark] Result screen created, score=%.2f\n", score);
 }
 
 static void coremark_thread_func(void *arg) {
     (void)arg;
+
+    /* 先把 "CoreMark Running..." 真正刷到 EPD 再跑，否则画面停在上一屏(像卡死)。
+     * coremark_runner_start 里只标记了 pending；disp_task 需等 lvgl 释放 EPD 锁
+     * 才会整帧刷新。这里以睡眠让步等待刷新结束(最高约 12s)，期间 lvgl/disp 正常调度。 */
+    for (int i = 0; i < 600; i++) {
+        if (!epd_refresh_in_progress && !epd_refresh_requested) break;
+        OS_MSleep(20);
+    }
 
     printf("[CoreMark] Thread started, pausing EPD refresh...\n");
     epd_pause_refresh();
@@ -153,10 +172,7 @@ int coremark_runner_start(void)
     epd_resume_refresh();
     epd_mark_refresh_pending();
 
-    printf("[CoreMark] Waiting for EPD to show 'Running...' screen...\n");
-    OS_Sleep(3);
-
-    printf("[CoreMark] Starting benchmark thread (HIGH priority)...\n");
+    printf("[CoreMark] Starting benchmark thread (HIGH priority), waiting EPD flush...\n");
 
     if (!OS_ThreadIsValid(&g_coremark_thread)) {
         OS_Status ret = OS_ThreadCreate(&g_coremark_thread,

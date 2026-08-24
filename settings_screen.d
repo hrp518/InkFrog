@@ -198,6 +198,8 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
  ../../../../project/demo/FontExp/wlan_manager.h \
  ../../../../project/demo/FontExp/settings_storage.h \
+ ../../../../project/demo/FontExp/chsc6540.h \
+ ../../../../project/demo/FontExp/lv_port_indev.h \
  ../../../../project/demo/FontExp/font_warm.h \
  ../../../../project/demo/FontExp/wifi_controller.h \
  ../../../../project/demo/FontExp/epd.h \
@@ -211,7 +213,10 @@
  ../../../../include/kernel/os/os_semaphore.h \
  ../../../../include/kernel/os/os_mutex.h \
  ../../../../include/kernel/os/os_timer.h \
- ../../../../include/sys/sys_heap.h
+ ../../../../include/sys/sys_heap.h \
+ ../../../../project/demo/FontExp/version.h \
+ ../../../../project/demo/FontExp/avatar_eink_img.h \
+ ../../../../project/demo/FontExp/logo_eink_img.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -609,6 +614,10 @@
 
 ../../../../project/demo/FontExp/settings_storage.h:
 
+../../../../project/demo/FontExp/chsc6540.h:
+
+../../../../project/demo/FontExp/lv_port_indev.h:
+
 ../../../../project/demo/FontExp/font_warm.h:
 
 ../../../../project/demo/FontExp/wifi_controller.h:
@@ -642,3 +651,9 @@
 ../../../../include/kernel/os/os_timer.h:
 
 ../../../../include/sys/sys_heap.h:
+
+../../../../project/demo/FontExp/version.h:
+
+../../../../project/demo/FontExp/avatar_eink_img.h:
+
+../../../../project/demo/FontExp/logo_eink_img.h:

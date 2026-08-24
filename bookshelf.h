@@ -13,6 +13,10 @@ extern "C" {
 /** 启动书架界面（调用方需已挂载 SD） */
 void bookshelf_init(void);
 
+/** 进入书架：先推"正在解析..."遮罩并刷新到屏，下一拍才真正扫描解析（避免
+ *  解析期间屏幕无反馈被当成卡死）。调用方需已挂载 SD。 */
+void bookshelf_begin_load(void);
+
 /** 关闭书架并返回主界面 */
 void bookshelf_close(void);
 

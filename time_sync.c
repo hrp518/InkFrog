@@ -5,6 +5,7 @@
 #include "time_sync.h"
 #include "net/sntp/sntp.h"
 #include "kernel/os/os.h"
+#include "wlan_manager.h"
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -85,6 +86,16 @@ int time_sync_from_ntsc(void)
         return -1;
     }
     s_syncing = 1;
+
+    /* 未连上网就不做 NTP: 没网时 sntp_set_server/sntp_get_time 仍会做同步
+     * DNS 解析, 每次 ~7s 超时, set_server×2 + query主备 共白耗 ~29s, 且
+     * 覆盖"已配置 SSID 但没连上"的情况 (wlan_manager_is_connected 查 netif
+     * 是否 up 且有 IP, 比仅判 SSID 非空可靠)。 */
+    if (!wlan_manager_is_connected()) {
+        printf("[TIME] WiFi not connected, skip NTP\r\n");
+        s_syncing = 0;
+        return -1;
+    }
 
     printf("[TIME] NTP sync via %s (CST+8)\r\n", NTSC_NTP_SERVER);
 

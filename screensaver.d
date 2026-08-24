@@ -5,6 +5,15 @@
  ../../../../include/libc/stdio.h \
  ../../../../project/demo/FontExp/screensaver.h \
  ../../../../project/demo/FontExp/lv_port_indev.h \
+ ../../../../project/demo/FontExp/sd_recovery.h \
+ ../../../../include/kernel/os/os.h \
+ ../../../../include/kernel/os/os_time.h \
+ ../../../../include/kernel/os/os_common.h ../../../../include/compiler.h \
+ ../../../../include/kernel/os/os_thread.h \
+ ../../../../include/kernel/os/os_queue.h \
+ ../../../../include/kernel/os/os_semaphore.h \
+ ../../../../include/kernel/os/os_mutex.h \
+ ../../../../include/kernel/os/os_timer.h \
  ../../../../project/demo/FontExp/lvgl/lvgl.h \
  ../../../../project/demo/FontExp/lvgl/src/misc/lv_log.h \
  ../../../../project/demo/FontExp/lvgl/src/misc/../lv_conf_internal.h \
@@ -198,14 +207,7 @@
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/lv_msgbox.h \
  ../../../../project/demo/FontExp/lvgl/src/extra/widgets/msgbox/../../../lvgl.h \
  ../../../../include/fs/fatfs/ff.h ../../../../include/fs/fatfs/integer.h \
- ../../../../include/fs/fatfs/ffconf.h ../../../../include/kernel/os/os.h \
- ../../../../include/kernel/os/os_time.h \
- ../../../../include/kernel/os/os_common.h ../../../../include/compiler.h \
- ../../../../include/kernel/os/os_thread.h \
- ../../../../include/kernel/os/os_queue.h \
- ../../../../include/kernel/os/os_semaphore.h \
- ../../../../include/kernel/os/os_mutex.h \
- ../../../../include/kernel/os/os_timer.h \
+ ../../../../include/fs/fatfs/ffconf.h \
  ../../../../project/common/framework/fs_ctrl.h \
  ../../../../project/common/framework/sys_ctrl/sys_ctrl.h \
  ../../../../project/common/framework/sys_ctrl/event_queue.h \
@@ -238,11 +240,16 @@
  ../../../../include/driver/cmsis/core_cmFunc.h \
  ../../../../include/driver/cmsis/core_cmSimd.h \
  ../../../../include/driver/chip/hal_ccm.h \
- ../../../../include/driver/chip/hal_gpio.h ../../../../include/pm/pm.h \
+ ../../../../include/driver/chip/hal_gpio.h \
+ ../../../../include/driver/chip/hal_nvic.h ../../../../include/pm/pm.h \
  ../../../../include/driver/chip/hal_i2c.h \
+ ../../../../include/driver/chip/hal_adc.h \
  ../../../../include/driver/chip/sdmmc/sdmmc.h \
  ../../../../include/driver/chip/sdmmc/card.h \
- ../../../../include/driver/chip/sdmmc/hal_sdhost.h
+ ../../../../include/driver/chip/sdmmc/hal_sdhost.h \
+ ../../../../project/demo/FontExp/chsc6540.h \
+ ../../../../project/demo/FontExp/charge_mode.h \
+ ../../../../project/demo/FontExp/loading.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -253,6 +260,26 @@
 ../../../../project/demo/FontExp/screensaver.h:
 
 ../../../../project/demo/FontExp/lv_port_indev.h:
+
+../../../../project/demo/FontExp/sd_recovery.h:
+
+../../../../include/kernel/os/os.h:
+
+../../../../include/kernel/os/os_time.h:
+
+../../../../include/kernel/os/os_common.h:
+
+../../../../include/compiler.h:
+
+../../../../include/kernel/os/os_thread.h:
+
+../../../../include/kernel/os/os_queue.h:
+
+../../../../include/kernel/os/os_semaphore.h:
+
+../../../../include/kernel/os/os_mutex.h:
+
+../../../../include/kernel/os/os_timer.h:
 
 ../../../../project/demo/FontExp/lvgl/lvgl.h:
 
@@ -644,24 +671,6 @@
 
 ../../../../include/fs/fatfs/ffconf.h:
 
-../../../../include/kernel/os/os.h:
-
-../../../../include/kernel/os/os_time.h:
-
-../../../../include/kernel/os/os_common.h:
-
-../../../../include/compiler.h:
-
-../../../../include/kernel/os/os_thread.h:
-
-../../../../include/kernel/os/os_queue.h:
-
-../../../../include/kernel/os/os_semaphore.h:
-
-../../../../include/kernel/os/os_mutex.h:
-
-../../../../include/kernel/os/os_timer.h:
-
 ../../../../project/common/framework/fs_ctrl.h:
 
 ../../../../project/common/framework/sys_ctrl/sys_ctrl.h:
@@ -730,12 +739,22 @@
 
 ../../../../include/driver/chip/hal_gpio.h:
 
+../../../../include/driver/chip/hal_nvic.h:
+
 ../../../../include/pm/pm.h:
 
 ../../../../include/driver/chip/hal_i2c.h:
+
+../../../../include/driver/chip/hal_adc.h:
 
 ../../../../include/driver/chip/sdmmc/sdmmc.h:
 
 ../../../../include/driver/chip/sdmmc/card.h:
 
 ../../../../include/driver/chip/sdmmc/hal_sdhost.h:
+
+../../../../project/demo/FontExp/chsc6540.h:
+
+../../../../project/demo/FontExp/charge_mode.h:
+
+../../../../project/demo/FontExp/loading.h:

@@ -25,7 +25,8 @@
  ../../../../include/kernel/os/os_queue.h \
  ../../../../include/kernel/os/os_semaphore.h \
  ../../../../include/kernel/os/os_mutex.h \
- ../../../../include/kernel/os/os_timer.h
+ ../../../../include/kernel/os/os_timer.h \
+ ../../../../project/demo/FontExp/wlan_manager.h
 
 ../../../../project/common/prj_conf_opt.h:
 
@@ -84,3 +85,5 @@
 ../../../../include/kernel/os/os_mutex.h:
 
 ../../../../include/kernel/os/os_timer.h:
+
+../../../../project/demo/FontExp/wlan_manager.h:

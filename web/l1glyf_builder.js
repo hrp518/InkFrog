@@ -16,6 +16,9 @@
   /* LEVEL1_CHARS replaced by tools/gen_l1glyf_web_js.py */
   var LEVEL1_CHARS = window.__LEVEL1_CHARS__ || [];
 
+  /* in-flight XHR for the TTF upload chain (cancellable via abortActive) */
+  var activeXhr = null;
+
   var crcTable = (function () {
     var t = new Uint32Array(256);
     for (var n = 0; n < 256; n++) {
@@ -291,22 +294,43 @@
           if (e.lengthComputable) onProgress(e.loaded, e.total);
         };
       }
+      activeXhr = xhr;
       xhr.onload = function () {
+        if (activeXhr === xhr) activeXhr = null;
         if (xhr.status === 200) resolve(xhr.responseText);
         else reject(new Error('HTTP ' + xhr.status + ' ' + xhr.responseText));
       };
-      xhr.onerror = function () { reject(new Error('network')); };
+      xhr.onerror = function () {
+        if (activeXhr === xhr) activeXhr = null;
+        reject(new Error('network'));
+      };
+      xhr.onabort = function () {
+        if (activeXhr === xhr) activeXhr = null;
+        reject(new Error('aborted'));
+      };
       xhr.send(fileOrBlob);
     });
+  }
+
+  function abortActive() {
+    if (activeXhr) {
+      var x = activeXhr;
+      activeXhr = null;
+      x.abort();
+      return true;
+    }
+    return false;
   }
 
   /** Font dir TTF: build l1glyf then upload .l1glyf then .ttf (sequential) */
   function uploadTtfWithCache(file, fontPath, hooks) {
     hooks = hooks || {};
     return buildFromFile(file).then(function (built) {
+      if (hooks.isCancelled && hooks.isCancelled()) throw new Error('aborted');
       if (hooks.onBuilt) hooks.onBuilt(built.stats);
       if (hooks.onPhase) hooks.onPhase('l1glyf', built.name);
       return uploadRaw(built.blob, '0:/Font/.l1glyf', built.name, hooks.onProgress).then(function () {
+        if (hooks.isCancelled && hooks.isCancelled()) throw new Error('aborted');
         if (hooks.onPhase) hooks.onPhase('ttf', file.name);
         return uploadRaw(file, fontPath, file.name, hooks.onProgress);
       });
@@ -317,6 +341,7 @@
     buildFromFile: buildFromFile,
     buildFromBuffer: buildFromBuffer,
     uploadRaw: uploadRaw,
-    uploadTtfWithCache: uploadTtfWithCache
+    uploadTtfWithCache: uploadTtfWithCache,
+    abortActive: abortActive
   };
 })(typeof window !== 'undefined' ? window : this);

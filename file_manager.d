@@ -213,12 +213,15 @@
  ../../../../project/demo/FontExp/epub_reader.h \
  ../../../../project/demo/FontExp/third_party/miniz/miniz.h \
  ../../../../project/demo/FontExp/epub_viewer.h \
+ ../../../../project/demo/FontExp/txt_viewer.h \
  ../../../../project/demo/FontExp/settings_storage.h \
  ../../../../project/demo/FontExp/font_priority_loader.h \
+ ../../../../project/demo/FontExp/loading.h \
  ../../../../project/demo/FontExp/font_warm.h \
  ../../../../project/demo/FontExp/wifi_controller.h \
  ../../../../project/demo/FontExp/wlan_manager.h \
  ../../../../project/demo/FontExp/http_server.h \
+ ../../../../project/demo/FontExp/fm_ota.h \
  ../../../../include/sys/dma_heap.h ../../../../include/types.h
 
 ../../../../project/common/prj_conf_opt.h:
@@ -653,9 +656,13 @@
 
 ../../../../project/demo/FontExp/epub_viewer.h:
 
+../../../../project/demo/FontExp/txt_viewer.h:
+
 ../../../../project/demo/FontExp/settings_storage.h:
 
 ../../../../project/demo/FontExp/font_priority_loader.h:
+
+../../../../project/demo/FontExp/loading.h:
 
 ../../../../project/demo/FontExp/font_warm.h:
 
@@ -664,6 +671,8 @@
 ../../../../project/demo/FontExp/wlan_manager.h:
 
 ../../../../project/demo/FontExp/http_server.h:
+
+../../../../project/demo/FontExp/fm_ota.h:
 
 ../../../../include/sys/dma_heap.h:
 

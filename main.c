@@ -46,6 +46,9 @@
 #include "bookshelf.h"
 #include "clock_mode.h"
 #include "charge_mode.h"
+#include "loading.h"
+#include "boot_screen.h"
+#include "sd_recovery.h"
 
 extern const lv_font_t lv_font_montserrat_12;
 
@@ -80,6 +83,7 @@ static lv_obj_t *g_http_dialog_bg = NULL;
 static lv_obj_t *g_vbat_label = NULL;
 static char g_vbat_text[16] = "";
 static uint8_t g_adc_inited = 0;
+static volatile int g_vbat_retry_countdown = 0;   /* ADC 读失败后快速重试计数 (20ms/格) */
 
 /* Home 顶部 WiFi 图标 (仅 CONNECTED 时显示) */
 static lv_obj_t *g_wifi_icon_label = NULL;
@@ -129,12 +133,18 @@ extern void platform_init(void);
 /* 省电优化: 仅 level0 (flash/image/PSRAM/cache), 跳过 level1(WiFi)/level2(SD)。
  * platform_init_level0 是 __weak 函数(platform_init.c:548), 未在头文件声明。 */
 extern void platform_init_level0(void);
+/* 拆开 level1/level2: 让 boot_screen 能在 level0 之后、WiFi 之前显示。 */
+extern void platform_init_level1(void);
+extern void platform_init_level2(void);
 
 /* 前向声明 - 解决main_ui_create在定义前被调用的问题 */
 void main_ui_create(void);
 static void settings_btn_event_handler(lv_event_t * e);
 static void settings_sleep_clock_btn_cb(lv_event_t * e);
 static void settings_sd_diag_btn_cb(lv_event_t *e);
+static void coremark_btn_event_handler(lv_event_t *e);
+static void settings_test_project_btn_cb(lv_event_t *e);
+static void clock_nowifi_dialog(void);
 
 /*====================
  * SD卡测试函数
@@ -292,12 +302,18 @@ static FRESULT fatfs_scan_files(char *path)
     
     static char path_stack[MAX_PATH_STACK][256];
     static int stack_top = 0;
+    int scanned_dirs = 0;
     
     /* 初始化 - 将根目录压入栈 */
     strcpy(path_stack[0], path);
     stack_top = 1;
     
     while (stack_top > 0) {
+        /* 防垃圾文件系统 (格式化中断/卡损坏) 导致无限遍历 */
+        if (++scanned_dirs > MAX_PATH_STACK * 4) {
+            printf("[FatFs WRN] scan aborted: too many dirs, FS may be corrupted\n");
+            break;
+        }
         /* 弹出栈顶目录 */
         stack_top--;
         strcpy(path, path_stack[stack_top]);
@@ -315,12 +331,14 @@ static FRESULT fatfs_scan_files(char *path)
             if (res != FR_OK || fno.fname[0] == 0) break;
             
             if (fno.fattrib & AM_DIR) {
-                /* 是目录 - 压入栈中待后续处理 */
-                if (stack_top < MAX_PATH_STACK - 1) {
+                /* 是目录 - 压入栈中待后续处理; 长度超限跳过,
+                 * 防止垃圾文件名把 256B 路径缓冲打爆 (历史 usage fault) */
+                if (stack_top < MAX_PATH_STACK - 1 &&
+                    (int)strlen(path) + 1 + (int)strlen(fno.fname) < 256) {
                     sprintf(path_stack[stack_top], "%s/%s", path, fno.fname);
                     stack_top++;
                 } else {
-                    printf("[FatFs WRN] Path stack full, skip dir: %s/%s\r\n", path, fno.fname);
+                    printf("[FatFs WRN] Path stack full / path too long, skip dir: %s/%s\r\n", path, fno.fname);
                 }
             } else {
                 /* 是文件 - 不再打印 (减少启动日志) */
@@ -414,15 +432,19 @@ static void fatfs_filesystem_test(void)
     /* 1. 挂载文件系统 */
     printf("[1/3] Mount FatFs File System...\r\n");
     if (fs_ctrl_mount(FS_MNT_DEV_TYPE_SDCARD, 0) != 0) {
-        printf("[ERROR] Mount failed!\r\n");
+        printf("[ERROR] Mount failed! (用控制台 'format yes' 可重建卷)\r\n");
         return;
     }
     printf("[OK] FatFs mounted successfully\r\n\r\n");
-    
+
     /* 2. 获取容量信息 */
     printf("[2/3] Get Card Capacity Info...\r\n");
     if (fatfs_get_card_info(&free_cap, &total_cap) == 0) {
         printf("  Total: %u MB, Free: %u MB\r\n", total_cap, free_cap);
+        /* 只告警不自动格式化: 防误检测清掉用户数据, 修复交给控制台 'format yes' */
+        if (total_cap == 0 || total_cap > 128 * 1024 || free_cap > total_cap) {
+            printf("[FS WRN] volume params look insane, run 'format yes' to rebuild\r\n");
+        }
     }
     printf("\r\n");
     
@@ -467,9 +489,11 @@ static void fatfs_filesystem_test(void)
  * - 完美避开了触摸IC高频中断的干扰
  *===================*/
 
-/* HTTP对话框停止按钮回调 */
-static void http_dialog_stop_cb(lv_event_t *e) {
-    printf("[HTTP_DIALOG] Stop button clicked\n");
+/* 关闭 HTTP 对话框并停止服务器（Stop 按钮 / 点背景 / 点对话框空白 复用）。
+ * 只做非阻塞动作：清状态 + shutdown socket，由 HTTP 工作线程自行收尾；
+ * 切勿在回调里等线程退出，否则 UI 会卡死。 */
+static void http_dialog_stop_and_dismiss(void)
+{
     g_wifi.http_running = 0;
     wifi_controller_set_http_running(0);
 
@@ -486,6 +510,29 @@ static void http_dialog_stop_cb(lv_event_t *e) {
     epd_mark_refresh_pending();
 }
 
+/* HTTP对话框停止按钮回调 */
+static void http_dialog_stop_cb(lv_event_t *e) {
+    (void)e;
+    printf("[HTTP_DIALOG] Stop button clicked\n");
+    http_dialog_stop_and_dismiss();
+}
+
+/* 点对话框外的全屏遮罩 → 同样停止服务器并关闭。
+ * 修复：原来遮罩无事件处理，按钮只有 80x35 且紧贴对话框底边，
+ * 点偏一点（如 Y=287）就落在遮罩上，屏幕毫无变化、服务器永远退不出。 */
+static void http_dialog_bg_click_cb(lv_event_t *e) {
+    (void)e;
+    printf("[HTTP_DIALOG] Background tapped, stopping\n");
+    http_dialog_stop_and_dismiss();
+}
+
+/* 点对话框空白处 → 与 Stop 按钮等效，杜绝"点不到按钮就出不去" */
+static void http_dialog_click_cb(lv_event_t *e) {
+    (void)e;
+    printf("[HTTP_DIALOG] Dialog tapped, stopping\n");
+    http_dialog_stop_and_dismiss();
+}
+
 /* 创建HTTP服务器信息对话框 */
 static void http_dialog_create(const char *ip_str) {
     if (g_http_dialog_bg) return; /* 已存在 */
@@ -497,6 +544,8 @@ static void http_dialog_create(const char *ip_str) {
     lv_obj_set_pos(g_http_dialog_bg, 0, 0);
     lv_obj_set_style_bg_color(g_http_dialog_bg, lv_color_make(255, 255, 255), 0);
     lv_obj_set_style_bg_opa(g_http_dialog_bg, LV_OPA_90, 0);
+    /* 点遮罩(对话框外)即可停止服务器并退出，避免点不到按钮时卡死在对话框 */
+    lv_obj_add_event_cb(g_http_dialog_bg, http_dialog_bg_click_cb, LV_EVENT_CLICKED, NULL);
     
     /* 对话框容器 */
     g_http_dialog = lv_obj_create(g_http_dialog_bg);
@@ -507,6 +556,8 @@ static void http_dialog_create(const char *ip_str) {
     lv_obj_set_style_border_color(g_http_dialog, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_radius(g_http_dialog, 8, 0);
     lv_obj_clear_flag(g_http_dialog, LV_OBJ_FLAG_SCROLLABLE);
+    /* 点对话框空白处同样停止服务器并退出（与按钮等效，加大可命中区域） */
+    lv_obj_add_event_cb(g_http_dialog, http_dialog_click_cb, LV_EVENT_CLICKED, NULL);
     
     /* 标题 */
     lv_obj_t *dlg_title = lv_label_create(g_http_dialog);
@@ -524,10 +575,10 @@ static void http_dialog_create(const char *ip_str) {
     lv_obj_set_style_text_color(dlg_ip, lv_color_make(0, 0, 0), 0);
     lv_obj_align(dlg_ip, LV_ALIGN_CENTER, 0, -10);
     
-    /* 停止按钮 */
+    /* 停止按钮 - 加大尺寸(150x42), 覆盖对话框底部大部分区域, 墨水屏触摸易命中 */
     lv_obj_t *btn_stop = lv_btn_create(g_http_dialog);
-    lv_obj_set_size(btn_stop, 80, 35);
-    lv_obj_align(btn_stop, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_set_size(btn_stop, 150, 42);
+    lv_obj_align(btn_stop, LV_ALIGN_BOTTOM_MID, 0, -12);
     lv_obj_set_style_bg_color(btn_stop, lv_color_make(0, 0, 0), 0);
     lv_obj_set_style_border_width(btn_stop, 2, 0);
     lv_obj_set_style_border_color(btn_stop, lv_color_make(0, 0, 0), 0);
@@ -579,8 +630,9 @@ static void settings_http_btn_event_handler(lv_event_t * e) {
     }
 }
 
-/* Settings 返回按钮事件处理 */
-static void settings_back_btn_event_handler(lv_event_t * e) {
+/* 设置页返回: 清理设置状态并重建首页 (屏幕返回与物理返回共用) */
+static void settings_goto_home(void)
+{
     printf("[Settings] Back to home\n");
 
     g_wifi.settings_paused = 0;
@@ -599,6 +651,18 @@ static void settings_back_btn_event_handler(lv_event_t * e) {
     main_ui_create();
 
     epd_mark_refresh_pending();
+}
+
+/* 物理返回按键: 与设置页屏幕返回按钮等效 */
+static void settings_physical_back(void)
+{
+    settings_goto_home();
+}
+
+/* Settings 返回按钮事件处理 */
+static void settings_back_btn_event_handler(lv_event_t * e) {
+    (void)e;
+    settings_goto_home();
 }
 
 /* WiFi扫描按钮回调 - 打开WiFi扫描子界面 */
@@ -621,29 +685,296 @@ static void settings_font_sel_btn_cb(lv_event_t *e) {
     epd_resume_refresh();
 }
 
-/* 休眠时钟按钮回调 - 进入时钟模式(GPT clock 方案 §一)
- * 需 WiFi 已连接(用于 NTP 校时写入 RTC)。进入后系统进入 HIBERNATION 不返回。 */
-static void settings_sleep_clock_btn_cb(lv_event_t * e) {
+/* 关于按钮回调 - 打开关于界面 (固件信息 -> 作者信息) */
+static void settings_about_btn_cb(lv_event_t *e) {
     (void)e;
+    printf("[Settings] Opening about screen\n");
+    epd_pause_refresh();
+    lv_obj_t *scr = lv_scr_act();
+    settings_about_open(scr);
+    epd_resume_refresh();
+}
+
+/* 休眠时钟精度选择 UI: 点击进入前先选 1/3/5/10/15/30/60 分钟 + 横/竖屏, 确认后再进 */
+static int     s_clock_sel_min = 1;
+static int     s_clock_landscape = 0;
+static lv_obj_t *s_clock_picker_ov = NULL;
+static lv_obj_t *s_clock_opt_btns[7] = {0};
+static lv_obj_t *s_clock_orient_btn = NULL;
+static const int s_clock_opts[7] = {1, 3, 5, 10, 15, 30, 60};
+
+static void clock_picker_close(void)
+{
+    if (s_clock_picker_ov) {
+        lv_obj_del_async(s_clock_picker_ov);
+        s_clock_picker_ov = NULL;
+    }
+}
+
+static void clock_picker_highlight(void)
+{
+    for (int i = 0; i < 7; i++) {
+        if (!s_clock_opt_btns[i]) continue;
+        bool sel = (s_clock_opts[i] == s_clock_sel_min);
+        lv_obj_set_style_bg_color(s_clock_opt_btns[i],
+                                  sel ? lv_color_make(0xDD, 0xDD, 0xDD) : lv_color_white(), 0);
+        lv_obj_set_style_border_width(s_clock_opt_btns[i], sel ? 2 : 1, 0);
+    }
+}
+
+static void clock_picker_opt_cb(lv_event_t *e)
+{
+    s_clock_sel_min = (int)(intptr_t)lv_event_get_user_data(e);
+    printf("[CLOCK] picker select=%d min\n", s_clock_sel_min);
+    clock_picker_highlight();
+}
+
+static void clock_picker_orient_refresh(void)
+{
+    if (!s_clock_orient_btn) return;
+    lv_obj_t *lbl = lv_obj_get_child(s_clock_orient_btn, 0);
+    if (lbl) lv_label_set_text(lbl, s_clock_landscape ? "显示方向 : 横屏" : "显示方向 : 竖屏");
+    lv_obj_set_style_bg_color(s_clock_orient_btn,
+                              s_clock_landscape ? lv_color_make(0xDD, 0xDD, 0xDD) : lv_color_white(), 0);
+}
+
+static void clock_picker_orient_cb(lv_event_t *e) {
+    (void)e;
+    s_clock_landscape = s_clock_landscape ? 0 : 1;
+    printf("[CLOCK] picker orientation=%s\n", s_clock_landscape ? "landscape" : "portrait");
+    clock_picker_orient_refresh();
+}
+
+static void clock_picker_confirm_cb(lv_event_t *e) {
+    (void)e;
+    clock_set_interval_min(s_clock_sel_min);
+    clock_set_landscape(s_clock_landscape);
+    printf("[CLOCK] confirm interval=%d min landscape=%d\n", s_clock_sel_min, s_clock_landscape);
+    clock_picker_close();
+    epd_mark_refresh_pending();
+    /* 未连接 WiFi: 时间无法 NTP 校准, 先询问用户是否进入(并显示当前 RTC 时间) */
     if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
-        printf("[CLOCK] need WiFi connected for NTP time, abort\r\n");
+        printf("[CLOCK] WiFi not connected, asking user before entering\n");
+        clock_nowifi_dialog();
         return;
     }
-    printf("[Settings] Entering sleep clock mode\n");
-    /* clock_mode_enter 内部会 NTP->RTC、刷新首帧、关停外设、进 HIBERNATION，
-     * 正常情况下不再返回。 */
+    /* clock_mode_enter 内部会 NTP->RTC、刷新首帧、关停外设、进 HIBERNATION */
     clock_mode_enter();
+}
+
+/* 未连接 WiFi 时进入休眠时钟的确认对话框 */
+static lv_obj_t *g_clock_nowifi_dlg = NULL;
+
+static void clock_nowifi_dlg_dismiss(void)
+{
+    if (g_clock_nowifi_dlg) {
+        lv_obj_del(g_clock_nowifi_dlg);
+        g_clock_nowifi_dlg = NULL;
+        epd_mark_refresh_pending();
+    }
+}
+
+static void clock_nowifi_enter_cb(lv_event_t *e) {
+    (void)e;
+    clock_nowifi_dlg_dismiss();
+    clock_mode_enter();
+}
+
+static void clock_nowifi_cancel_cb(lv_event_t *e) {
+    (void)e;
+    clock_nowifi_dlg_dismiss();
+}
+
+static void clock_nowifi_dialog(void)
+{
+    if (g_clock_nowifi_dlg) return;
+
+    char time_str[16];
+    if (clock_format_rtc_time(time_str, sizeof(time_str)) != 0) {
+        snprintf(time_str, sizeof(time_str), "--:--:--");
+    }
+
+    lv_obj_t *bg = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(bg);
+    lv_obj_set_size(bg, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(bg, 0, 0);
+    lv_obj_set_style_bg_color(bg, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(bg, LV_OPA_90, 0);
+    lv_obj_clear_flag(bg, LV_OBJ_FLAG_SCROLLABLE);
+    g_clock_nowifi_dlg = bg;
+
+    lv_obj_t *box = lv_obj_create(bg);
+    lv_obj_set_size(box, 210, 170);
+    lv_obj_align(box, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_bg_color(box, lv_color_white(), 0);
+    lv_obj_set_style_border_width(box, 2, 0);
+    lv_obj_set_style_border_color(box, lv_color_black(), 0);
+    lv_obj_set_style_radius(box, 8, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    epd_disable_all_animations_recursive(box);
+
+    lv_obj_t *title = lv_label_create(box);
+    lv_label_set_text(title, "未连接 WiFi");
+    lv_obj_set_style_text_font(title, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_black(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    char msg1[48];
+    snprintf(msg1, sizeof(msg1), "当前RTC时间: %s", time_str);
+    lv_obj_t *lbl_time = lv_label_create(box);
+    lv_label_set_text(lbl_time, msg1);
+    lv_obj_set_style_text_font(lbl_time, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(lbl_time, lv_color_make(0x44, 0x44, 0x44), 0);
+    lv_obj_align(lbl_time, LV_ALIGN_TOP_MID, 0, 36);
+
+    lv_obj_t *lbl_warn = lv_label_create(box);
+    lv_label_set_text(lbl_warn, "时间可能不准确\n仍要进入休眠时钟吗?");
+    lv_obj_set_style_text_font(lbl_warn, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(lbl_warn, lv_color_make(0x66, 0x66, 0x66), 0);
+    lv_obj_align(lbl_warn, LV_ALIGN_TOP_MID, 0, 68);
+
+    /* 进入 / 取消 */
+    lv_obj_t *ok = lv_btn_create(box);
+    lv_obj_set_size(ok, 80, 40);
+    lv_obj_set_pos(ok, 12, 120);
+    ui_apply_static_btn_style(ok, 2, 4);
+    lv_obj_add_event_cb(ok, clock_nowifi_enter_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *okl = lv_label_create(ok);
+    lv_label_set_text(okl, "进入");
+    lv_obj_set_style_text_font(okl, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(okl, lv_color_black(), 0);
+    lv_obj_center(okl);
+
+    lv_obj_t *cancel = lv_btn_create(box);
+    lv_obj_set_size(cancel, 80, 40);
+    lv_obj_set_pos(cancel, 118, 120);
+    ui_apply_static_btn_style(cancel, 2, 4);
+    lv_obj_add_event_cb(cancel, clock_nowifi_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cl = lv_label_create(cancel);
+    lv_label_set_text(cl, "取消");
+    lv_obj_set_style_text_font(cl, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(cl, lv_color_black(), 0);
+    lv_obj_center(cl);
+
+    lv_obj_invalidate(bg);
+    lv_refr_now(NULL);
+    epd_mark_refresh_pending();
+}
+
+static void clock_picker_cancel_cb(lv_event_t *e) {
+    (void)e;
+    clock_picker_close();
+    epd_mark_refresh_pending();
+}
+
+static void clock_precision_picker_show(void)
+{
+    if (s_clock_picker_ov) return;
+    s_clock_sel_min = clock_get_interval_min();
+    s_clock_landscape = clock_get_landscape();
+
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_t *ov = lv_obj_create(scr);
+    lv_obj_remove_style_all(ov);
+    lv_obj_set_size(ov, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_pos(ov, 0, 0);
+    lv_obj_set_style_bg_color(ov, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(ov, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(ov, LV_OBJ_FLAG_SCROLLABLE);
+    epd_disable_all_animations_recursive(ov);
+    s_clock_picker_ov = ov;
+
+    lv_obj_t *title = lv_label_create(ov);
+    lv_label_set_text(title, "休眠时钟精度");
+    lv_obj_set_style_text_font(title, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_black(), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
+
+    lv_obj_t *sub = lv_label_create(ov);
+    lv_label_set_text(sub, "选择唤醒刷新间隔");
+    lv_obj_set_style_text_font(sub, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(sub, lv_color_make(0x66, 0x66, 0x66), 0);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, 32);
+
+    /* 精度选项: 2 列网格, 按钮高度统一 50px(与设置页行按钮一致, 便于点按) */
+    static const int col_x[2] = {10, 125};
+    const int opt_h = 50, opt_y0 = 48, opt_pitch = 60;
+    for (int i = 0; i < 7; i++) {
+        lv_obj_t *b = lv_btn_create(ov);
+        int r = i / 2, c = i % 2;
+        lv_obj_set_size(b, 105, opt_h);
+        lv_obj_set_pos(b, col_x[c], opt_y0 + r * opt_pitch);
+        ui_apply_static_btn_style(b, 1, 4);
+        lv_obj_clear_flag(b, LV_OBJ_FLAG_SCROLLABLE);
+        epd_disable_all_animations_recursive(b);
+        char txt[16];
+        snprintf(txt, sizeof(txt), "%d 分钟", s_clock_opts[i]);
+        lv_obj_t *lb = lv_label_create(b);
+        lv_label_set_text(lb, txt);
+        lv_obj_set_style_text_font(lb, &lv_font_misans_16, 0);
+        lv_obj_set_style_text_color(lb, lv_color_black(), 0);
+        lv_obj_center(lb);
+        lv_obj_add_event_cb(b, clock_picker_opt_cb, LV_EVENT_CLICKED,
+                            (void *)(intptr_t)s_clock_opts[i]);
+        s_clock_opt_btns[i] = b;
+    }
+    clock_picker_highlight();
+
+    /* 显示方向切换(竖屏/横屏), 整宽 50px */
+    s_clock_orient_btn = lv_btn_create(ov);
+    lv_obj_set_size(s_clock_orient_btn, 220, opt_h);
+    lv_obj_set_pos(s_clock_orient_btn, 10, opt_y0 + 4 * opt_pitch);
+    ui_apply_static_btn_style(s_clock_orient_btn, 1, 4);
+    lv_obj_clear_flag(s_clock_orient_btn, LV_OBJ_FLAG_SCROLLABLE);
+    epd_disable_all_animations_recursive(s_clock_orient_btn);
+    lv_obj_add_event_cb(s_clock_orient_btn, clock_picker_orient_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *olb = lv_label_create(s_clock_orient_btn);
+    lv_label_set_text(olb, "显示方向");
+    lv_obj_set_style_text_font(olb, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(olb, lv_color_black(), 0);
+    lv_obj_center(olb);
+    clock_picker_orient_refresh();
+
+    /* 确认 / 取消, 高度 50px 与设置按钮一致 */
+    lv_obj_t *ok = lv_btn_create(ov);
+    lv_obj_set_size(ok, 90, opt_h);
+    lv_obj_set_pos(ok, 20, opt_y0 + 5 * opt_pitch);
+    ui_apply_static_btn_style(ok, 2, 4);
+    lv_obj_add_event_cb(ok, clock_picker_confirm_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *okl = lv_label_create(ok);
+    lv_label_set_text(okl, "确认");
+    lv_obj_set_style_text_font(okl, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(okl, lv_color_black(), 0);
+    lv_obj_center(okl);
+
+    lv_obj_t *cn = lv_btn_create(ov);
+    lv_obj_set_size(cn, 90, opt_h);
+    lv_obj_set_pos(cn, 130, opt_y0 + 5 * opt_pitch);
+    ui_apply_static_btn_style(cn, 2, 4);
+    lv_obj_add_event_cb(cn, clock_picker_cancel_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *cnl = lv_label_create(cn);
+    lv_label_set_text(cnl, "取消");
+    lv_obj_set_style_text_font(cnl, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(cnl, lv_color_black(), 0);
+    lv_obj_center(cnl);
+
+    lv_obj_invalidate(ov);
+    lv_refr_now(NULL);
+    epd_mark_refresh_pending();
+}
+
+/* 休眠时钟按钮回调(Settings 入口) - 先选精度再进 */
+static void settings_sleep_clock_btn_cb(lv_event_t * e) {
+    (void)e;
+    printf("[Settings] Opening sleep clock precision picker\n");
+    clock_precision_picker_show();
 }
 
 /* 首页休眠时钟按钮回调 (fix-power-saving: 把时钟入口提到首页) */
 static void home_clock_btn_event_handler(lv_event_t *e) {
     (void)e;
-    if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
-        printf("[CLOCK] need WiFi connected for NTP time, abort\r\n");
-        return;
-    }
-    printf("[Home] Entering sleep clock mode\n");
-    clock_mode_enter();
+    printf("[Home] Opening sleep clock precision picker\n");
+    clock_precision_picker_show();
 }
 
 /*====================
@@ -652,7 +983,6 @@ static void home_clock_btn_event_handler(lv_event_t *e) {
 
 /* 在 LVGL 线程中由 wlan_manager_poll() 触发
  * 主要作用: WiFi 掉了自动停 HTTP + 更新 home WiFi 图标 */
-static int s_font_warm_after_wifi_done;
 
 /* 同步首页 WiFi 图标到当前 phase，并尽快刷到墨水屏 */
 static void home_time_label_apply(int force_epd)
@@ -700,11 +1030,6 @@ static void on_wifi_phase_change(WLAN_Phase_t phase, void *user_data)
     if (phase == WLAN_PHASE_CONNECTING) {
         /* 关联阶段不刷首页/settings，减少与 WPA 并发的 EPD 请求 */
         return;
-    }
-
-    if (!s_font_warm_after_wifi_done && phase == WLAN_PHASE_CONNECTED) {
-        s_font_warm_after_wifi_done = 1;
-        font_warm_schedule_boot();
     }
 
     /* Home 顶部 WiFi 图标：CONNECTED 显示，其它清空并刷新 */
@@ -788,6 +1113,40 @@ static void settings_sd_diag_btn_cb(lv_event_t *e)
     sd_write_diag_run();
 }
 
+/* Settings 设置页整行按钮: 左侧24px图标(LV_SYMBOL) + 右侧16px中文(MiSans) */
+static lv_obj_t *settings_row_create(lv_obj_t *parent,
+                                     lv_coord_t y, lv_coord_t h,
+                                     const char *symbol, const char *text,
+                                     lv_event_cb_t cb)
+{
+    lv_obj_t *btn = lv_btn_create(parent);
+    lv_obj_set_size(btn, 220, h);
+    lv_obj_set_pos(btn, 10, y);
+    lv_obj_set_style_bg_color(btn, lv_color_make(255, 255, 255), 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
+    lv_obj_set_style_border_color(btn, lv_color_make(0, 0, 0), 0);
+    lv_obj_set_style_radius(btn, 4, 0);
+    lv_obj_set_style_transition(btn, NULL, LV_PART_MAIN);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *ic = lv_label_create(btn);
+    lv_label_set_text(ic, symbol);
+    lv_obj_set_style_text_font(ic, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(ic, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(ic, LV_ALIGN_LEFT_MID, 12, 0);
+
+    lv_obj_t *lb = lv_label_create(btn);
+    lv_label_set_text(lb, text);
+    lv_obj_set_style_text_font(lb, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(lb, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(lb, LV_ALIGN_LEFT_MID, 46, 0);
+
+    if (cb) {
+        lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, NULL);
+    }
+    return btn;
+}
+
 /* Settings 入口按钮事件处理 */
 static void settings_btn_event_handler(lv_event_t * e) {
     printf("[Settings] Entering Settings page\n");
@@ -814,123 +1173,123 @@ static void settings_btn_event_handler(lv_event_t * e) {
     lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
     lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
     
-    /* 标题 */
+    /* 标题: 自动尺寸+居中, 避免固定 200px 标签的文本左移落到返回按钮下方 */
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "Settings");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_label_set_text(title, "设置");
+    lv_obj_set_style_text_font(title, &lv_font_misans_16, 0);
     lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(title, 200, 30);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 10);
-    
-    /* 返回按钮 - 放在标题下方，避免重叠 */
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    /* 返回按钮 - 统一左上角，尺寸与 FM 关闭按钮一致 */
     lv_obj_t *btn_back = lv_btn_create(scr);
     lv_obj_set_size(btn_back, 60, 30);
-    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 10, 45);  /* Y=45，在标题下方 */
+    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 4, 2);
     ui_apply_static_btn_style(btn_back, 2, 4);
     lv_obj_t *btn_back_label = lv_label_create(btn_back);
-    lv_label_set_text(btn_back_label, "Back");
-    lv_obj_set_style_text_font(btn_back_label, &lv_font_montserrat_12, 0);
+    lv_label_set_text(btn_back_label, "返回");
+    lv_obj_set_style_text_font(btn_back_label, &lv_font_misans_16, 0);
     lv_obj_set_style_text_color(btn_back_label, lv_color_make(0, 0, 0), 0);
     lv_obj_center(btn_back_label);
     lv_obj_add_event_cb(btn_back, settings_back_btn_event_handler, LV_EVENT_CLICKED, NULL);
-    
-    /* WiFi 行 - 纯入口, 开关已合并到 WiFi 子页 (手机式) */
-    lv_obj_t *wifi_btn = lv_btn_create(scr);
-    lv_obj_set_size(wifi_btn, 200, 30);
-    lv_obj_set_pos(wifi_btn, 20, 90);
-    lv_obj_set_style_bg_color(wifi_btn, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_border_width(wifi_btn, 2, 0);
-    lv_obj_set_style_border_color(wifi_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_radius(wifi_btn, 4, 0);
-    lv_obj_set_style_transition(wifi_btn, NULL, LV_PART_MAIN);
-    lv_obj_clear_flag(wifi_btn, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *wifi_label = lv_label_create(wifi_btn);
-    lv_label_set_text(wifi_label, LV_SYMBOL_WIFI "  WiFi >");
-    lv_obj_set_style_text_font(wifi_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(wifi_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_center(wifi_label);
-    lv_obj_add_event_cb(wifi_btn, settings_wifi_scan_open_btn_cb, LV_EVENT_CLICKED, NULL);
-    
-    /* HTTP Server 按钮（仅 WiFi 连接时显示）- 调整位置 */
-    g_settings_http_btn = lv_btn_create(scr);
-    lv_obj_set_size(g_settings_http_btn, 200, 45);
-    lv_obj_set_pos(g_settings_http_btn, 20, 130);  /* Y=130，在WiFi开关下方 */
-    lv_obj_set_style_bg_color(g_settings_http_btn, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_border_width(g_settings_http_btn, 2, 0);
-    lv_obj_set_style_border_color(g_settings_http_btn, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_radius(g_settings_http_btn, 8, 0);
-    lv_obj_set_style_transition(g_settings_http_btn, NULL, LV_PART_MAIN);
-    
-    lv_obj_t *http_label = lv_label_create(g_settings_http_btn);
-    lv_label_set_text(http_label, LV_SYMBOL_WIFI "  HTTP Server");
-    lv_obj_set_style_text_font(http_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(http_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_center(http_label);
-    
-    lv_obj_add_event_cb(g_settings_http_btn, settings_http_btn_event_handler, LV_EVENT_CLICKED, NULL);
-    
+    /* 无线网络 - 纯入口, 开关已合并到 WiFi 子页 (手机式) */
+    settings_row_create(scr, 78, 50, LV_SYMBOL_WIFI,
+                        "无线网络", settings_wifi_scan_open_btn_cb);
+
+    /* HTTP 服务器（仅 WiFi 连接时显示） */
+    g_settings_http_btn = settings_row_create(scr, 125, 50, LV_SYMBOL_WIFI,
+                                              "HTTP 服务器", settings_http_btn_event_handler);
     /* 根据 WiFi 状态决定是否显示 HTTP 按钮 */
     if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
         lv_obj_add_flag(g_settings_http_btn, LV_OBJ_FLAG_HIDDEN);
     }
-    
-    /* 字体选择按钮 - Y=185 (原Y=225上移) */
-    lv_obj_t *btn_font_sel = lv_btn_create(scr);
-    lv_obj_set_size(btn_font_sel, 200, 35);
-    lv_obj_set_pos(btn_font_sel, 10, 185);
-    lv_obj_set_style_bg_color(btn_font_sel, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_border_width(btn_font_sel, 2, 0);
-    lv_obj_set_style_border_color(btn_font_sel, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_radius(btn_font_sel, 4, 0);
-    lv_obj_set_style_transition(btn_font_sel, NULL, LV_PART_MAIN);
-    
-    lv_obj_t *font_sel_label = lv_label_create(btn_font_sel);
-    lv_label_set_text(font_sel_label, LV_SYMBOL_IMAGE "  Font Select");
-    lv_obj_set_style_text_font(font_sel_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(font_sel_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_center(font_sel_label);
-    lv_obj_add_event_cb(btn_font_sel, settings_font_sel_btn_cb, LV_EVENT_CLICKED, NULL);
 
-    /* 休眠时钟按钮 - Y=240 (Font Select 下方)。
+    /* 字体选择 */
+    settings_row_create(scr, 172, 50, LV_SYMBOL_IMAGE,
+                        "字体选择", settings_font_sel_btn_cb);
+
+    /* 性能测试 (CoreMark) - 从首页移入设置 */
+    settings_row_create(scr, 219, 50, LV_SYMBOL_CHARGE,
+                        "性能测试 (CoreMark)", coremark_btn_event_handler);
+
+    /* 休眠时钟
      * 进入后每分钟刷新一次时钟并 HIBERNATION，按 PA6 退出回正常模式。 */
-    lv_obj_t *btn_sleep_clock = lv_btn_create(scr);
-    lv_obj_set_size(btn_sleep_clock, 200, 35);
-    lv_obj_set_pos(btn_sleep_clock, 10, 240);
-    lv_obj_set_style_bg_color(btn_sleep_clock, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_border_width(btn_sleep_clock, 2, 0);
-    lv_obj_set_style_border_color(btn_sleep_clock, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_radius(btn_sleep_clock, 4, 0);
-    lv_obj_set_style_transition(btn_sleep_clock, NULL, LV_PART_MAIN);
+    settings_row_create(scr, 266, 50, LV_SYMBOL_BELL,
+                        "休眠时钟", settings_sleep_clock_btn_cb);
 
-    lv_obj_t *sleep_clock_label = lv_label_create(btn_sleep_clock);
-    lv_label_set_text(sleep_clock_label, LV_SYMBOL_BELL "  Sleep Clock");
-    lv_obj_set_style_text_font(sleep_clock_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(sleep_clock_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_center(sleep_clock_label);
-    lv_obj_add_event_cb(btn_sleep_clock, settings_sleep_clock_btn_cb, LV_EVENT_CLICKED, NULL);
+    /* 测试项目 - 收纳 SD 诊断 + 触摸校准(子页内再选, 避免改主屏按钮高度) */
+    settings_row_create(scr, 313, 50, LV_SYMBOL_LIST,
+                        "测试项目", settings_test_project_btn_cb);
 
-    /* SD 写诊断按钮 - Y=285 (Sleep Clock 下方) */
-    lv_obj_t *btn_sd_diag = lv_btn_create(scr);
-    lv_obj_set_size(btn_sd_diag, 200, 35);
-    lv_obj_set_pos(btn_sd_diag, 10, 285);
-    lv_obj_set_style_bg_color(btn_sd_diag, lv_color_make(255, 255, 255), 0);
-    lv_obj_set_style_border_width(btn_sd_diag, 2, 0);
-    lv_obj_set_style_border_color(btn_sd_diag, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_style_radius(btn_sd_diag, 4, 0);
-    lv_obj_set_style_transition(btn_sd_diag, NULL, LV_PART_MAIN);
-
-    lv_obj_t *sd_diag_label = lv_label_create(btn_sd_diag);
-    lv_label_set_text(sd_diag_label, LV_SYMBOL_LIST "  SD Write Diag");
-    lv_obj_set_style_text_font(sd_diag_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(sd_diag_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_center(sd_diag_label);
-    lv_obj_add_event_cb(btn_sd_diag, settings_sd_diag_btn_cb, LV_EVENT_CLICKED, NULL);
+    /* 关于 - 固件信息 -> 作者信息 */
+    settings_row_create(scr, 360, 50, LV_SYMBOL_FILE,
+                        "关于", settings_about_btn_cb);
 
     /* 【EPD优化】恢复刷新，触发一次完整刷新 */
     epd_resume_refresh();
     
+    /* 绑定物理返回键: 与设置页返回按钮等效 */
+    touch_register_back_btn_callback(settings_physical_back);
+
     printf("[UI] Settings page created\n");
+}
+
+/* 触摸校准行回调(包装 void(void) API 为 lv_event_cb_t) */
+static void settings_touch_test_row_cb(lv_event_t *e) {
+    (void)e;
+    settings_touch_test_open();
+}
+
+/* 测试项目子页 返回: 回到首页(与其余设置子页一致) */
+static void settings_test_project_back_cb(lv_event_t *e) {
+    (void)e;
+    main_ui_create();
+    epd_mark_refresh_pending();
+}
+
+/* 物理返回按键: 测试项目子页与屏幕返回按钮等效 */
+static void settings_test_project_physical_back(void)
+{
+    main_ui_create();
+    epd_mark_refresh_pending();
+}
+
+/* 测试项目入口: 进入子页, 收纳 SD 诊断 + 触摸校准 */
+static void settings_test_project_btn_cb(lv_event_t *e) {
+    (void)e;
+    printf("[Settings] Opening test project sub-screen\n");
+    epd_pause_refresh();
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_clean(scr);
+    lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
+    lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
+
+    lv_obj_t *title = lv_label_create(scr);
+    lv_label_set_text(title, "测试项目");
+    lv_obj_set_style_text_font(title, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+
+    lv_obj_t *btn_back = lv_btn_create(scr);
+    lv_obj_set_size(btn_back, 60, 30);
+    lv_obj_align(btn_back, LV_ALIGN_TOP_LEFT, 4, 2);
+    ui_apply_static_btn_style(btn_back, 2, 4);
+    lv_obj_t *bb = lv_label_create(btn_back);
+    lv_label_set_text(bb, "返回");
+    lv_obj_set_style_text_font(bb, &lv_font_misans_16, 0);
+    lv_obj_set_style_text_color(bb, lv_color_black(), 0);
+    lv_obj_center(bb);
+    lv_obj_add_event_cb(btn_back, settings_test_project_back_cb, LV_EVENT_CLICKED, NULL);
+
+    /* 子页内的两个测试项(行高/间距与主屏一致) */
+    settings_row_create(scr, 78, 50, LV_SYMBOL_LIST, "SD 卡诊断", settings_sd_diag_btn_cb);
+    settings_row_create(scr, 125, 50, LV_SYMBOL_WIFI, "触摸校准", settings_touch_test_row_cb);
+
+    epd_resume_refresh();
+    printf("[Settings] Test project sub-screen created\n");
+
+    /* 绑定物理返回键: 与子页返回按钮等效 */
+    touch_register_back_btn_callback(settings_test_project_physical_back);
 }
 
 /* CoreMark按钮事件处理函数 */
@@ -953,6 +1312,7 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
     // 挂载SD卡文件系统
     printf("[FM] Mounting SD card...\n");
     fs_ctrl_mount(FS_MNT_DEV_TYPE_SDCARD, 0);
+    sd_apply_clock_policy();   /* DCE 探测: 降 SD 时钟, 拉开 DAT 时序余量 */
     
     // 启动文件管理器
     file_manager_init();
@@ -964,7 +1324,8 @@ static void file_manager_btn_event_handler(lv_event_t * e) {
 /* 书架入口 */
 static void bookshelf_btn_event_handler(lv_event_t * e) {
     (void)e;
-    epd_pause_refresh();
+    /* 不再先 epd_pause_refresh(): bookshelf_begin_load 要先让"解析中"遮罩
+     * 刷新上屏, 再延迟一拍做同步扫描/解析, 避免解析期间无反馈被当成卡死。 */
 
     if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
         printf("[BS] WiFi not connected, canceling background connect\n");
@@ -974,8 +1335,7 @@ static void bookshelf_btn_event_handler(lv_event_t * e) {
     printf("[BS] Mounting SD card...\n");
     fs_ctrl_mount(FS_MNT_DEV_TYPE_SDCARD, 0);
 
-    bookshelf_init();
-    /* bookshelf_init 内部会 resume+mark */
+    bookshelf_begin_load();
 }
 
 static lv_obj_t *create_home_tile(lv_obj_t *parent,
@@ -1002,18 +1362,18 @@ static lv_obj_t *create_home_tile(lv_obj_t *parent,
 
     lv_obj_t *icon = lv_label_create(tile);
     lv_label_set_text(icon, symbol);
-    lv_obj_set_style_text_font(icon, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(icon, &lv_font_montserrat_24, 0);
     lv_obj_set_style_text_color(icon, lv_color_make(0, 0, 0), 0);
-    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 10);
+    lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, 8);
 
     lv_obj_t *label = lv_label_create(tile);
     lv_label_set_text(label, title);
-    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(label, &lv_font_misans_16, 0);
     lv_obj_set_style_text_color(label, lv_color_make(0, 0, 0), 0);
     lv_obj_set_width(label, w - 12);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
-    lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    lv_obj_align(label, LV_ALIGN_BOTTOM_MID, 0, -8);
 
     return tile;
 }
@@ -1025,21 +1385,54 @@ static void lvgl_task(void *arg) {
     static uint32_t s_last_diag_tick = 0;
 
     while (1) {
+        /* 安全点互斥: 整个循环体持锁。lv_timer_handler 与 phase 回调
+         * (wifi_controller_poll → lv_refr_now) 都会写 framebuffer, 只有
+         * 两轮循环之间的空隙是 disp_task 做 EPD 硬件刷新的安全点。
+         * 取代原 vTaskSuspend 硬挂起, 避免连接成功瞬间挂起丢失恢复。 */
+        epd_lock(OS_WAIT_FOREVER);
+        g_lvgl_heartbeat++;
+
         s_lvgl_loop_count++;
 
+        /* 运行阶段栅栏: 每次进入一个子步骤先置位 g_lvgl_stage, 看门狗在
+         * 卡死时打印它, 即可定位 lv_timer_handler 挂住还是 wifi_poll 等。
+         * 1=将执行 lv_timer_handler; 2=其已返回; 3=重绘分支完成;
+         * 4=wifi_controller_poll 已返回; 5=循环体结束将解锁。 */
+        g_lvgl_stage = 1;
         /* 【关键修复】：告诉 LVGL 时间过去了 LVGL_TIMER_PERIOD 毫秒 */
         lv_tick_inc(LVGL_TIMER_PERIOD);
 
         /* LVGL定时器处理（内部会检查是否该触发 read_cb 了） */
         lv_timer_handler();
+        g_lvgl_stage = 2;
+
+        /* 延迟重绘: loading 遮罩在 EPD 刷新窗口内被抑制(epd_refresh_in_progress
+         * 挡掉 _lv_disp_refr_timer)时登记了 epd_request_rerender, 这里等刷新
+         * 结束后补一次完整渲染。否则遮罩删除后 inv_p 被 epd_do_refresh 清掉,
+         * 画面停在 "Preparing fonts..." 永远不上屏。全部在锁内执行, 与
+         * disp_task 的 EPD 硬件刷新互斥, 安全。
+         * 注意: 必须先确认 EPD 空闲再消费请求, 否则会丢掉待补的重绘。 */
+        if (!epd_refresh_in_progress && !epd_refresh_requested
+            && epd_consume_rerender_request()) {
+            lv_obj_invalidate(lv_scr_act());
+            lv_refr_now(NULL);
+            /* 若仍被抑制 (如阅读器 g_rendering_in_progress), 重新登记下次再试 */
+            lv_disp_t *d = lv_disp_get_default();
+            if (d && d->inv_p > 0) {
+                epd_request_rerender();
+            }
+        }
+        g_lvgl_stage = 3;
 
         /* 轮询 wifi controller (扫描/连接/phase 回调) - 确保在LVGL线程中调用 */
         wifi_controller_poll();
+        g_lvgl_stage = 4;
 
         /* NTP 对时结果 / 本地钟点刷新 → 首页时间标签 */
         if (time_sync_take_pending()) {
             home_time_label_apply(1);
         }
+        g_lvgl_stage = 5;
 
         /* 诊断: 每 200 次循环 ~1s 打印一次, 验证 lvgl_task 在 resume 后是否还在跑 */
         if (s_lvgl_loop_count % 200 == 0) {
@@ -1050,7 +1443,8 @@ static void lvgl_task(void *arg) {
             printf("[LVGL_DIAG] loop=%u gap=%ums\n", s_lvgl_loop_count, gap);
         }
 
-        /* 休眠一小段时间 */
+        /* 休眠一小段时间 (先释放互斥锁, 给 disp_task 留 EPD 刷新安全点) */
+        epd_unlock();
         OS_MSleep(LVGL_TIMER_PERIOD);
     }
 }
@@ -1062,7 +1456,7 @@ static void lvgl_task(void *arg) {
 /* ADC函数前向声明（定义在disp_task之后） */
 static void adc_vbat_init(void);
 static float adc_read_vbat(void);
-static void update_vbat_display(void);
+static void update_vbat_display(int allow_shutdown);
 
 /* VBAT更新间隔（每5秒更新一次） */
 #define VBAT_UPDATE_INTERVAL_MS  5000
@@ -1072,10 +1466,13 @@ static void disp_task(void *arg) {
     printf("[Display] Task started\r\n");
     uint32_t vbat_counter = 0;
     uint32_t time_counter = 0;
+    /* lvgl_task 看门狗状态 (诊断用) */
+    static uint32_t s_last_lvgl_hb = 0;
+    static uint32_t s_lvgl_stall_tick = 0;
 
-    /* 初始化ADC并在首次读取VBAT */
+    /* 初始化ADC并在首次读取VBAT (allow_shutdown=1: disp_task 上下文, 可触发低电量软关机) */
     adc_vbat_init();
-    update_vbat_display();
+    update_vbat_display(1);
     
     while (1) {
         /* PA6 按键检测：低电平=按下，进入休眠
@@ -1101,12 +1498,16 @@ static void disp_task(void *arg) {
                 while (HAL_GPIO_ReadPin(GPIO_PORT_A, PA6_BUTTON_PIN) == 0) {
                     OS_MSleep(20);
                 }
-                /* 充电模式: 插着电按 PA6 → 进充电模式 (显示充电界面, 低功耗) */
+                /* 充电模式: 插着电按 PA6 → 先显示休眠遮罩反馈(推屏),
+                 * 稍作停留让用户看到, 再进充电界面. */
                 if (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21) == 0) {
                     printf(", charger connected -> charge mode\r\n");
+                    screensaver_show_sleep_overlay();
+                    OS_MSleep(600);  /* 让用户看清反馈遮罩 */
                     charge_mode_enter();  /* 不返回 */
                 }
                 printf(", entering hibernation (via screensaver)\r\n");
+                loading_show("Going to sleep...");
                 screensaver_task_force_enter();
             }
         }
@@ -1124,11 +1525,36 @@ static void disp_task(void *arg) {
         /* 执行EPD刷新 - 可能阻塞本线程，但不影响lvgl */
         epd_do_refresh();
 
-        /* 定期更新VBAT显示 */
+        /* 看门狗: lvgl_task 心跳 3s 未推进且不在 EPD 刷新中 → 告警。
+         * 仅日志诊断, 不做自动恢复(互斥锁安全点已消除挂起丢失类卡死)。 */
+        {
+            uint32_t hb_now = epd_get_tick();
+            if (g_lvgl_heartbeat != s_last_lvgl_hb) {
+                s_last_lvgl_hb = g_lvgl_heartbeat;
+                s_lvgl_stall_tick = hb_now;
+            } else if (!epd_refresh_in_progress && (hb_now - s_lvgl_stall_tick) > 3000) {
+                printf("[WATCHDOG] lvgl_task stalled %ums (hb=%lu stage=%u epd=%u/%u)\n",
+                       (unsigned)(hb_now - s_lvgl_stall_tick),
+                       (unsigned long)g_lvgl_heartbeat,
+                       (unsigned)g_lvgl_stage,
+                       (unsigned)epd_refresh_in_progress,
+                       (unsigned)epd_refresh_requested);
+                s_lvgl_stall_tick = hb_now;  /* 每 3s 报一次, 不刷屏 */
+            }
+        }
+
+        /* 定期更新VBAT显示 (disp_task 上下文, 可触发低电量软关机)。
+         * ADC 读取失败时 update_vbat_display 置 g_vbat_retry_countdown，
+         * 这里倒数归零后立即触发一次重读（尽快出真实电量，不拖到下个周期） */
         vbat_counter += DISP_TASK_PERIOD;
+        if (g_vbat_retry_countdown > 0) {
+            if (--g_vbat_retry_countdown == 0) {
+                vbat_counter = VBAT_UPDATE_INTERVAL_MS;
+            }
+        }
         if (vbat_counter >= VBAT_UPDATE_INTERVAL_MS) {
             vbat_counter = 0;
-            update_vbat_display();
+            update_vbat_display(1);
         }
 
         /* 每分钟刷新首页时钟文本（EPD 仅在分钟变化时刷） */
@@ -1149,6 +1575,17 @@ static void disp_task(void *arg) {
 void main_ui_create(void)
 {
     lv_obj_t *scr = lv_scr_act();
+
+    /* 回到主页: 清掉物理返回回调, 主页无返回按钮 */
+    touch_register_back_btn_callback(NULL);
+
+    /* 【关键】清屏前先显式关闭 loading 遮罩。
+     * 开机 loading_show("Booting...") 创建的遮罩是活动屏的子对象，若直接
+     * lv_obj_clean(scr) 会把它连带删除，而 loading.c 的 s_bg/s_box/s_label
+     * 静态指针仍非 NULL —— 之后 font_warm 的 loading_show() 会先对已释放的
+     * 对象调 lv_obj_del()，造成 use-after-free / TLSF 双重释放，堆被破坏，
+     * 表现为开机约 30 秒后整机卡死。此处先 loading_hide() 可把指针置空。 */
+    loading_hide();
 
     /* 清屏 */
     lv_obj_clean(scr);
@@ -1193,68 +1630,69 @@ void main_ui_create(void)
     lv_obj_add_style(scr, &style_no_anim, LV_STATE_ANY);
     lv_obj_set_style_bg_color(scr, lv_color_make(255, 255, 255), 0);
 
-    /* 标题 - 居左, 中间留给时间, 右侧 vbat + WiFi */
+    /* 标题 - 左侧; 时间紧跟标题右侧; 右侧 vbat + WiFi (不与时间重叠) */
     lv_obj_t *title = lv_label_create(scr);
-    lv_label_set_text(title, "Home");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_12, 0);
+    lv_label_set_text(title, "首页");
+    lv_obj_set_style_text_font(title, &lv_font_misans_16, 0);
     lv_obj_set_style_text_color(title, lv_color_make(0, 0, 0), 0);
     lv_obj_set_size(title, 48, 30);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 5, 10);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 6, 8);
 
-    /* 顶端时间 HH:MM（WiFi 连通后国家授时中心同步） */
+    /* 顶端时间 HH:MM（WiFi 连通后国家授时中心同步）
+     * 放标题右侧, 与右侧 WiFi/vbat 分开, 避免 240px 宽下重合 */
     g_time_label = lv_label_create(scr);
-    lv_obj_set_style_text_font(g_time_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_time_label, &lv_font_misans_16, 0);
     lv_obj_set_style_text_color(g_time_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_width(g_time_label, 50);
-    lv_obj_set_style_text_align(g_time_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(g_time_label, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_set_width(g_time_label, 60);
+    lv_obj_align(g_time_label, LV_ALIGN_TOP_LEFT, 56, 8);
     home_time_label_apply(0);
 
-    /* WiFi 图标 - 紧贴 vbat 左侧, 仅 CONNECTED 时显示 */
+    /* WiFi 图标 - 12px 小版, 紧贴 vbat 左侧, 仅 CONNECTED 时显示 */
     g_wifi_icon_label = lv_label_create(scr);
     lv_obj_set_style_text_font(g_wifi_icon_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(g_wifi_icon_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(g_wifi_icon_label, 18, 14);
-    lv_obj_align(g_wifi_icon_label, LV_ALIGN_TOP_RIGHT, -78, 12);
+    lv_obj_set_size(g_wifi_icon_label, 16, 15);
+    lv_obj_align(g_wifi_icon_label, LV_ALIGN_TOP_RIGHT, -82, 8);
     /* early WiFi 可能已 CONNECTED：创建时同步，避免首帧无图标 */
     home_wifi_icon_sync(0);
 
-    /* 第一行按钮: Files 和 Settings */
-    create_home_tile(scr, 10, 78, 106, 84,
+    /* 第一行: 文件和设置 */
+    create_home_tile(scr, 10, 78, 106, 88,
                      LV_SYMBOL_DIRECTORY,
-                     "Files",
+                     "文件",
                      file_manager_btn_event_handler);
 
-    create_home_tile(scr, 124, 78, 106, 84,
+    create_home_tile(scr, 124, 78, 106, 88,
                      LV_SYMBOL_SETTINGS,
-                     "Settings",
+                     "设置",
                      settings_btn_event_handler);
 
-    /* 第二行: 书架 */
-    create_home_tile(scr, 10, 170, 220, 60,
+    /* 第二行: 书架 (CoreMark 已移到设置页) */
+    create_home_tile(scr, 10, 174, 220, 72,
                      LV_SYMBOL_LIST,
-                     "Books",
+                     "书架",
                      bookshelf_btn_event_handler);
 
-    /* 第三行: CoreMark */
-    create_home_tile(scr, 10, 240, 220, 60,
-                     LV_SYMBOL_CHARGE,
-                     "CoreMark",
-                     coremark_btn_event_handler);
-
-    /* 第四行: 休眠时钟 (fix-power-saving: 从 Settings 里提到首页) */
-    create_home_tile(scr, 10, 310, 220, 60,
+    /* 第三行: 休眠时钟 (fix-power-saving: 从 Settings 提到首页) */
+    create_home_tile(scr, 10, 254, 220, 72,
                      LV_SYMBOL_BELL,
-                     "Sleep Clock",
+                     "休眠时钟",
                      home_clock_btn_event_handler);
 
-    /* VBAT SOC%标签 - 标题右侧 */
+    /* VBAT SOC%标签 - 右上角 */
     g_vbat_label = lv_label_create(scr);
     lv_label_set_text(g_vbat_label, g_vbat_text[0] ? g_vbat_text : "");
-    lv_obj_set_style_text_font(g_vbat_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(g_vbat_label, &lv_font_misans_16, 0);
     lv_obj_set_style_text_color(g_vbat_label, lv_color_make(0, 0, 0), 0);
-    lv_obj_set_size(g_vbat_label, 70, 14);
-    lv_obj_align(g_vbat_label, LV_ALIGN_TOP_RIGHT, -5, 12);
+    lv_obj_set_size(g_vbat_label, 70, 20);
+    lv_obj_align(g_vbat_label, LV_ALIGN_TOP_RIGHT, -6, 8);
+
+    /* 立即初始化 ADC 并读一次电量显示，避免开机后空等 5s 周期才有电量。
+     * allow_shutdown=0: main_ui_create 可能运行在 main 线程 / LVGL 线程
+     * (settings 返回 / 屏保退出), 这里不能触发休眠 (pm_enter_mode 只能在
+     * disp_task 上下文调用), 低电量软关机由 disp_task 的周期调用负责。 */
+    adc_vbat_init();
+    update_vbat_display(0);
 
     printf("[UI] Main UI created\n");
 
@@ -1333,17 +1771,43 @@ static int voltage_to_soc(float v)
     return soc;
 }
 
-static void update_vbat_display(void)
+static void update_vbat_display(int allow_shutdown)
 {
     static int last_soc = -1;
     static int last_charging = -1;
 
     float vbat = adc_read_vbat();
+    if (vbat <= 0.0f) {
+        /* 读取失败（ADC 未就绪/超时，raw=0）：绝不显示 0%，保留上次显示值，
+         * 也不触发低电量关机；置快速重试（~200ms 后再读） */
+        printf("[VBAT] read failed (0.00V), keep last display, retry soon\n");
+        g_vbat_retry_countdown = 10;
+        return;
+    }
     int pa21 = HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21);
     int charging = (pa21 == 0);
     int soc = voltage_to_soc(vbat);
 
     printf("[VBAT] raw=%.2fV soc=%d%% PA21=%d charging=%d\n", vbat, soc, pa21, charging);
+
+    /* 低电量软关机 (fix-power-saving):
+     *   未充电且电量见底 (soc==0 或 vbat<3.0V) → 直接走 screensaver 进
+     *   HIBERNATION。soc==0 在 kSocLut 下对应 vbat<3.50V (3.50V 起才是 10%),
+     *   即 ~5% 电量就软关机, 避免低电量时反复开机 + 每次开机 EPD 全刷的
+     *   掉电复位死循环 (见 EPD_3IN52_Init 内嵌 Clear)。充电中不触发
+     *   (插电走充电模式/充电唤醒)。vbat>1.0V 的 sanity 检查防止 ADC 读数
+     *   失败(0V)时误判为低电量。allow_shutdown 只由 disp_task 传 1:
+     *   pm_enter_mode(HIBERNATION) 必须在 disp_task 上下文调用 (与 PA6 休眠
+     *   一致), LVGL 线程调用会触发 PM 框架 UsageFault。 */
+    if (allow_shutdown && !charging && vbat > 1.0f && (soc <= 0 || vbat < 3.0f)) {
+        printf("[LOWBATT] soft shutdown: soc=%d%% vbat=%.2fV charging=%d\r\n",
+               soc, vbat, charging);
+        fflush(stdout);
+        screensaver_task_force_enter();
+        /* 正常情况不返回 (进 HIBERNATION / CPUReset); 若被 HTTP 运行中拒绝
+         * 则打印提示后继续, 下次周期再试。 */
+        printf("[LOWBATT] screensaver refused, retry next cycle\r\n");
+    }
 
     /* 变化才更新 UI - 避免每 5s 触发 EPD 刷新 */
     if (soc == last_soc && charging == last_charging) return;
@@ -1383,16 +1847,7 @@ int main(void)
      *   直接进 clock_minute_cycle 渲染时钟。
      *==================================================*/
     if (HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKTIMER) {
-        /* WKTIMER 同时被时钟模式和充电模式使用:
-         *  - RTC weekday==7 → 时钟模式(分钟刷新)
-         *  - RTC weekday==6 → 充电模式(电量刷新)
-         *  - 其它 → 异常, 走正常启动 */
-        if (charge_mode_enabled()) {
-            printf("[BOOT] WKTIMER wake -> charge mode cycle\r\n");
-            platform_init_level0();
-            EPD_GPIO_Init_Public();
-            charge_mode_cycle();       /* 不返回 */
-        }
+        /* WKTIMER 只被时钟模式使用 (RTC weekday==7 → 分钟刷新) */
         printf("[BOOT] WKTIMER wake -> minimal init (skip WiFi/SD)\r\n");
         platform_init_level0();          /* 仅 flash/image/PSRAM/cache */
         EPD_GPIO_Init_Public();          /* EPD GPIO 最小初始化 */
@@ -1400,19 +1855,28 @@ int main(void)
         /* 不会到达 */
     }
 
-    /* PA21(WKIO7) 充电唤醒早判: 插入充电器从普通休眠唤醒。
-     * 此时 RTC weekday 还是正常值(不是 6), 用唤醒源区分。 */
-    if ((HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKIO7) && !charge_mode_enabled()
-        && !clock_mode_enabled()) {
-        printf("[BOOT] PA21(WKIO7) wake -> charge mode (charger inserted)\r\n");
+    /* PA21(WKIO7) 充电唤醒早判: 休眠时插入充电器 → PA21 下降沿唤醒。
+     * 直接进充电模式(最小初始化, 不启动 WiFi/SD/LVGL), MCU 活跃轮询。
+     * charge_mode_run 在 PA6 按下时返回, 继续正常启动。 */
+    if ((HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKIO7)
+        && !clock_mode_enabled()
+        && (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21) == 0)) {
+        printf("[BOOT] PA21(WKIO7) wake + charging -> charge mode\r\n");
         platform_init_level0();
         EPD_GPIO_Init_Public();
-        charge_mode_cycle();       /* 不返回: 设 magic + 渲染充电界面 + HIBERNATION */
-        /* 不会到达 */
+        charge_mode_set_enabled(true);
+        charge_mode_run_minimal();   /* 显示充电画面 + 轮询 PA21/PA6 */
+        /* PA6 按下 → return, 继续正常启动 */
+        printf("[BOOT] PA6 pressed in charge mode -> normal boot\r\n");
     }
 
-    /* 平台初始化 (正常启动: 完整初始化含 WiFi/SD) */
-    platform_init();
+    /* 正常启动: 先 level0 + 显示开机画面, 再 level1(WiFi) + level2(SD).
+     * 这样开机画面在最早期就出现, WiFi/SD 初始化期间用户看到的是 boot 画面而非黑屏. */
+    platform_init_level0();          /* flash/image/PSRAM/cache */
+    EPD_GPIO_Init_Public();          /* EPD GPIO 最小初始化 */
+    boot_screen_show();              /* 推开机画面到墨水屏 (在 WiFi 前) */
+    platform_init_level1();          /* WiFi/网络子系统 */
+    platform_init_level2();          /* SD/音频等 */
 
     {
         extern void epub_buffer_init(void);
@@ -1501,12 +1965,10 @@ int main(void)
      *==================================================*/
     clock_boot_dispatch();
 
-    /* 充电模式 PA6 唤醒 → 清标志, 正常启动 (可看书/设置) */
+    /* 充电模式 PA6 唤醒 → 清标志, 正常启动 (可看书/设置)。
+     * (PA21 早判已在 platform_init 之前处理, 这里只处理从充电模式 PA6 退出) */
     if (charge_mode_enabled()) {
-        uint32_t event = HAL_Wakeup_GetEvent();
-        if (event & PM_WAKEUP_SRC_WKIO2) {
-            printf("[BOOT] PA6 wake from charge mode -> normal boot\r\n");
-        }
+        printf("[BOOT] PA6 wake from charge mode -> normal boot\r\n");
         charge_mode_set_enabled(false);
     }
 
@@ -1545,12 +2007,23 @@ int main(void)
     lv_init();
     printf("[MAIN] lv_init() returned\r\n");
     printf("[MAIN] Step 1: lv_init() completed\r\n");
-    
+
+    /* SD 卡已在 fatfs_filesystem_test() 挂载, lv_fs(FATFS) 在 lv_init() 内已就绪。
+     * 字体 warmup 在此同步执行: 此时 disp/lvgl 任务还没创建(无并发 LVGL, 线程安全),
+     * 首页也尚未构建/刷屏, EPD 上仍是 boot 开机画面 —— 预加载的 ~2s 耗时被这层
+     * 开机画面完全遮罩, 因此不会再弹 "Preparing fonts..." 遮罩。
+     * 注: 不能用 LVGL 定时器, 定时器要等 lvgl_task 启动后才触发, 那时首页已刷上屏。 */
+    font_warm_run_boot(NULL);
+
     /* 初始化显示端口 */
     printf("[MAIN] Step 2: Calling lv_port_disp_init()...\r\n");
     lv_port_disp_init();
     printf("[MAIN] Step 2: lv_port_disp_init() completed\r\n");
-    
+
+    /* 开机提示: lv_port_disp_init 后 EPD 已初始化(白屏)。
+     * 后续触摸初始化 + 首页构建要几百 ms, 先显示提示让用户知道在开机。 */
+    loading_show("Booting...");
+
     /* 初始化输入端口 (触摸) */
     printf("[MAIN] Step 3: Calling lv_port_indev_init()...\r\n");
     lv_port_indev_init();
@@ -1559,7 +2032,11 @@ int main(void)
     /* 创建主界面UI */
     main_ui_create();
     screensaver_init();
-    
+
+    /* SD 数据错误 (DCE 后卡死) 恢复服务: 定时器在 LVGL 上下文内轮询,
+     * http 上传遇到 f_write FR_DISK_ERR 时请求整卡重建并重试。 */
+    sd_recovery_init();
+
     printf("\r\n[OK] LVGL system initialized!\r\n");
     printf("[INFO] Controls: Files and Settings tiles\r\n");
 
