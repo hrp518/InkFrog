@@ -8,7 +8,7 @@
 
 | 依赖 | 说明 |
 |:-----|:-----|
-| XR872 SDK | `xradio-skylark-sdk-master`，本工程位于其 `project/demo/FontExp` 下，不能脱离 SDK 单独编译 |
+| XR872 SDK | 官方仓库：https://github.com/XradioTech/xradio-skylark-sdk ，本工程位于其 `project/demo/FontExp` 下，不能脱离 SDK 单独编译 |
 | 交叉工具链 | `gcc-arm-none-eabi 4.9 2015q2`（本机路径 `C:/XR872/home/Administrator/tools/gcc-arm-none-eabi-4_9_2015q2/bin`） |
 | Shell | Windows + Git Bash（`C:\XR872\bin\bash.exe`），SDK 的 gcc.mk 依赖该环境 |
 | Python 3 | 运行 `tools/` 下的生成脚本 |

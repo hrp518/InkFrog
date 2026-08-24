@@ -101,7 +101,7 @@
 
 ## 🔧 编译
 
-本工程是 XR872 SDK（`xradio-skylark-sdk-master`）内的 demo 工程，依赖 SDK 工具链与 `gcc.mk`。
+本工程是 [XR872 SDK（xradio-skylark-sdk）](https://github.com/XradioTech/xradio-skylark-sdk) 内的 demo 工程，依赖 SDK 工具链与 `gcc.mk`，请先克隆官方 SDK 并将本工程放入其 `project/demo/` 目录。
 
 ```bash
 # 1.（可选）改动 web/l1glyf_builder.js 后重生成内嵌 JS
@@ -126,7 +126,7 @@ cd ../image/xr872
 
 | 项目 | 规格 |
 |:-----|:-----|
-| 主控 | 全志 XR872（Cortex-M4F，XIP/PSRAM） |
+| 主控 | Xradio XR872（Cortex-M4F，XIP/PSRAM） |
 | 屏幕 | 3.7" 墨水屏，EPD_3IN52，SPI 驱动 |
 | 触摸 | CHSC6540（I2C1） |
 | 存储 | SD 卡（书籍 + 字库 + .l1glyf 缓存） |
@@ -182,7 +182,7 @@ FontExp/
 
 <table>
   <tr><th>项目 / 库</th><th>贡献</th></tr>
-  <tr><td>全志 XR872 SDK（xradio-skylark）</td><td>硬件驱动、网络协议栈、任务调度基础</td></tr>
+  <tr><td><a href="https://github.com/XradioTech/xradio-skylark-sdk">XR872 SDK（xradio-skylark）</a></td><td>硬件驱动、网络协议栈、任务调度基础</td></tr>
   <tr><td><a href="https://lore.kernel.org/FreeRTOS/">FreeRTOS</a></td><td>嵌入式实时操作系统内核（v8.2.3）</td></tr>
   <tr><td><a href="https://github.com/richgel999/miniz">miniz</a></td><td>轻量 deflate / inflate 压缩库，用于 EPUB 容器解压</td></tr>
   <tr><td><a href="https://lvgl.io">LVGL</a></td><td>轻量图形库与 UI 框架</td></tr>
