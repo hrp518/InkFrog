@@ -2,10 +2,11 @@
 
 <p align="center">
   <strong>XR872 墨水屏开源阅读器固件</strong><br>
-  3.52 寸 E-Ink · LVGL 图形库 · EPUB/TXT 阅读 · WiFi 传书 · 低功耗待机
+  3.7 寸 E-Ink · LVGL 图形库 · EPUB/TXT 阅读 · WiFi 传书 · 低功耗待机
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/version-V0.9A-blue?style=flat-square" alt="Version">
+  <img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License">
   <img src="https://img.shields.io/badge/chip-XR872-orange?style=flat-square" alt="Chip">
   <img src="https://img.shields.io/badge/display-3.7%22%20E--Ink-lightgrey?style=flat-square" alt="Display">
   <img src="https://img.shields.io/badge/GUI-LVGL-02D3A9?style=flat-square" alt="GUI">
@@ -169,7 +170,9 @@ FontExp/
 ├── tools/                            # 构建期工具（l1glyf / GBK）
 ├── third_party/miniz                 # miniz 压缩库（EPUB 解压）
 ├── coremark/                         # 性能基准
-└── FontExp_prev/                     # 旧版本备份
+├── docs/images/                      # README 效果预览截图
+├── .gitignore                        # 构建产物 / 笔记忽略规则
+└── LICENSE                           # MIT 许可证
 ```
 
 ---
@@ -189,13 +192,13 @@ FontExp/
 
 ## 📄 许可
 
-本项目基于开源 XR872 SDK 与 LVGL 开发，遵循各上游项目的授权条款。
+本仓库代码以 **MIT 许可证** 发布，详见 [LICENSE](LICENSE)。依赖的第三方组件（XR872 SDK、LVGL、FreeRTOS、miniz 等）遵循各自上游项目的授权条款。
 
 ---
 
 <p align="center">
   <strong>hrp</strong> ·
   <a href="https://github.com/hrp518">GitHub</a> ·
-  <a href="https://space.bilibili.com/hrp8888">Bilibili</a> ·
+  <a href="https://space.bilibili.com/16182355">Bilibili</a> ·
   hrp8888@outlook.com
 </p>

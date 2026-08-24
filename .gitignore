@@ -1,0 +1,37 @@
+# ===== 构建产物（一律不入库） =====
+*.o
+*.d
+*.a
+*.gch
+*.axf
+*.map
+*.ld
+*.bin
+*.img
+*.l1glyf
+*.backup
+
+# 镜像打包必需、来自 SDK 的输入二进制保留
+!image/xr872/boot_40M.bin
+!image/xr872/wlan_bl.bin
+!image/xr872/wlan_fw.bin
+!image/xr872/wlan_sdd_40M.bin
+
+# gcc 编译目录：只保留 Makefile（localconfig.mk 为本地配置）
+gcc/*
+!gcc/Makefile
+!gcc/localconfig.mk
+
+# ===== 开发笔记 / 随笔（根目录只留 README.md） =====
+/*.md
+!README.md
+*.ini
+
+# ===== IDE / 工具缓存 =====
+.kilo/
+.vscode/
+__pycache__/
+*.pyc
+
+# ===== 旧版本备份 =====
+FontExp_prev/
