@@ -54,6 +54,9 @@ DIRS += $(PRJ_BOARD)
 
 SRCS := $(basename $(foreach dir,$(DIRS),$(wildcard $(dir)/*.[csS])))
 
+# 主机单测只在 PC 上编译运行（gcc -I host_stub ...），不进固件
+SRCS := $(filter-out $(PRJ_ROOT_PATH)/tools/test_gbk,$(SRCS))
+
 # Browser L1 glyf JS blob (Flash .rodata, zero runtime RAM)
 GEN_L1GLYF_JS := $(PRJ_ROOT_PATH)/http_l1glyf_js.c
 $(GEN_L1GLYF_JS): $(PRJ_ROOT_PATH)/web/l1glyf_builder.js $(PRJ_ROOT_PATH)/level1_data.c $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py

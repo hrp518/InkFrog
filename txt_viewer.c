@@ -6,7 +6,7 @@
  * 但取字符来源从「静态 decoded_text_buf」改为「原始字节窗口 + gbk_decode_next」。
  *
  * 偏移空间 = 原始文件字节。所有 read_offset/page_end_offset/history/书签/百分比
- * 都基于原始字节，跨 UTF-8/GBK 编码统一。
+ * 都基于原始字节，跨 UTF-8/GBK/UTF-16 编码统一（UTF-16 额外做 2 字节码元对齐）。
  *
  * 解耦：
  *   - 不含任何 EPUB/XHTML 解析代码。
@@ -187,11 +187,53 @@ static int get_read_percentage(TxtViewer *v) {
     return (int)((long long)pos * 100 / (long long)v->content_size);
 }
 
+/* ========== 编码相关辅助（UTF-16 码元对齐 / 换行扫描） ========== */
+
+/* UTF-16 的字符偏移必须与 bom_size 同奇偶（2 字节码元对齐），
+ * 奇数偏移会落到字符中间。单字节编码原样返回。 */
+static int align_char_boundary(TxtViewer *v, int offset) {
+    if (v->encoding != TXT_ENC_UTF16LE && v->encoding != TXT_ENC_UTF16BE) return offset;
+    if (((offset - v->bom_size) & 1) != 0) offset++;
+    return offset;
+}
+
 /**
- * @brief 百分比(0-100) → 原始字节偏移，并向前到下一个 \n 后对齐
+ * @brief 从窗口相对下标 rel 起向前找换行，返回行首的窗口相对下标；找不到返回 -1
  *
- * \n 在 ASCII/UTF-8/GBK 都是单字节且不在 GBK lead/trail 中，故按原始字节
- * 扫描换行对齐对所有编码安全。
+ * UTF-8/GBK：原始字节 0x0A 即换行（不会出现在多字节序列内部）。
+ * UTF-16LE/BE：换行为 0A 00 / 00 0A 双字节，且只在与 bom_size 同奇偶的
+ * 码元起点上认定——「上」(U+4E0A) 之类汉字的 0x0A 低位字节不是换行。
+ */
+static int scan_next_line_start(TxtViewer *v, int rel) {
+    const uint8_t *buf = s_raw_window;
+    int win_end = v->window_len;
+    int limit = rel + 300;
+    if (limit > win_end) limit = win_end;
+
+    if (v->encoding == TXT_ENC_UTF16LE) {
+        for (int i = rel; i < limit && i + 1 < win_end; i++) {
+            if (((v->window_start + i - v->bom_size) & 1) == 0 &&
+                buf[i] == 0x0A && buf[i + 1] == 0x00) {
+                return i + 2;
+            }
+        }
+    } else if (v->encoding == TXT_ENC_UTF16BE) {
+        for (int i = rel; i < limit; i++) {
+            if (i >= 1 && ((v->window_start + i - v->bom_size) & 1) == 1 &&
+                buf[i] == 0x0A && buf[i - 1] == 0x00) {
+                return i + 1;
+            }
+        }
+    } else {
+        for (int i = rel; i < limit; i++) {
+            if (buf[i] == '\n') return i + 1;
+        }
+    }
+    return -1;
+}
+
+/**
+ * @brief 百分比(0-100) → 原始字节偏移，并向前到下一行行首对齐
  */
 static int pct_to_offset(TxtViewer *v, int pct) {
     if (!v || v->content_size <= 0) return v->bom_size;
@@ -203,24 +245,16 @@ static int pct_to_offset(TxtViewer *v, int pct) {
     if (raw_off >= v->file_size) raw_off = v->file_size - 1;
 
     /* 用窗口读取后扫描换行 */
-    if (fill_window(v, raw_off) <= 0) return v->bom_size;
+    if (fill_window(v, raw_off) <= 0) return align_char_boundary(v, v->bom_size);
 
-    const uint8_t *buf = s_raw_window;
-    int win_end = v->window_len;
-    int rel = raw_off - v->window_start;
-    int search_limit = rel + 300;
-    if (search_limit > win_end) search_limit = win_end;
-
-    /* 向前找到下一个 \n 后开始 */
-    for (int i = rel; i < search_limit; i++) {
-        if (buf[i] == '\n') {
-            int aligned = v->window_start + i + 1;
-            if (aligned >= v->file_size) aligned = v->file_size - 1;
-            return aligned;
-        }
+    int idx = scan_next_line_start(v, raw_off - v->window_start);
+    if (idx >= 0) {
+        int aligned = v->window_start + idx;
+        if (aligned >= v->file_size) aligned = v->file_size - 1;
+        return align_char_boundary(v, aligned);
     }
-    /* 300 字节内无换行，保持当前位置 */
-    return raw_off;
+    /* 300 字节内无换行，保持当前位置（UTF-16 仍做码元对齐） */
+    return align_char_boundary(v, raw_off);
 }
 
 /* ========== 窗口读取 ========== */
@@ -371,34 +405,31 @@ static void update_display(TxtViewer *v) {
     int line_width = 0;
 
     while (p < win_end && y_offset + current_lh <= CONTENT_HEIGHT) {
-        /* 换行：原始字节 0x0A（ASCII/UTF-8/GBK 统一） */
-        if (*p == '\n') {
+        /* 先解码下一个字符（unicode + 占用原始字节数），换行判断走解码值：
+         * UTF-16 的换行是 0A 00 / 00 0A 双字节，原始单字节 0x0A 可能只是
+         * 某汉字的低位字节（如「上」U+4E0A），不能按原始字节判断。 */
+        uint32_t unicode = 0;
+        int adv_raw = gbk_decode_next(v->encoding, p, win_end, &unicode);
+        if (adv_raw <= 0) break;
+
+        /* 换行（解码值，各编码统一） */
+        if (unicode == '\n') {
             if (line_pos > 0) {
                 create_line_label(v, line_buf, line_pos, current_font, &y_offset);
                 y_offset += current_lh;
                 line_pos = 0;
                 line_width = 0;
-                if (y_offset + current_lh > CONTENT_HEIGHT) { p++; break; }
+                if (y_offset + current_lh > CONTENT_HEIGHT) { p += adv_raw; break; }
             }
-            p++;
+            p += adv_raw;
             continue;
         }
 
-        /* 跳过 \r（CRLF / 老 Mac 风格） */
-        if (*p == '\r') {
-            p++;
+        /* 跳过 \r（CRLF / 老 Mac 风格）与 NUL */
+        if (unicode == '\r' || unicode == 0x00) {
+            p += adv_raw;
             continue;
         }
-
-        /* 跳过 NUL */
-        if (*p == 0x00) {
-            p++;
-            continue;
-        }
-
-        /* 解码下一个字符（unicode + 占用原始字节数） */
-        uint32_t unicode = 0;
-        int adv_raw = gbk_decode_next(v->encoding, p, win_end, &unicode);
 
         /* 空白类字符归一化为半角空格（与 epub filter_unsupported_chars 一致） */
         int render_adv;
@@ -423,8 +454,11 @@ static void update_display(TxtViewer *v) {
             }
         }
 
-        /* 把该字符的 UTF-8 编码写入 line_buf（label 用 UTF-8） */
-        if (line_pos < 78) {
+        /* 把该字符的 UTF-8 编码写入 line_buf（label 用 UTF-8）。
+         * 先算字节数再判余量，防止 4 字节字符在 line_pos=77/78 时越界写 */
+        int nb = 1;
+        if (unicode >= 0x80) nb = (unicode < 0x800) ? 2 : ((unicode < 0x10000) ? 3 : 4);
+        if (line_pos + nb <= 78) {
             if (unicode < 0x80) {
                 line_buf[line_pos++] = (char)unicode;
             } else if (unicode < 0x800) {
@@ -442,7 +476,7 @@ static void update_display(TxtViewer *v) {
             }
         }
         line_width += render_adv;
-        p += (adv_raw > 0 ? adv_raw : 1);
+        p += adv_raw;
     }
 
     /* flush 残留行 */
@@ -900,9 +934,10 @@ static void next_page_handler(TxtViewer *v) {
     /* 已到文件末尾 */
     if (v->page_end_offset >= v->file_size) return;
 
-    /* 防止空页死循环 */
+    /* 防止空页死循环（UTF-16 按 2 字节码元前进，保持奇偶对齐） */
     if (v->read_offset == v->page_end_offset && v->page_end_offset < v->file_size) {
-        v->page_end_offset++;
+        v->page_end_offset +=
+            (v->encoding == TXT_ENC_UTF16LE || v->encoding == TXT_ENC_UTF16BE) ? 2 : 1;
     }
 
     history_push(v, v->read_offset);
@@ -926,20 +961,12 @@ static void prev_page_handler(TxtViewer *v) {
         if (back < v->bom_size) back = v->bom_size;
 
         if (fill_window(v, back) <= 0) return;
-        const uint8_t *buf = s_raw_window;
-        int win_end = v->window_len;
-        int rel = back - v->window_start;
 
-        /* 换行对齐：找下一个 \n 后开始（从 back 向后 300 字节内） */
-        int limit = rel + 300;
-        if (limit > win_end) limit = win_end;
-        for (int i = rel; i < limit; i++) {
-            if (buf[i] == '\n') {
-                back = v->window_start + i + 1;
-                break;
-            }
-        }
-        v->read_offset = back;
+        /* 换行对齐：找下一行行首（编码感知，UTF-16 码元对齐） */
+        int idx = scan_next_line_start(v, back - v->window_start);
+        if (idx >= 0) back = v->window_start + idx;
+
+        v->read_offset = align_char_boundary(v, back);
         update_display(v);
     }
 }
@@ -1081,7 +1108,7 @@ void txt_viewer_goto_offset(TxtViewer *v, int raw_offset) {
     if (raw_offset < v->bom_size) raw_offset = v->bom_size;
     if (raw_offset >= v->file_size) raw_offset = (v->file_size > 0) ? v->file_size - 1 : 0;
     history_clear(v);
-    v->read_offset = raw_offset;
+    v->read_offset = align_char_boundary(v, raw_offset);
     update_display(v);
 }
 

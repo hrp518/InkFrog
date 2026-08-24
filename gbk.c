@@ -58,6 +58,14 @@ int gbk_decode_char(const uint8_t *p, const uint8_t *end, uint32_t *uni_out) {
     }
 
     uint8_t trail = p[1];
+
+    /* GB18030 四字节序列（lead + 0x30-0x39 开头）：无映射表，整组按
+     * 4 字节消费兜底空格，防止把后续字节当新字符导致整段错位 */
+    if (trail >= 0x30 && trail <= 0x39) {
+        if (uni_out) *uni_out = 0x20;
+        return (end - p >= 4) ? 4 : (int)(end - p);
+    }
+
     int ti = gbk_trail_index(trail);
     if (ti < 0) {
         /* trail 非法（含 0x7F），仅前进 1（lead 单独非法） */
@@ -81,52 +89,67 @@ int gbk_decode_char(const uint8_t *p, const uint8_t *end, uint32_t *uni_out) {
     return 2;
 }
 
+/* ==================== 流式 UTF-8 嗅探状态机 ==================== */
+
+/* 关键语义：块尾不完整的多字节序列保持 pending，不判非法——采样窗口
+ * 截断在字符中间是常态（概率约 2/3，纯中文 UTF-8），旧实现把它当
+ * 非法序列导致 UTF-8 文件被误判 GBK。残缺尾巴留给下一块或最终忽略。 */
+
+void txt_sniff_reset(TxtSniffState *st) {
+    if (!st) return;
+    st->need = 0;
+    st->saw_multibyte = 0;
+    st->utf8_broken = 0;
+    st->cp = 0;
+    st->min_cp = 0;
+}
+
+void txt_sniff_feed(TxtSniffState *st, const uint8_t *data, int len) {
+    if (!st || !data || len <= 0 || st->utf8_broken) return;
+
+    for (int i = 0; i < len; i++) {
+        uint8_t b = data[i];
+        if (st->need == 0) {
+            if (b <= 0x7F) continue;
+            st->saw_multibyte = 1;
+            if ((b & 0xE0) == 0xC0) {
+                st->need = 1; st->min_cp = 0x80;    st->cp = b & 0x1F;
+            } else if ((b & 0xF0) == 0xE0) {
+                st->need = 2; st->min_cp = 0x800;   st->cp = b & 0x0F;
+            } else if ((b & 0xF8) == 0xF0) {
+                st->need = 3; st->min_cp = 0x10000; st->cp = b & 0x07;
+            } else {
+                st->utf8_broken = 1;   /* 孤立 continuation / 非法前导 */
+                return;
+            }
+        } else {
+            if ((b & 0xC0) != 0x80) {  /* continuation 必须 10xxxxxx */
+                st->utf8_broken = 1;
+                return;
+            }
+            st->cp = (st->cp << 6) | (b & 0x3F);
+            if (--st->need == 0) {
+                if (st->cp < st->min_cp) { st->utf8_broken = 1; return; }         /* 非最短形式 */
+                if (st->cp >= 0xD800 && st->cp <= 0xDFFF) { st->utf8_broken = 1; return; } /* 代理区 */
+                if (st->cp > 0x10FFFF) { st->utf8_broken = 1; return; }           /* 超上限 */
+            }
+        }
+    }
+}
+
+int txt_sniff_decide(const TxtSniffState *st) {
+    if (!st) return TXT_SNIFF_GBK;
+    return st->utf8_broken ? TXT_SNIFF_GBK : TXT_SNIFF_UTF8;
+}
+
 /* ==================== UTF-8 校验 ==================== */
 
 bool gbk_is_valid_utf8(const uint8_t *data, int len) {
     if (!data || len <= 0) return true;
-    int i = 0;
-    while (i < len) {
-        uint8_t b = data[i];
-        int need;       /* 后续 continuation 字节数 */
-        uint32_t min_cp;/* 该长度下最小合法码点（用于拒绝非最短形式） */
-
-        if (b <= 0x7F) {
-            i++;
-            continue;
-        } else if ((b & 0xE0) == 0xC0) {
-            need = 1; min_cp = 0x80;
-        } else if ((b & 0xF0) == 0xE0) {
-            need = 2; min_cp = 0x800;
-        } else if ((b & 0xF8) == 0xF0) {
-            need = 3; min_cp = 0x10000;
-        } else {
-            /* 孤立的 continuation 字节或非法前导 */
-            return false;
-        }
-        if (i + need >= len) return false;  /* 截断 */
-
-        uint32_t cp;
-        if (need == 1) {
-            cp = (uint32_t)(b & 0x1F);
-        } else if (need == 2) {
-            cp = (uint32_t)(b & 0x0F);
-        } else {
-            cp = (uint32_t)(b & 0x07);
-        }
-
-        for (int k = 1; k <= need; k++) {
-            uint8_t cb = data[i + k];
-            if ((cb & 0xC0) != 0x80) return false;  /* continuation 必须 10xxxxxx */
-            cp = (cp << 6) | (cb & 0x3F);
-        }
-        if (cp < min_cp) return false;          /* 非最短形式 */
-        if (cp >= 0xD800 && cp <= 0xDFFF) return false;  /* UTF-16 代理区 */
-        if (cp > 0x10FFFF) return false;        /* 超出 Unicode 上限 */
-
-        i += 1 + need;
-    }
-    return true;
+    TxtSniffState st;
+    txt_sniff_reset(&st);
+    txt_sniff_feed(&st, data, len);
+    return !st.utf8_broken;
 }
 
 /* ==================== 统一解码接口 ==================== */
@@ -140,6 +163,33 @@ int gbk_decode_next(TxtEncoding enc, const uint8_t *p, const uint8_t *end,
 
     if (enc == TXT_ENC_GBK) {
         return gbk_decode_char(p, end, uni_out);
+    }
+
+    /* UTF-16 路径：BMP 2 字节直取，代理对组合 4 字节，孤立代理兜底空格 */
+    if (enc == TXT_ENC_UTF16LE || enc == TXT_ENC_UTF16BE) {
+        if (end - p < 2) {
+            if (uni_out) *uni_out = 0x20;
+            return 1;
+        }
+        uint32_t cp = (enc == TXT_ENC_UTF16LE)
+                      ? ((uint32_t)p[0] | ((uint32_t)p[1] << 8))
+                      : (((uint32_t)p[0] << 8) | (uint32_t)p[1]);
+        if (cp >= 0xD800 && cp <= 0xDBFF && (end - p) >= 4) {
+            uint32_t lo = (enc == TXT_ENC_UTF16LE)
+                          ? ((uint32_t)p[2] | ((uint32_t)p[3] << 8))
+                          : (((uint32_t)p[2] << 8) | (uint32_t)p[3]);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                if (uni_out) *uni_out = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                return 4;
+            }
+        }
+        if (cp >= 0xD800 && cp <= 0xDFFF) {
+            /* 孤立代理（或窗口尾截断的代理对前半）：兜底空格按 2 前进 */
+            if (uni_out) *uni_out = 0x20;
+            return 2;
+        }
+        if (uni_out) *uni_out = cp;
+        return 2;
     }
 
     /* UTF-8 / UTF-8 BOM 路径：复用合法 UTF-8 解码，非法兜底空格 */
@@ -182,41 +232,54 @@ int gbk_decode_next(TxtEncoding enc, const uint8_t *p, const uint8_t *end,
 /* ==================== 编码检测 ==================== */
 
 int gbk_bom_size(TxtEncoding enc) {
-    return (enc == TXT_ENC_UTF8_BOM) ? 3 : 0;
+    if (enc == TXT_ENC_UTF8_BOM) return 3;
+    if (enc == TXT_ENC_UTF16LE || enc == TXT_ENC_UTF16BE) return 2;
+    return 0;
 }
+
+#define SNIFF_CHUNK      4096
+#define SNIFF_MAX_BYTES  (256 * 1024)   /* 采样上限：再长仍纯 ASCII 则按 UTF-8（解码等价） */
 
 TxtEncoding gbk_detect_encoding(FIL *fp) {
     if (!fp) return TXT_ENC_GBK;
 
-    /* 读前 4KB 用于 BOM 嗅探 + UTF-8 合法性校验 */
-    static uint8_t sniff[4096] __attribute__((section(".psram_bss")));
-    UINT br = 0;
-    FRESULT res;
+    /* 分块采样缓冲（.psram_bss，与 txt_viewer 的 32KB 窗口不同时使用） */
+    static uint8_t sniff[SNIFF_CHUNK] __attribute__((section(".psram_bss")));
+    TxtSniffState st;
+    txt_sniff_reset(&st);
+
+    if (f_lseek(fp, 0) != FR_OK) return TXT_ENC_GBK;
+
+    int total = 0;
+    int first_chunk = 1;
+    for (;;) {
+        UINT br = 0;
+        if (f_read(fp, sniff, SNIFF_CHUNK, &br) != FR_OK || br == 0) break;
+
+        if (first_chunk) {
+            first_chunk = 0;
+            if (br >= 3 && sniff[0] == 0xEF && sniff[1] == 0xBB && sniff[2] == 0xBF) {
+                f_lseek(fp, 0);
+                return TXT_ENC_UTF8_BOM;
+            }
+            if (br >= 2 && sniff[0] == 0xFF && sniff[1] == 0xFE) {
+                f_lseek(fp, 0);
+                return TXT_ENC_UTF16LE;
+            }
+            if (br >= 2 && sniff[0] == 0xFE && sniff[1] == 0xFF) {
+                f_lseek(fp, 0);
+                return TXT_ENC_UTF16BE;
+            }
+        }
+
+        txt_sniff_feed(&st, sniff, (int)br);
+        total += (int)br;
+
+        if (st.utf8_broken) break;              /* 已定案 GBK，终止采样省 IO */
+        if (br < SNIFF_CHUNK) break;            /* EOF */
+        if (total >= SNIFF_MAX_BYTES) break;    /* 采样上限 */
+    }
 
     f_lseek(fp, 0);
-    res = f_read(fp, sniff, sizeof(sniff), &br);
-    f_lseek(fp, 0);
-
-    if (res != FR_OK || br == 0) {
-        return TXT_ENC_GBK;
-    }
-
-    /* UTF-8 BOM */
-    if (br >= 3 && sniff[0] == 0xEF && sniff[1] == 0xBB && sniff[2] == 0xBF) {
-        return TXT_ENC_UTF8_BOM;
-    }
-
-    /* UTF-16 BOM：不在支持范围，按 GBK 兜底（中文场景 GBK 更可能） */
-    if (br >= 2 && sniff[0] == 0xFF && sniff[1] == 0xFE) {
-        return TXT_ENC_GBK;
-    }
-    if (br >= 2 && sniff[0] == 0xFE && sniff[1] == 0xFF) {
-        return TXT_ENC_GBK;
-    }
-
-    /* UTF-8 合法性校验：全程合法则判为 UTF-8，否则 GBK */
-    if (gbk_is_valid_utf8(sniff, (int)br)) {
-        return TXT_ENC_UTF8;
-    }
-    return TXT_ENC_GBK;
+    return st.utf8_broken ? TXT_ENC_GBK : TXT_ENC_UTF8;
 }
