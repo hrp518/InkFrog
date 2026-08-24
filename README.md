@@ -172,6 +172,7 @@ FontExp/
 ├── coremark/                         # 性能基准
 ├── docs/images/                      # README 效果预览截图
 ├── .gitignore                        # 构建产物 / 笔记忽略规则
+├── agent.md                          # 编译 / 打包 / 烧录指南
 └── LICENSE                           # MIT 许可证
 ```
 

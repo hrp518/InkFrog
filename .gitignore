@@ -22,9 +22,10 @@ gcc/*
 !gcc/Makefile
 !gcc/localconfig.mk
 
-# ===== 开发笔记 / 随笔（根目录只留 README.md） =====
+# ===== 开发笔记 / 随笔（根目录只留 README.md 与 agent.md） =====
 /*.md
 !README.md
+!agent.md
 *.ini
 
 # ===== IDE / 工具缓存 =====
