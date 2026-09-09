@@ -55,8 +55,15 @@
 /* CST +8h */
 #define CST_OFFSET_SEC      (8 * 3600)
 
-/* RTC weekday 子字段正常取值 0-6；用 7 作为"时钟模式"magic(3bit 字段可表达)。 */
+/* RTC weekday 子字段正常取值 0-6；用 7 作为"时钟模式"magic(3bit 字段可表达)。
+ * 注意: 该 magic 会被 RTC 硬件从日期字段重算顶掉(合法 weekday 只有 0-6,
+ * 数学上不可能等于 7), 不能作为唯一持久依据 —— 分流判断用 clock_mode_active()。 */
 #define CLOCK_MAGIC_WDAY    ((RTC_WeekDay)7)
+
+/* 假日期年份标记: 时钟模式期间 RTC 日期 = (88, 1竖屏/2横屏, 精度下标1..7)。
+ * 88 同时兼作持久的"处于时钟模式"判定依据 —— weekday magic 会被硬件重算
+ * 覆盖, 而日期字段硬件只按自然月/年进位, 标记可长期存活(退出时重写真实日期)。 */
+#define CLOCK_CFG_YEAR_MARK 88
 
 /* 时钟渲染布局(240 宽 x 415 高)：
  *   4 个 48px 数字 + 1 个 24px 冒号，数字间距 4px。
@@ -147,6 +154,26 @@ bool clock_mode_enabled(void)
     uint8_t h, m, s;
     HAL_RTC_GetDDHHMMSS(&wday, &h, &m, &s);
     return ((uint32_t)wday == (uint32_t)CLOCK_MAGIC_WDAY);
+}
+
+/* 持久判定"处于时钟模式": weekday magic 仍在, 或 RTC 日期是本模式的假日期
+ * (year==88 且 month/mday 在配置编码范围内)。
+ *
+ * 为什么不能只看 weekday magic: 时钟模式把配置写进日期字段后, RTC 硬件
+ * 会(异步)从假日期重算 weekday —— 合法 weekday 只有 0-6, 永远不会等于 7,
+ * magic 必然被顶掉; 部分组合还会恰好撞上 6(充电 magic)。结果就是休眠时钟
+ * 中插入充电器被 main 的 PA21 早判当成普通充电唤醒, 弹出充电界面。
+ * PA21 插电 / PA6 退出的启动分流必须用本函数判断。 */
+bool clock_mode_active(void)
+{
+    uint8_t is_leap, year, month, mday;
+    if (clock_mode_enabled()) {
+        return true;
+    }
+    HAL_RTC_GetYYMMDD(&is_leap, &year, &month, &mday);
+    return (year == (uint8_t)CLOCK_CFG_YEAR_MARK &&
+            month >= 1 && month <= 2 &&
+            mday >= 1 && mday <= 7);
 }
 
 void clock_mode_set_enabled(bool en)
@@ -280,8 +307,6 @@ int clock_format_rtc_time(char *out, size_t sz)
 
 /* RTC 配置存储(精度/横屏) —— 记入日期字段, 供无 SD 的分钟唤醒路径读取。
  * 仅在时钟模式期间使用; 退出时重建真实日期(见 clock_mode_set_enabled)。 */
-#define CLOCK_CFG_YEAR_MARK 88
-
 static void clock_rtc_store_config(void)
 {
     static const int span[] = {1, 3, 5, 10, 15, 30, 60};
@@ -294,9 +319,9 @@ static void clock_rtc_store_config(void)
                       (uint8_t)(ls ? 2 : 1),   /* month: 1=竖屏 2=横屏 */
                       (uint8_t)(idx + 1));     /* mday: 精度下标 1..7 */
 
-    /* 写日期字段可能触发 RTC 硬件重算 weekday, 覆盖掉时钟模式 magic(wday=7),
-     * 导致休眠后插入充电器被误判为普通充电唤醒而非回时钟。这里最后再断言一次
-     * magic, 保证进入后 wday==7 是 RTC 最终状态, 并随休眠持久化。 */
+    /* 写日期字段后 RTC 硬件会(异步)从假日期重算 weekday, magic=7 注定被顶掉
+     * (合法 weekday 只有 0-6)。这里仍断言一次 magic 尽量延长其存活, 但持久的
+     * 模式判定依据是上面的假日期标记 —— 见 clock_mode_active()。 */
     {
         RTC_WeekDay wd;
         uint8_t hh = 0, mm = 0, ss = 0;
@@ -323,6 +348,20 @@ static void clock_get_active_config(int *interval_min, int *landscape)
     if (clock_rtc_load_config(interval_min, landscape) == 0) return;
     if (interval_min) *interval_min = clock_get_interval_min();
     if (landscape)    *landscape    = clock_get_landscape();
+}
+
+/* 重写假日期标记(把 mday 归位 1..7)。硬件跨午夜会推进 mday/month, 日期
+ * 滚出编码范围后 clock_mode_active() 的日期标记就失效了 —— 分钟唤醒 /
+ * 充电保持唤醒循环里周期性重写, 保证标记长期有效。iv/ls 用刚读回的配置。 */
+static void clock_rtc_refresh_marker(int interval_min, int landscape)
+{
+    static const int span[] = {1, 3, 5, 10, 15, 30, 60};
+    int idx = 0;
+    for (int i = 0; i < 7; i++) { if (span[i] == interval_min) { idx = i; break; } }
+    HAL_RTC_SetYYMMDD(0,
+                      CLOCK_CFG_YEAR_MARK,
+                      (uint8_t)(landscape ? 2 : 1),
+                      (uint8_t)(idx + 1));
 }
 
 /* 按当前精度算到下一个唤醒时间点(对齐到 interval 边界)，取代固定每分钟。
@@ -542,8 +581,9 @@ static void clock_awake_loop(void)
     clock_render_cycle(true);   /* 首帧 GC 全刷清残影 */
 
     for (;;) {
-        int iv = 1;
-        clock_get_active_config(&iv, NULL);
+        int iv = 1, ls = 0;
+        clock_get_active_config(&iv, &ls);
+        clock_rtc_refresh_marker(iv, ls);   /* 边界重写假日期标记, 防跨月失效 */
         uint32_t interval = (uint32_t)iv * 60U;
         if (interval < 60U) interval = 60U;
 
@@ -588,6 +628,14 @@ void clock_minute_cycle(void)
     int ret;
 
     clock_charge_gpio_init();
+
+    /* 刷新假日期标记: 硬件跨午夜推进 mday/month, 滚出编码范围后
+     * clock_mode_active() 会失效(插电又会被误判成充电模式)。 */
+    {
+        int iv = 1, ls = 0;
+        clock_get_active_config(&iv, &ls);
+        clock_rtc_refresh_marker(iv, ls);
+    }
 
     /* 若此刻充电(或休眠期间插入了充电器): 保持唤醒, 不反复休眠-唤醒 */
     if (clock_charging()) {
@@ -652,6 +700,16 @@ void clock_boot_dispatch(void)
     uint32_t event = HAL_Wakeup_GetEvent();
     printf("[CLOCK] boot dispatch, wake_event=0x%08x\r\n", event);
 
+    /* 诊断: RTC 实时读回(验证硬件重算 weekday 机制: 假日期下 wday≠7) */
+    {
+        RTC_WeekDay wd;
+        uint8_t hh = 0, mm = 0, ss = 0, lp, yy, mo, md;
+        HAL_RTC_GetDDHHMMSS(&wd, &hh, &mm, &ss);
+        HAL_RTC_GetYYMMDD(&lp, &yy, &mo, &md);
+        printf("[CLOCK] rtc readback: wday=%u date=%u-%u-%u\r\n",
+               (unsigned)wd, (unsigned)yy, (unsigned)mo, (unsigned)md);
+    }
+
     if (event & PM_WAKEUP_SRC_WKTIMER) {
         /* 分钟唤醒：唯一启用 WKTIMER 的路径就是时钟模式 */
         printf("[CLOCK] WKTIMER wake -> minute cycle\r\n");
@@ -660,15 +718,16 @@ void clock_boot_dispatch(void)
         return;                   /* 不会到达 */
     }
 
-    if ((event & PM_WAKEUP_SRC_WKIO7) && clock_mode_enabled()) {
-        /* 休眠时钟中插入充电器: 切到"保持唤醒"充电时钟, 不退出时钟模式 */
+    if ((event & PM_WAKEUP_SRC_WKIO7) && clock_mode_active()) {
+        /* 休眠时钟中插入充电器: 切到"保持唤醒"充电时钟, 不退出时钟模式。
+         * 必须用 clock_mode_active(): weekday magic 已被硬件重算顶掉。 */
         printf("[CLOCK] PA21(replug) wake -> stay awake clock\r\n");
         EPD_GPIO_Init_Public();
         clock_awake_loop();       /* 不返回 */
         return;                   /* 不会到达 */
     }
 
-    if ((event & PM_WAKEUP_SRC_WKIO2) && clock_mode_enabled()) {
+    if ((event & PM_WAKEUP_SRC_WKIO2) && clock_mode_active()) {
         /* PA6 按下退出时钟模式 */
         printf("[CLOCK] PA6 wake -> exit clock mode\r\n");
         clock_mode_set_enabled(false);
@@ -678,10 +737,18 @@ void clock_boot_dispatch(void)
         return;
     }
 
-    /* 其它(包括上电、异常复位)：正常启动。
-     * 若 weekday 仍是 magic(异常复位后)，清掉它以免误判。 */
-    if (clock_mode_enabled()) {
-        printf("[CLOCK] stale magic on non-WKTIMER wake, clearing\r\n");
+/* 其它(包括上电、异常复位)：正常启动。
+     * 若仍处于时钟模式(异常复位后 magic/假日期残留)，清掉以免误判。 */
+    if (clock_mode_active()) {
+        /* WiFi 未完全关断时 MAC 层会残留 WKSEV/WLAN 唤醒事件(0x800)，
+         * 不是用户意图 —— 不清标志退出, 按分钟周期重渲染一次并回休眠,
+         * 避免时钟模式刚睡着就被残留唤醒打断、莫名其妙回到主界面。 */
+        if (event & PM_WAKEUP_SRC_WLAN) {
+            printf("[CLOCK] spurious WLAN(wksev) wake in clock mode, re-enter sleep\n");
+            EPD_GPIO_Init_Public();
+            clock_minute_cycle();   /* 不返回 */
+        }
+        printf("[CLOCK] stale clock state on non-WKTIMER wake, clearing\n");
         clock_mode_set_enabled(false);
     }
 }
@@ -769,6 +836,16 @@ void clock_mode_enter_run(void)
     clock_render_framebuffer(h, m);
     if (clock_epd_refresh_sync(true) != 0) {
         printf("[CLOCK] first frame refresh failed\r\n");
+    }
+
+    /* 诊断: 刷新耗时 ~2-3s, 此刻读回 wday 可验证硬件异步重算
+     * (预期: wday 已不是 7, 而是假日期算出的 0-6; 判定靠日期标记) */
+    {
+        RTC_WeekDay wd;
+        uint8_t hh = 0, mm = 0, ss = 0;
+        HAL_RTC_GetDDHHMMSS(&wd, &hh, &mm, &ss);
+        printf("[CLOCK] pre-hibernate wday=%u (magic alive: %d)\r\n",
+               (unsigned)wd, (int)clock_mode_enabled());
     }
 
     /* 配置下次唤醒(WKTIMER 间隔 + PA6 退出 + PA21 插入充电) */

@@ -4,6 +4,7 @@
 
 #include "time_sync.h"
 #include "net/sntp/sntp.h"
+#include "driver/chip/hal_rtc.h"
 #include "kernel/os/os.h"
 #include "wlan_manager.h"
 #include <stdio.h>
@@ -123,6 +124,30 @@ int time_sync_from_ntsc(void)
     /* 写入系统时间（UTC）；显示时再加 CST */
     if (settimeofday(&ntp_time, NULL) != 0) {
         printf("[TIME] settimeofday failed\r\n");
+    }
+
+    /* 同步成功即写日历 RTC，使离线时间源(阅读状态栏/休眠时钟 no-wifi 对话框)
+     * 在 WiFi 关闭后仍准确。真实 weekday 0-6 不会与时钟/充电模式的 magic(7/6)冲突。 */
+    {
+        time_t local = ntp_time.tv_sec + CST_OFFSET_SEC;
+        struct tm *tm = gmtime(&local); /* 已加 CST，避免再叠本地 TZ */
+        if (tm) {
+            /* tm_wday: 0=Sunday..6=Saturday; RTC_WDAY: 0=Monday..6=Sunday */
+            RTC_WeekDay rtc_wday = (tm->tm_wday == 0) ? RTC_WDAY_SUNDAY : (RTC_WeekDay)(tm->tm_wday - 1);
+            uint8_t is_leap, year, month, mday;
+            HAL_RTC_GetYYMMDD(&is_leap, &year, &month, &mday);
+            HAL_RTC_SetYYMMDD(is_leap,
+                              (uint8_t)(tm->tm_year % 100),
+                              (uint8_t)(tm->tm_mon + 1),
+                              (uint8_t)tm->tm_mday);
+            HAL_RTC_SetDDHHMMSS(rtc_wday,
+                                (uint8_t)tm->tm_hour,
+                                (uint8_t)tm->tm_min,
+                                (uint8_t)tm->tm_sec);
+            printf("[TIME] RTC set %04d-%02d-%02d %02d:%02d:%02d\n",
+                   tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+                   tm->tm_hour, tm->tm_min, tm->tm_sec);
+        }
     }
 
     time_sync_format_from_epoch(ntp_time.tv_sec, s_time_text, (int)sizeof(s_time_text));

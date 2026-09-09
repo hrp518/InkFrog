@@ -81,7 +81,9 @@ static lv_obj_t *g_http_dialog_bg = NULL;
 
 /* VBAT电压显示 */
 static lv_obj_t *g_vbat_label = NULL;
-static char g_vbat_text[16] = "";
+/* 电量文本 ("83%" / "83% +")，由 disp_task 每 5s 更新；
+ * 阅读器状态栏等其它界面通过 extern 引用，保证全机显示一致 */
+char g_vbat_text[16] = "";
 static uint8_t g_adc_inited = 0;
 static volatile int g_vbat_retry_countdown = 0;   /* ADC 读失败后快速重试计数 (20ms/格) */
 
@@ -752,8 +754,14 @@ static void clock_picker_confirm_cb(lv_event_t *e) {
     printf("[CLOCK] confirm interval=%d min landscape=%d\n", s_clock_sel_min, s_clock_landscape);
     clock_picker_close();
     epd_mark_refresh_pending();
-    /* 未连接 WiFi: 时间无法 NTP 校准, 先询问用户是否进入(并显示当前 RTC 时间) */
+    /* 未连接 WiFi: 若本次开机 NTP 已成功过一次(time_sync_is_valid), NTP 时已写
+     * 日历 RTC, 时间基本准确, 直接进入; 否则询问用户(并显示当前 RTC 时间)。 */
     if (g_wifi.phase != WLAN_PHASE_CONNECTED) {
+        if (time_sync_is_valid()) {
+            printf("[CLOCK] WiFi not connected but time synced this boot, entering directly\n");
+            clock_mode_enter();
+            return;
+        }
         printf("[CLOCK] WiFi not connected, asking user before entering\n");
         clock_nowifi_dialog();
         return;
@@ -1838,28 +1846,18 @@ int main(void)
     printf("======================================\r\n\r\n");
     
     /*====================================================
-     * 省电优化: WKTIMER 分钟唤醒走最小化初始化路径
-     *   正常时钟模式每分钟冷启动本来要跑完整 platform_init (含 WiFi/SD),
-     *   但分钟周期只用 EPD(PSRAM)+RTC+pm_enter_mode, 完全不需要 WiFi/SD。
-     *   这里在 platform_init 之前早判 (HAL_Wakeup_GetEvent 在 SystemInit→pm_init
-     *   里已填充, main 第一行即可用), 若是 WKTIMER 唤醒则只跑 level0
-     *   (flash/image/PSRAM/cache), 跳过 level1(WiFi) 和 level2(SD/audio),
-     *   直接进 clock_minute_cycle 渲染时钟。
+     * 休眠时钟启动分流 (GPT clock 方案 §二) 已下移到 level0+EPD GPIO
+     * 之后、boot 画面之前 —— WKTIMER 分钟唤醒 / PA21 插电(充电时钟) /
+     * PA6 退出 三类唤醒都在那里统一早判, 均只跑 level0 无需 WiFi/SD。
      *==================================================*/
-    if (HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKTIMER) {
-        /* WKTIMER 只被时钟模式使用 (RTC weekday==7 → 分钟刷新) */
-        printf("[BOOT] WKTIMER wake -> minimal init (skip WiFi/SD)\r\n");
-        platform_init_level0();          /* 仅 flash/image/PSRAM/cache */
-        EPD_GPIO_Init_Public();          /* EPD GPIO 最小初始化 */
-        clock_minute_cycle();            /* 不返回: 渲染→刷新→配置唤醒→HIBERNATION */
-        /* 不会到达 */
-    }
 
     /* PA21(WKIO7) 充电唤醒早判: 休眠时插入充电器 → PA21 下降沿唤醒。
      * 直接进充电模式(最小初始化, 不启动 WiFi/SD/LVGL), MCU 活跃轮询。
-     * charge_mode_run 在 PA6 按下时返回, 继续正常启动。 */
+     * charge_mode_run 在 PA6 按下时返回, 继续正常启动。
+     * 时钟模式判定用 clock_mode_active()(日期标记持久, weekday magic
+     * 会被硬件重算顶掉) —— 否则休眠时钟中插电会误进充电模式。 */
     if ((HAL_Wakeup_GetEvent() & PM_WAKEUP_SRC_WKIO7)
-        && !clock_mode_enabled()
+        && !clock_mode_active()
         && (HAL_GPIO_ReadPin(GPIO_PORT_A, GPIO_PIN_21) == 0)) {
         printf("[BOOT] PA21(WKIO7) wake + charging -> charge mode\r\n");
         platform_init_level0();
@@ -1874,6 +1872,12 @@ int main(void)
      * 这样开机画面在最早期就出现, WiFi/SD 初始化期间用户看到的是 boot 画面而非黑屏. */
     platform_init_level0();          /* flash/image/PSRAM/cache */
     EPD_GPIO_Init_Public();          /* EPD GPIO 最小初始化 */
+
+    /* 休眠时钟启动分流 (GPT clock 方案 §二): 必须在 boot 画面/WiFi/SD/LVGL 等
+     * 普通服务之前。时钟模式中插入充电器(PA21)在此直接切"保持唤醒充电时钟",
+     * 不显示开机画面 —— 若放正常启动末尾再分流, 会先闪一帧开机画面。 */
+    clock_boot_dispatch();
+
     boot_screen_show();              /* 推开机画面到墨水屏 (在 WiFi 前) */
     platform_init_level1();          /* WiFi/网络子系统 */
     platform_init_level2();          /* SD/音频等 */
@@ -1955,15 +1959,6 @@ int main(void)
      * EXT LDO 硬件稳定时间 <1ms, 只需给电容充电几 ms 即可。 */
     printf("[SD] Waiting 100ms for EXT LDO to stabilize...\r\n");
     OS_MSleep(100);
-
-    /*====================================================
-     * 休眠时钟启动分流 (GPT clock 方案 §二)
-     * 必须在 WiFi/SD/LVGL/触摸等普通服务启动之前。
-     *   - WKTIMER 唤醒 -> 分钟周期(最小化)，不返回
-     *   - PA6 唤醒且处于时钟模式 -> 清标志 + boot guard，继续正常启动
-     *   - 其它 -> 正常 InkFrog 启动
-     *==================================================*/
-    clock_boot_dispatch();
 
     /* 充电模式 PA6 唤醒 → 清标志, 正常启动 (可看书/设置)。
      * (PA21 早判已在 platform_init 之前处理, 这里只处理从充电模式 PA6 退出) */

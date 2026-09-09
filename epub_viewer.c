@@ -10,6 +10,7 @@
 #include <ctype.h>
 /* #include <sys/dma_heap.h>  -- 不再使用 DMA heap，改用静态分配 (.psram_bss) */
 #include "fs/fatfs/ff.h"
+#include "driver/chip/hal_rtc.h"
 #include "loading.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -20,6 +21,8 @@ static char s_decoded_text_buf[DECODED_TEXT_BUF_SIZE] __attribute__((section(".p
 
 extern void epd_mark_refresh_pending(void);
 extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
+/* 电量文本 (main.c 的 disp_task 每 5s 更新, 如 "83%" / "83% +") */
+extern char g_vbat_text[];
 
 #define VIEWER_DEBUG 1
 #define VIEWER_VERBOSE_DEBUG 0  /* hex dump & per-line debug: very slow (~600ms), only enable for debugging */
@@ -36,11 +39,11 @@ extern void epd_disable_all_animations_recursive(lv_obj_t *obj);
 #define SCREEN_WIDTH   240
 #define SCREEN_HEIGHT  415
 
-/* 内容区：几乎全屏，顶部14px padding，底部留4px margin */
+/* 内容区：顶部留 ~26px 给右上角状态栏(电量+时间)，底部留 4px margin */
 #define CONTENT_X      10
-#define CONTENT_Y      14
+#define CONTENT_Y      40
 #define CONTENT_WIDTH  (SCREEN_WIDTH - 20)
-#define CONTENT_HEIGHT (SCREEN_HEIGHT - 18)
+#define CONTENT_HEIGHT (SCREEN_HEIGHT - CONTENT_Y - 4)
 /* 工具栏 */
 #define TOOLBAR_HEIGHT    138
 #define TOOLBAR_TRIGGER_Y 130
@@ -122,6 +125,11 @@ struct EpubViewer {
     lv_obj_t *progress_bar;    /* 底部进度条填充 */
     lv_obj_t *progress_bg;     /* 底部进度条背景 */
 
+    /* UI 元素 - 右上角状态栏 (电量+时间, 阅读时 WiFi 已断, 时间读日历 RTC) */
+    lv_obj_t *status_label;
+    lv_timer_t *status_timer;
+    char status_last_buf[32];   /* 上次写入的文本, 无变化不触发 EPD 刷新 */
+
     /* UI 元素 - 工具栏 */
     lv_obj_t *toolbar;
     lv_obj_t *toolbar_title;
@@ -168,6 +176,8 @@ static void create_toolbar(EpubViewer *viewer);
 static void update_toolbar_info(EpubViewer *viewer);
 static void show_goto_keyboard(EpubViewer *viewer);
 static void cleanup_goto_screen(EpubViewer *viewer);
+static void update_status_bar(EpubViewer *viewer);
+static void status_timer_cb(lv_timer_t *timer);
 
 /* ========== 偏移历史栈 ========== */
 
@@ -851,6 +861,39 @@ EpubViewer* epub_viewer_create(EpubReader *reader) {
     return v;
 }
 
+/* ========== 右上角状态栏 (电量 + 时间) ========== */
+
+/* 单阅读器实例: 定时器回调经静态指针取 viewer。
+ * 本工程 LVGL 为裁剪版, 头文件有 lv_timer_get_user_data 声明但实现被裁,
+ * 链接会报 undefined reference, 故沿用 file_manager.c 的模块静态变量写法。 */
+static EpubViewer *s_status_owner = NULL;
+
+/* 组装 "电量 时间" 文本；有变化才写 label，避免每 5s 触发 EPD 刷新。
+ * 电量文本复用 main.c 的 g_vbat_text (disp_task 每 5s 更新, 含充电 "+")；
+ * 时间读日历 RTC —— 阅读时 WiFi 已断, 而 RTC 在每次 NTP 同步时写入
+ * (time_sync.c), 只要开机同步过一次即基本准确。 */
+static void update_status_bar(EpubViewer *viewer) {
+    if (!viewer || !viewer->status_label) return;
+
+    RTC_WeekDay wday;
+    uint8_t h = 0, m = 0, s = 0;
+    HAL_RTC_GetDDHHMMSS(&wday, &h, &m, &s);
+
+    char buf[32];
+    const char *batt = g_vbat_text[0] ? g_vbat_text : "--";
+    snprintf(buf, sizeof(buf), "%s %02u:%02u", batt, (unsigned)h, (unsigned)m);
+
+    if (strcmp(buf, viewer->status_last_buf) == 0) return;
+    strncpy(viewer->status_last_buf, buf, sizeof(viewer->status_last_buf) - 1);
+    viewer->status_last_buf[sizeof(viewer->status_last_buf) - 1] = '\0';
+    lv_label_set_text(viewer->status_label, buf);
+}
+
+static void status_timer_cb(lv_timer_t *timer) {
+    (void)timer;
+    update_status_bar(s_status_owner);
+}
+
 /* ========== 工具栏 ========== */
 
 static void update_toolbar_info(EpubViewer *viewer) {
@@ -1222,6 +1265,18 @@ void epub_viewer_show(EpubViewer *viewer) {
     lv_obj_add_flag(viewer->content_container, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
     epd_disable_all_animations_recursive(viewer->content_container);
 
+    /* 右上角状态栏: 电量 + 时间 (内容区已下移 CONTENT_Y 给状态栏留位) */
+    viewer->status_label = lv_label_create(viewer->screen);
+    lv_obj_set_style_text_font(viewer->status_label, ui_font, 0);
+    lv_obj_set_style_text_color(viewer->status_label, lv_color_black(), 0);
+    lv_obj_align(viewer->status_label, LV_ALIGN_TOP_RIGHT, -6, 8);
+    epd_disable_all_animations_recursive(viewer->status_label);
+    viewer->status_last_buf[0] = '\0';
+    update_status_bar(viewer);
+    /* 每 5s 检查一次; 内容无变化时不触发 EPD 刷新。删除随 epub_viewer_close 一同清理。 */
+    s_status_owner = viewer;
+    viewer->status_timer = lv_timer_create(status_timer_cb, 5000, NULL);
+
     /* 不在阅读界面创建进度条和百分比（进度信息仅在工具栏中显示） */
     viewer->progress_bg = NULL;
     viewer->progress_bar = NULL;
@@ -1240,6 +1295,13 @@ void epub_viewer_show(EpubViewer *viewer) {
 
 void epub_viewer_close(EpubViewer *viewer) {
     if (!viewer) return;
+    /* 先清理状态栏定时器，避免关闭后仍访问已销毁的 label */
+    if (viewer->status_timer) {
+        lv_timer_del(viewer->status_timer);
+        viewer->status_timer = NULL;
+    }
+    s_status_owner = NULL;
+    viewer->status_label = NULL;
     /* 先清理跳转键盘 */
     if (viewer->goto_screen) {
         if (viewer->goto_kb) { lv_obj_del(viewer->goto_kb); viewer->goto_kb = NULL; }

@@ -73,8 +73,16 @@ void clock_mode_enter_run(void);
 
 /*
  * 当前是否处于时钟模式(读 RTC weekday==7)。供 main/disp_task 启动判断用。
+ * 注意: weekday magic 会被 RTC 硬件从时钟模式的假日期重算顶掉, 时钟模式
+ * 进行中本函数可能返回 false —— 启动分流请用 clock_mode_active()。
  */
 bool clock_mode_enabled(void);
+
+/*
+ * 持久判定"处于时钟模式": weekday magic 仍在, 或 RTC 日期为配置假日期
+ * (year==88)。PA21 插电/PA6 退出的启动分流必须用这个函数。
+ */
+bool clock_mode_active(void);
 
 /*
  * 清除时钟模式标志(weekday 写回真实值 0-6)。退出路径调用。
