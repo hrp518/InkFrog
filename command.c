@@ -30,6 +30,7 @@
 #include "common/cmd/cmd_util.h"
 #include "common/cmd/cmd.h"
 #include "common/framework/fs_ctrl.h"
+#include "fs_ctrl_format.h"
 #include "fs/fatfs/ff.h"
 #include "sd_recovery.h"
 #include <stdio.h>

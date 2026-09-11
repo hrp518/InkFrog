@@ -36,3 +36,5 @@ __pycache__/
 
 # ===== 旧版本备份 =====
 FontExp_prev/
+# 工程专属链接脚本 (XIP/PSRAM 白名单) 必须入库
+!gcc/appos.ld
