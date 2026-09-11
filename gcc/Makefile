@@ -14,6 +14,9 @@ ROOT_PATH := ../../../..
 
 include $(ROOT_PATH)/gcc.mk
 
+# 工程侧放宽警告 (gcc.mk 保持原版, 不再打补丁)
+CC_FLAGS += -Wno-error
+
 # ----------------------------------------------------------------------------
 # project name and project root path
 # ----------------------------------------------------------------------------
@@ -40,6 +43,7 @@ INCLUDE_PATHS += -I$(PRJ_ROOT_PATH)/lvgl/src
 INCLUDE_PATHS += -I$(PRJ_ROOT_PATH)/coremark
 
 DIRS_IGNORE := $(PRJ_ROOT_PATH)/gcc%
+DIRS_IGNORE += $(PRJ_ROOT_PATH)/mkfs_ff%   # f_mkfs 独立模块 (规则单独编译), 不进工程源码扫描
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/image%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/example%
 DIRS_IGNORE += $(PRJ_ROOT_PATH)/lvgl/demos%
@@ -63,6 +67,8 @@ GEN_L1GLYF_JS := $(PRJ_ROOT_PATH)/http_l1glyf_js.c
 $(GEN_L1GLYF_JS): $(PRJ_ROOT_PATH)/web/l1glyf_builder.js $(PRJ_ROOT_PATH)/level1_data.c $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py
 	@python $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py 2>/dev/null || py -3 $(PRJ_ROOT_PATH)/tools/gen_l1glyf_web_js.py
 
+# fs_ctrl 已整体工程化 (含 fs_ctrl_format), 排除 SDK 原版避免重复符号
+SRCS := $(filter-out $(ROOT_PATH)/project/common/framework/fs_ctrl,$(SRCS))
 OBJS := $(addsuffix .o,$(SRCS))
 
 # extra libraries searching path
@@ -94,19 +100,32 @@ IMAGE_CFG := image_auto_cal.cfg
 # 此处占位即可覆盖。
 LINKER_SCRIPT := $(PRJ_ROOT_PATH)/gcc/appos.ld
 
+# SDK bugfix 链接期外移, 实现见工程 sdk_fixes.c (SD 容量换算 + HIBERNATION 保持 32K 校准)
+LD_FLAGS += -Wl,--wrap,SDMMC_ioctl -Wl,--wrap,HAL_PRCM_DisableInter32KCalib
+
+# f_mkfs 独立模块: FatFs 原版源文件 + _USE_MKFS=1 副本, objcopy 只保留
+# f_mkfs 全局符号单独链接。SDK libfs/ffconf.h 保持原版 (_USE_MKFS=0),
+# SDK 零改动 (原版 sdmmc_diskio.c 的 mkfs 分支有 case 后声明的编译错误,
+# _USE_MKFS=0 时被预处理器裁掉不会触发; 本模块绕开整段)。
+MKFS_DIR := $(PRJ_ROOT_PATH)/mkfs_ff
+MKFS_OBJ := $(MKFS_DIR)/f_mkfs.o
+$(MKFS_OBJ): $(MKFS_DIR)/ff.c $(MKFS_DIR)/fs/fatfs/ff.h $(MKFS_DIR)/fs/fatfs/ffconf.h
+	$(Q)$(CC) $(CPU) -c $(DBG_FLAG) -fno-common -fmessage-length=0 -fno-exceptions -ffunction-sections -fdata-sections -fomit-frame-pointer -Os -std=gnu99 -I$(MKFS_DIR) -I$(ROOT_PATH)/include -o $@ $(MKFS_DIR)/ff.c
+	$(Q)$(OBJCOPY) --keep-global-symbol=f_mkfs $@ $@.tmp && mv $@.tmp $@
+
 # project make rules - 必须在响应文件规则之后include
 include $(PRJ_MAKE_RULES)
 
 # ----------------------------------------------------------------------------
 # 覆盖project.mk中的链接规则，使用响应文件
 # ----------------------------------------------------------------------------
-$(PROJECT).$(ELF_EXT): $(GEN_L1GLYF_JS) $(OBJS) $(RESPONSE_FILE)
+$(PROJECT).$(ELF_EXT): $(GEN_L1GLYF_JS) $(OBJS) $(RESPONSE_FILE) $(MKFS_OBJ)
 	@echo "Linking $@..."
 ifeq ($(__CONFIG_ROM), y)
 	$(Q)$(CC) -E -P -CC $(CC_SYMBOLS) -o $(ROM_SYMBOL_NAME) - < $(ROM_SYMBOL_FILE)
 endif
 	$(Q)$(CC) -E -P -CC $(CC_SYMBOLS) -o $(PROJECT_LD) - < $(LINKER_SCRIPT) && \
-	$(Q)$(CC) $(LD_FLAGS) -T$(PROJECT_LD) $(LIBRARY_PATHS) -o $@ @$(RESPONSE_FILE) $(LIBRARIES)
+	$(Q)$(CC) $(LD_FLAGS) -T$(PROJECT_LD) $(LIBRARY_PATHS) -o $@ @$(RESPONSE_FILE) $(MKFS_OBJ) $(LIBRARIES)
 	@echo "Linking $@...done"
 
 # ----------------------------------------------------------------------------
